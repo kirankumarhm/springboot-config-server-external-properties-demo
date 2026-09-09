@@ -1,0 +1,6 @@
+# Shared by EVERY client application.
+# Maps to APPLICATION='application' rows (version B) and application.yml (version C).
+demo:
+  shared:
+    banner-message: "Configured centrally via Spring Cloud Config - Git backend"
+    environment-label: "production-like"

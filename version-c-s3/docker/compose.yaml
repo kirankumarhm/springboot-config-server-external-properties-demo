@@ -1,0 +1,146 @@
+name: config-s3-demo
+
+# Floci (the local AWS emulator) runs OUTSIDE this stack, started with `floci start`, so there is
+# no S3/SQS container here. Reaching it from inside a container needs two things:
+#
+#   1. extra_hosts mapping localhost.floci.io to host-gateway, because a container's own
+#      "localhost" is not the host.
+#   2. the BUCKET-prefixed hostname mapped too. The AWS SDK uses virtual-host-style addressing
+#      (bucket.host) with a custom endpoint, and Floci's wildcard DNS resolves
+#      <bucket>.localhost.floci.io on the host but not inside a container.
+#
+# Mapping the known bucket name explicitly avoids having to force path-style addressing, which
+# AwsS3EnvironmentProperties does not expose as a property anyway.
+
+x-floci-hosts: &floci-hosts
+  - "localhost.floci.io:host-gateway"
+  - "acme-platform-config.localhost.floci.io:host-gateway"
+
+services:
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: cfg-s3-rabbitmq
+    ports:
+      - "5674:5672"
+      - "15674:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  config-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: config-server
+    container_name: cfg-s3-server
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8908:8888"
+      - "9900:9888"
+    extra_hosts: *floci-hosts
+    volumes:
+      # The private key is a mounted secret, read-only, never baked into the image.
+      - ../secrets:/secrets:ro
+    environment:
+      MANAGEMENT_PORT: 9888
+      ENCRYPT_KEYSTORE_LOCATION: file:/secrets/config-server.p12
+      ENCRYPT_KEYSTORE_PASSWORD: keystore-secret
+      ENCRYPT_KEYSTORE_ALIAS: configkey
+      AWS_ENDPOINT: http://localhost.floci.io:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      CONFIG_BUCKET: acme-platform-config
+      CONFIG_CHANGE_QUEUE: config-change-queue
+      CONFIG_KEY_PREFIX: main/
+      RABBITMQ_HOST: rabbitmq
+      CONFIG_ADMIN_PASSWORD: "{noop}admin-secret"
+      CONFIG_CLIENT_PASSWORD: "{noop}client-secret"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9888/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 25s
+
+  inventory-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: inventory-service
+    container_name: cfg-s3-inventory
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8101:8081"
+      - "9101:9081"
+    environment:
+      CONFIG_SERVER_URI: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9081/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  pricing-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: pricing-service
+    container_name: cfg-s3-pricing
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8102:8082"
+      - "9102:9082"
+    environment:
+      CONFIG_SERVER_URI: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9082/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  pricing-service-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: pricing-service
+    container_name: cfg-s3-pricing-2
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8103:8083"
+      - "9103:9083"
+    environment:
+      SERVER_PORT: 8083
+      MANAGEMENT_PORT: 9083
+      APP_INDEX: 8083
+      CONFIG_SERVER_URI: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9083/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s

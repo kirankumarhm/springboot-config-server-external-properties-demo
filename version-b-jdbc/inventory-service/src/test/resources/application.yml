@@ -1,0 +1,29 @@
+# TEST-ONLY application.yml. It SHADOWS the production one, because src/test/resources precedes
+# src/main/resources on the test classpath.
+#
+# Why this file is necessary: the production application.yml declares
+#     spring.config.import: "configserver:http://...?fail-fast=true"
+# so every context-loading test tries to reach a live Config Server. That either fails the build or,
+# worse, passes only because a server happens to be listening on :8888 - which is how these tests
+# silently "passed" until the stacks were stopped.
+#
+# Two things that do NOT work, both tried:
+#   - "spring.config.import=" as a test property: the import is processed as part of the FILE's own
+#     contribution, so an overriding property source does not remove it.
+#   - "spring.cloud.config.enabled=false": that removes the configserver: location resolver, so the
+#     location then fails to resolve at all ("Incorrect ConfigDataLocationResolver chosen").
+#
+# Slice tests supply what they need via @WebMvcTest(properties=...) or ApplicationContextRunner.
+# Real Config Server wiring is covered by the E2E suites and by GitBackendIT.
+spring:
+  cloud:
+    config:
+      # With spring-cloud-starter-config on the classpath, ConfigDataMissingEnvironmentPostProcessor
+      # FAILS the context when no spring.config.import is set ("No spring.config.import set").
+      # Since this file deliberately removes the import, that check has to be switched off too.
+      import-check:
+        enabled: false
+  application:
+    name: inventory-service
+  main:
+    banner-mode: "off"

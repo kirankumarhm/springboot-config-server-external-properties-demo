@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: config-demo
+  labels:
+    app.kubernetes.io/part-of: config-demo
+---
+# Non-secret settings. Anything sensitive is in the Secret below, never here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-server-env
+  namespace: config-demo
+data:
+  DB_URL: "jdbc:postgresql://postgres:5432/configdb"
+  CONFIG_LABEL: "main"
+  RABBITMQ_HOST: "rabbitmq"
+  RABBITMQ_PORT: "5672"
+  ENCRYPT_KEYSTORE_LOCATION: "file:/secrets/config-server.p12"
+  ENCRYPT_KEYSTORE_ALIAS: "configkey"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: client-env
+  namespace: config-demo
+data:
+  CONFIG_SERVER_URI: "http://config-server:8888"
+  RABBITMQ_HOST: "rabbitmq"
+  RABBITMQ_PORT: "5672"
+---
+# Created here with literal values only so the manifests are self-contained and applyable.
+# In a real cluster this object is NOT in git: it comes from External Secrets, Sealed Secrets,
+# Vault injection or SOPS. The passwords below are the same local-development values as the
+# compose stack, and are worthless outside it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: config-credentials
+  namespace: config-demo
+type: Opaque
+stringData:
+  DB_USERNAME: "config_admin"
+  DB_PASSWORD: "config-secret"
+  # {noop} is acceptable only because these are throwaway local credentials. The delegating
+  # password encoder accepts {bcrypt}$2a$... unchanged, which is what a real deployment supplies.
+  CONFIG_ADMIN_PASSWORD: "{noop}admin-secret"
+  CONFIG_CLIENT_PASSWORD_ENCODED: "{noop}client-secret"
+  # The clients authenticate with the plaintext form.
+  CONFIG_CLIENT_PASSWORD: "client-secret"
+  ENCRYPT_KEYSTORE_PASSWORD: "keystore-secret"
+  RABBITMQ_USERNAME: "guest"
+  RABBITMQ_PASSWORD: "guest"

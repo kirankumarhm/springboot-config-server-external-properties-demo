@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.example.config</groupId>
+    <artifactId>version-a-git</artifactId>
+    <version>1.0.0</version>
+  </parent>
+
+  <artifactId>config-server</artifactId>
+  <name>config-server</name>
+  <description>Spring Cloud Config Server - Git backend, /monitor webhook, Bus broadcast</description>
+
+  <properties>
+    <!--
+      Lower than the project default (0.70). SecurityConfig and the application class need a full
+      context to instantiate; their behaviour is asserted by GitBackendIT (401/403 on the real
+      endpoints) and by scripts/e2e-test.sh, not by unit coverage.
+    -->
+    <coverage.line.min>0.45</coverage.line.min>
+    <coverage.branch.min>0.35</coverage.branch.min>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-config-server</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-config-monitor</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-bus-amqp</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <!--
+      TestRestTemplate moved in Spring Boot 4: it is no longer in
+      org.springframework.boot.test.web.client (part of spring-boot-starter-test) but in
+      org.springframework.boot.resttestclient, shipped as its own module.
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-resttestclient</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!--
+      Enables ASYMMETRIC {cipher} support. Without it the server only supports a symmetric
+      encrypt.key, which means every party that can encrypt a value can also decrypt every
+      other value. With an RSA keypair the private half never leaves the Config Server.
+    -->
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-rsa</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

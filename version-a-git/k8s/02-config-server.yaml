@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: config-server
+  namespace: config-demo
+automountServiceAccountToken: false   # the app never calls the Kubernetes API
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: config-server
+  namespace: config-demo
+spec:
+  selector:
+    app: config-server
+  ports:
+    - name: http
+      port: 8888
+      targetPort: 8888
+    # Management is a SEPARATE port so a NetworkPolicy can allow probes and scraping without
+    # exposing the Environment API, and so /actuator is never reachable on the app port.
+    - name: management
+      port: 9888
+      targetPort: 9888
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: config-server
+  namespace: config-demo
+  labels:
+    app: config-server
+spec:
+  replicas: 2          # safe for the JDBC backend: no shared filesystem, no working tree
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: config-server
+  template:
+    metadata:
+      labels:
+        app: config-server
+    spec:
+      serviceAccountName: config-server
+      # Long enough for in-flight requests to drain under the graceful shutdown configured in
+      # application.yml (spring.lifecycle.timeout-per-shutdown-phase).
+      # Kubernetes injects legacy Docker-link environment variables for every Service in the
+      # namespace, so a Service named "rabbitmq" produces RABBITMQ_PORT=tcp://10.x.x.x:5672.
+      # That shadows ${RABBITMQ_PORT:5672} in application.yml and the app dies at startup with
+      # NumberFormatException: For input string: "tcp://10.97.198.48:5672".
+      # Disabling service links removes the whole class of collision; RABBITMQ_PORT is also set
+      # explicitly in the ConfigMap so the intent is visible rather than implicit.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: config-server
+          image: config-git-demo-config-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8888
+            - name: management
+              containerPort: 9888
+          envFrom:
+            - configMapRef: { name: config-server-env }
+          env:
+            - name: MANAGEMENT_PORT
+              value: "9888"
+            - name: CONFIG_REPO_USERNAME
+              valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_REPO_USERNAME } }
+            - name: CONFIG_REPO_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_REPO_PASSWORD } }
+            - name: CONFIG_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_ADMIN_PASSWORD } }
+            - name: CONFIG_CLIENT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: config-credentials, key: CONFIG_CLIENT_PASSWORD_ENCODED }
+            - name: ENCRYPT_KEYSTORE_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: ENCRYPT_KEYSTORE_PASSWORD } }
+            - name: RABBITMQ_USERNAME
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_USERNAME } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_PASSWORD } }
+            # Makes the Spring Cloud Bus instance id traceable to a pod. Derived from SERVER_PORT
+            # it would be identical across every replica, since they all listen on the same port.
+            - name: APP_INDEX
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          volumeMounts:
+            - name: encryption-keystore
+              mountPath: /secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          # Startup probe first, so a slow start never trips the liveness probe and causes a
+          # crash loop. Only after it passes do liveness and readiness begin.
+          startupProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: management }
+            periodSeconds: 15
+            failureThreshold: 3
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: encryption-keystore
+          secret:
+            secretName: config-encryption-keystore
+            defaultMode: 0400
+        # readOnlyRootFilesystem is on, but the JVM still needs a writable temp dir.
+        - name: tmp
+          emptyDir: {}
+---
+# With maxUnavailable: 0 on the Deployment and 2 replicas, this keeps a voluntary disruption
+# (node drain, cluster upgrade) from taking both Config Servers at once - which would make every
+# client that restarts during the window fail its fail-fast startup.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: config-server
+  namespace: config-demo
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: config-server

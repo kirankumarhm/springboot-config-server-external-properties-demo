@@ -1,0 +1,143 @@
+name: config-git-demo
+
+services:
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: cfg-git-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  config-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: config-server
+    container_name: cfg-git-server
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8888:8888"
+      - "9898:9888"
+    volumes:
+      # MUST be writable, and that is a property of the file:// backend rather than a shortcut.
+      # With a file: URI, JGitEnvironmentRepository uses the repository path directly as its
+      # working directory (basedir is ignored, no clone happens) and performs a real
+      # `git checkout <label>`, which needs to create .git/index.lock. Mounting :ro fails with
+      # "Read-only file system", and the server then reports the misleading
+      # "No such label: master" as it falls back from the default label.
+      #
+      # The Config Server still never *writes configuration* - it only checks out - so CON-04
+      # holds. The production answer to NFR-51 is a remote uri (ssh:/https:), where the server
+      # clones into its own basedir and never touches the source repository at all.
+      - ../config-repo:/config-repo
+      # The private key is a mounted secret, read-only, never baked into the image.
+      - ../secrets:/secrets:ro
+    environment:
+      MANAGEMENT_PORT: 9888
+      ENCRYPT_KEYSTORE_LOCATION: file:/secrets/config-server.p12
+      ENCRYPT_KEYSTORE_PASSWORD: keystore-secret
+      ENCRYPT_KEYSTORE_ALIAS: configkey
+      CONFIG_REPO_URI: file:///config-repo
+      CONFIG_REPO_LABEL: main
+      RABBITMQ_HOST: rabbitmq
+      CONFIG_ADMIN_PASSWORD: "{noop}admin-secret"
+      CONFIG_CLIENT_PASSWORD: "{noop}client-secret"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9888/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  inventory-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: inventory-service
+    container_name: cfg-git-inventory
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+      - "9081:9081"
+    environment:
+      SERVER_PORT: 8081
+      MANAGEMENT_PORT: 9081
+      APP_INDEX: 8081
+      CONFIG_SERVER_URI: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9081/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  pricing-service:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: pricing-service
+    container_name: cfg-git-pricing
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+      - "9082:9082"
+    environment:
+      SERVER_PORT: 8082
+      MANAGEMENT_PORT: 9082
+      APP_INDEX: 8082
+      CONFIG_SERVER_URI: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9082/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # Second pricing instance, to prove ONE broadcast reaches EVERY instance (AC-03).
+  # Distinct APP_INDEX keeps the bus service id unique.
+  pricing-service-2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MODULE: pricing-service
+    container_name: cfg-git-pricing-2
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+      - "9083:9083"
+    environment:
+      SERVER_PORT: 8083
+      MANAGEMENT_PORT: 9083
+      APP_INDEX: 8083
+      CONFIG_SERVER_URI: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9083/actuator/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s

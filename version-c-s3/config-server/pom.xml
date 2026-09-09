@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.example.config</groupId>
+    <artifactId>version-c-s3</artifactId>
+    <version>1.0.0</version>
+  </parent>
+
+  <artifactId>config-server</artifactId>
+  <name>config-server</name>
+  <description>Config Server - AWS S3 backend with S3 Event Notification change detection</description>
+
+  <properties>
+    <!--
+      Lower than the project default (0.70), for a documented reason. The detectors and the
+      key->application mapper - where all the logic lives - are covered at 31 unit tests.
+      What remains uncovered is SecurityConfig, which needs a full application context with a
+      live S3 endpoint and broker to instantiate; its behaviour is asserted end to end by
+      scripts/e2e-test.sh (401 unauthenticated, 200 authenticated).
+    -->
+    <coverage.line.min>0.45</coverage.line.min>
+    <coverage.branch.min>0.35</coverage.branch.min>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-config-server</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-bus-amqp</artifactId>
+    </dependency>
+    <!--
+      Presence of this artifact plus the 'awss3' profile is what activates
+      AwsS3EnvironmentRepository. Version is managed by the Spring Cloud AWS BOM - never pin an
+      individual awssdk artifact, the SDK must move as a consistent set.
+    -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>s3</artifactId>
+    </dependency>
+    <!-- Consumes the S3 -> SQS change notifications. -->
+    <dependency>
+      <groupId>io.awspring.cloud</groupId>
+      <artifactId>spring-cloud-aws-starter-sqs</artifactId>
+    </dependency>
+    <!--
+      Declared explicitly: the S3 event body is parsed as raw JSON, and relying on Jackson
+      arriving transitively through some other starter is exactly the kind of accidental
+      dependency that breaks when a starter's own dependencies change.
+    -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <!--
+      Enables ASYMMETRIC {cipher} support. Without it the server only supports a symmetric
+      encrypt.key, which means every party that can encrypt a value can also decrypt every
+      other value. With an RSA keypair the private half never leaves the Config Server.
+    -->
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-rsa</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.awaitility</groupId>
+      <artifactId>awaitility</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

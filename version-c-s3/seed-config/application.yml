@@ -1,0 +1,4 @@
+demo:
+  shared:
+    banner-message: "Configured centrally via Spring Cloud Config - AWS S3 backend"
+    environment-label: "local"

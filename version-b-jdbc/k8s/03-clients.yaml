@@ -1,0 +1,228 @@
+# The two client services. pricing-service runs 2 replicas specifically to prove that ONE
+# broadcast reaches EVERY instance - the property that a poll-based design cannot give you.
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+  namespace: config-demo
+spec:
+  selector:
+    app: inventory-service
+  ports:
+    - name: http
+      port: 8081
+      targetPort: 8081
+    - name: management
+      port: 9081
+      targetPort: 9081
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+  namespace: config-demo
+  labels:
+    app: inventory-service
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: inventory-service
+  template:
+    metadata:
+      labels:
+        app: inventory-service
+    spec:
+      automountServiceAccountToken: false
+      # Kubernetes injects legacy Docker-link environment variables for every Service in the
+      # namespace, so a Service named "rabbitmq" produces RABBITMQ_PORT=tcp://10.x.x.x:5672.
+      # That shadows ${RABBITMQ_PORT:5672} in application.yml and the app dies at startup with
+      # NumberFormatException: For input string: "tcp://10.97.198.48:5672".
+      # Disabling service links removes the whole class of collision; RABBITMQ_PORT is also set
+      # explicitly in the ConfigMap so the intent is visible rather than implicit.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: inventory-service
+          image: config-jdbc-demo-inventory-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+            - name: management
+              containerPort: 9081
+          envFrom:
+            - configMapRef: { name: client-env }
+          env:
+            - name: CONFIG_CLIENT_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_CLIENT_PASSWORD } }
+            - name: RABBITMQ_USERNAME
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_USERNAME } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_PASSWORD } }
+            - name: APP_INDEX
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          # Generous failureThreshold: the client fails fast if the Config Server is unreachable,
+          # which is correct behaviour but means a cold start where the server is still coming up
+          # needs room to retry rather than being declared dead.
+          startupProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 5
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: management }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "150m", memory: "384Mi" }
+            limits: { cpu: "1", memory: "768Mi" }
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pricing-service
+  namespace: config-demo
+spec:
+  selector:
+    app: pricing-service
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+    - name: management
+      port: 9082
+      targetPort: 9082
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pricing-service
+  namespace: config-demo
+  labels:
+    app: pricing-service
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: pricing-service
+  template:
+    metadata:
+      labels:
+        app: pricing-service
+    spec:
+      automountServiceAccountToken: false
+      # Kubernetes injects legacy Docker-link environment variables for every Service in the
+      # namespace, so a Service named "rabbitmq" produces RABBITMQ_PORT=tcp://10.x.x.x:5672.
+      # That shadows ${RABBITMQ_PORT:5672} in application.yml and the app dies at startup with
+      # NumberFormatException: For input string: "tcp://10.97.198.48:5672".
+      # Disabling service links removes the whole class of collision; RABBITMQ_PORT is also set
+      # explicitly in the ConfigMap so the intent is visible rather than implicit.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas so a single node loss cannot take every instance. On a one-node minikube
+      # this is unsatisfiable, hence ScheduleAnyway rather than DoNotSchedule.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: pricing-service
+      containers:
+        - name: pricing-service
+          image: config-jdbc-demo-pricing-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8082
+            - name: management
+              containerPort: 9082
+          envFrom:
+            - configMapRef: { name: client-env }
+          env:
+            - name: CONFIG_CLIENT_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_CLIENT_PASSWORD } }
+            - name: RABBITMQ_USERNAME
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_USERNAME } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_PASSWORD } }
+            - name: APP_INDEX
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          startupProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 5
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /actuator/health/readiness, port: management }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /actuator/health/liveness, port: management }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "150m", memory: "384Mi" }
+            limits: { cpu: "1", memory: "768Mi" }
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Only the Config Server may reach PostgreSQL. Without this, any pod in the namespace could read
+# the properties table directly and bypass the audit trail the trigger provides.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-allow-config-server-only
+  namespace: config-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: config-server
+      ports:
+        - protocol: TCP
+          port: 5432

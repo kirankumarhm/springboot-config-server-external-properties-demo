@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.example.config</groupId>
+    <artifactId>version-b-jdbc</artifactId>
+    <version>1.0.0</version>
+  </parent>
+
+  <artifactId>config-server</artifactId>
+  <name>config-server</name>
+  <description>Config Server - PostgreSQL/JDBC backend with LISTEN/NOTIFY change detection</description>
+
+  <properties>
+    <!--
+      Lower than the project default (0.70) for a specific, documented reason: this module's
+      largest class, PostgresNotifyChangeDetector, is a background thread holding a raw socket in
+      a blocking getNotifications() loop. Unit-testing it would mean testing a mock of the
+      PostgreSQL driver, which proves nothing. Its real behaviour - trigger, transactional NOTIFY,
+      statement-level collapsing, delivery to a LISTENing session - is proven by
+      ConfigChangeTriggerIT against a real PostgreSQL container, plus scripts/e2e-test.sh AC-15
+      for listener kill/recovery. SecurityConfig likewise needs a full context with a live
+      database and broker to instantiate.
+    -->
+    <coverage.line.min>0.25</coverage.line.min>
+    <coverage.branch.min>0.20</coverage.branch.min>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-config-server</artifactId>
+    </dependency>
+    <!--
+      No spring-cloud-config-monitor here. /monitor is an HTTP entry point for Git hosting
+      providers; the database detector runs in-process and publishes the bus event directly.
+    -->
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-starter-bus-amqp</artifactId>
+    </dependency>
+    <!-- Required for JdbcEnvironmentRepository to be auto-configured under the 'jdbc' profile. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jdbc</artifactId>
+    </dependency>
+    <!--
+      Compile scope, not runtime: the LISTEN/NOTIFY detector imports PGConnection and
+      PGNotification directly. There is no JDBC-standard API for asynchronous notifications,
+      so this is a deliberate, documented coupling to the PostgreSQL driver - and it is exactly
+      why the ConfigChangeDetector SPI exists, so another database plugs in a different
+      implementation rather than forcing a rewrite.
+    -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+    </dependency>
+    <!--
+      Schema as versioned code, never ddl-auto (NFR-52).
+
+      spring-boot-flyway is REQUIRED in Spring Boot 4 and is easy to miss when migrating from
+      Boot 3. Boot 4 split autoconfiguration into per-technology modules, so flyway-core on the
+      classpath no longer triggers migration on startup - it just sits there. The failure mode is
+      silent: the application starts cleanly and only fails later with
+      'relation "properties" does not exist'.
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-flyway</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <!--
+      Enables ASYMMETRIC {cipher} support. Without it the server only supports a symmetric
+      encrypt.key, which means every party that can encrypt a value can also decrypt every
+      other value. With an RSA keypair the private half never leaves the Config Server.
+    -->
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-rsa</artifactId>
+    </dependency>
+    <!-- Integration tests run against a real PostgreSQL: statement-level triggers with
+         transition tables and transactional NOTIFY do not exist in an in-memory database. -->
+    <!--
+      Integration tests run against a real PostgreSQL: statement-level triggers with transition
+      tables and transactional NOTIFY do not exist in an in-memory database.
+
+      NOTE: these drag in junit:junit 4.x transitively and it CANNOT be excluded -
+      PostgreSQLContainer implements JUnit 4's TestRule, so the interface must be on the test
+      compile classpath even though only the Jupiter engine is registered at runtime. See the
+      enforcer comment in the parent POM.
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

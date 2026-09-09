@@ -1,0 +1,37 @@
+#!/bin/sh
+# Bridges a local commit to the Config Server /monitor webhook.
+#
+# A local file:// repository has no hosting provider, so nothing calls the Config Server when
+# configuration changes. This hook is that missing caller: it makes `git commit` behave exactly
+# like a GitHub push, which is what keeps the propagation path identical to production.
+#
+# Best-effort by design: a failed notify never blocks the commit. Manual recovery is
+# POST /actuator/busrefresh/<app> on the Config Server.
+
+MONITOR_URL="${CONFIG_SERVER_MONITOR_URL:-http://localhost:8888/monitor}"
+AUTH="${CONFIG_ADMIN_USERNAME:-config-admin}:${CONFIG_ADMIN_PASSWORD_PLAIN:-admin-secret}"
+
+CHANGED=$(git diff-tree -r --no-commit-id --name-only HEAD)
+CORRELATION_ID=$(git rev-parse --short HEAD)
+
+if [ -z "$CHANGED" ]; then
+  exit 0
+fi
+
+for file in $CHANGED; do
+  # Pass the changed filename through verbatim. The Config Server's PropertyPathEndpoint owns
+  # the path -> application mapping (application.yml => all apps, foo.yml => app "foo"), so the
+  # hook stays dumb and the scoping rule lives in one place.
+  RESPONSE=$(curl -sf -m 5 -u "$AUTH" \
+    -H "X-Correlation-Id: $CORRELATION_ID" \
+    --data-urlencode "path=$file" \
+    "$MONITOR_URL" 2>/dev/null)
+
+  if [ $? -eq 0 ]; then
+    echo "post-commit: notified Config Server for '$file' -> broadcast ${RESPONSE:-[]}"
+  else
+    echo "post-commit: WARNING could not notify $MONITOR_URL for '$file'" >&2
+  fi
+done
+
+exit 0

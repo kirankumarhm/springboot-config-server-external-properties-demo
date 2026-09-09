@@ -1,0 +1,5 @@
+target/
+secrets/
+*.jks
+*.p12
+.DS_Store

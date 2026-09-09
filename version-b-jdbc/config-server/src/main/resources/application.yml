@@ -1,0 +1,123 @@
+server:
+  # Graceful shutdown: without this a rolling update severs in-flight requests. Pair with
+  # terminationGracePeriodSeconds and a preStop hook so endpoints deregister before SIGTERM.
+  shutdown: graceful
+  port: 8888
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  application:
+    name: config-server
+  # The 'jdbc' profile name is load-bearing: Spring Cloud Config keys JdbcEnvironmentRepository
+  # autoconfiguration off it. (This is the SERVER's own profile and is unrelated to the profiles
+  # it serves to clients.)
+  profiles:
+    active: jdbc
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/configdb}
+    username: ${DB_USERNAME:config_admin}
+    password: ${DB_PASSWORD:config-secret}
+    hikari:
+      pool-name: config-read-pool
+      maximum-pool-size: 10
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  cloud:
+    config:
+      server:
+        jdbc:
+          enabled: true
+          # The shipped default is 'master', NOT 'main'. Leaving it unset makes every lookup
+          # return an empty environment, which surfaces as clients starting with no properties.
+          default-label: ${CONFIG_LABEL:main}
+          # A query failure must be loud. With fail-on-error=false a database outage looks
+          # exactly like "this application has no configuration", which is far worse.
+          fail-on-error: true
+          order: 1
+          # BOTH statements are overridden, and that is mandatory here for two separate reasons.
+          #
+          # 1. Case sensitivity. The shipped defaults select "KEY" and "VALUE" - uppercase and
+          #    double-quoted. In PostgreSQL, double quotes make an identifier case-SENSITIVE, so
+          #    "KEY" does not match a lowercase `key` column and the server fails with
+          #    'column "KEY" does not exist'. Either the DDL declares uppercase quoted columns,
+          #    or the statements are overridden as they are here. Idiomatic lowercase columns are
+          #    kept because operators change configuration with hand-written SQL in this version.
+          #
+          # 2. Overriding only `sql` sets an internal configIncomplete flag which SKIPS the
+          #    null-profile queries entirely and instead prepends 'default,' to the profile list -
+          #    silently changing resolution semantics. Override both, or neither.
+          sql: 'SELECT "key", "value" FROM properties WHERE application=? AND profile=? AND label=?'
+          sql-without-profile: 'SELECT "key", "value" FROM properties WHERE application=? AND profile IS NULL AND label=?'
+        # The built-in Config Server health indicator probes application 'app'/profile 'default'
+        # by default, which resolves to nothing meaningful here. Point it at a real application so
+        # health reflects an actual, serveable lookup.
+        health:
+          repositories:
+            inventory-service:
+              name: inventory-service
+              profiles: default
+              label: main
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+
+app:
+  security:
+    admin-username: ${CONFIG_ADMIN_USERNAME:config-admin}
+    admin-password: ${CONFIG_ADMIN_PASSWORD:{noop}admin-secret}
+    client-username: ${CONFIG_CLIENT_USERNAME:config-client}
+    client-password: ${CONFIG_CLIENT_PASSWORD:{noop}client-secret}
+  config-change:
+    listener:
+      channel: config_changed
+      poll-timeout-millis: 10000
+      initial-backoff-millis: 1000
+      max-backoff-millis: 30000
+    revision-poller:
+      initial-delay: 15000
+      interval: 15000
+
+# Asymmetric encryption for {cipher} values. The private key lives ONLY here; the keystore is a
+# mounted secret and never baked into the image or committed. Operators can be handed the public
+# certificate alone and still encrypt new values.
+encrypt:
+  key-store:
+    location: ${ENCRYPT_KEYSTORE_LOCATION:file:./secrets/config-server.p12}
+    password: ${ENCRYPT_KEYSTORE_PASSWORD:keystore-secret}
+    alias: ${ENCRYPT_KEYSTORE_ALIAS:configkey}
+    # MUST equal `password`: PKCS12 does not support a distinct key password and keytool silently
+    # ignores -keypass, so a different value here fails at startup with UnrecoverableKeyException.
+    secret: ${ENCRYPT_KEYSTORE_PASSWORD:keystore-secret}
+
+management:
+  # Actuator on a SEPARATE port, so a NetworkPolicy can allow probes and metrics scraping without
+  # exposing the Environment API, and /actuator/env can never be reached on the app port.
+  # Boot creates a management CHILD context for this; ManagementWebSecurityAutoConfiguration
+  # secures it (health/info open, everything else authenticated) because no SecurityFilterChain
+  # is declared in that child context - the chain in SecurityConfig applies to the parent only.
+  server:
+    port: ${MANAGEMENT_PORT:9888}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,busrefresh,env,configprops
+  endpoint:
+    health:
+      show-details: always
+    env:
+      show-values: never
+    configprops:
+      show-values: never
+  health:
+    probes:
+      enabled: true
+
+logging:
+  level:
+    com.example.config.server.change: DEBUG
+    org.springframework.cloud.bus: INFO

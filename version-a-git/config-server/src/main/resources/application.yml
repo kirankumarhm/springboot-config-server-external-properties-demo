@@ -1,0 +1,88 @@
+server:
+  # Graceful shutdown: without this a rolling update severs in-flight requests. Pair with
+  # terminationGracePeriodSeconds and a preStop hook so endpoints deregister before SIGTERM.
+  shutdown: graceful
+  port: 8888
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  application:
+    name: config-server
+  cloud:
+    config:
+      server:
+        git:
+          # Externalised so the same image runs against a local repo or a remote GitHub repo.
+          uri: ${CONFIG_REPO_URI:file:///config-repo}
+          default-label: ${CONFIG_REPO_LABEL:main}
+          timeout: 10
+          # Remote-only settings, kept here for the switch to GitHub:
+          # force-pull: true
+          # basedir: /var/tmp/config-repo-cache
+          # username: ${CONFIG_REPO_USERNAME:}
+          # password: ${CONFIG_REPO_PASSWORD:}
+        monitor:
+          # Verified empirically on spring-cloud-config 5.0.5: /monitor accepts BOTH the
+          # form-encoded (path=...) and GitHub-shaped payloads with the validation filter
+          # ENABLED and no webhook-secret configured. The documented behaviour that it
+          # "rejects all incoming webhook requests" without secrets does not apply to
+          # unsigned requests, so no local-only relaxation is needed here.
+          validation-filter-enabled: ${CONFIG_MONITOR_VALIDATION:true}
+          # For a REMOTE GitHub repo, set a secret so pushes are authenticated by signature:
+          # github:
+          #   webhook-secret: ${GITHUB_WEBHOOK_SECRET}
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+
+app:
+  security:
+    admin-username: ${CONFIG_ADMIN_USERNAME:config-admin}
+    # {noop} is acceptable for a local demo only. Supply {bcrypt}$2a$... in a deployed
+    # environment; the delegating password encoder handles both without a code change.
+    admin-password: ${CONFIG_ADMIN_PASSWORD:{noop}admin-secret}
+    client-username: ${CONFIG_CLIENT_USERNAME:config-client}
+    client-password: ${CONFIG_CLIENT_PASSWORD:{noop}client-secret}
+
+# Asymmetric encryption for {cipher} values. The private key lives ONLY here; the keystore is a
+# mounted secret and never baked into the image or committed. Operators can be handed the public
+# certificate alone and still encrypt new values.
+encrypt:
+  key-store:
+    location: ${ENCRYPT_KEYSTORE_LOCATION:file:./secrets/config-server.p12}
+    password: ${ENCRYPT_KEYSTORE_PASSWORD:keystore-secret}
+    alias: ${ENCRYPT_KEYSTORE_ALIAS:configkey}
+    # MUST equal `password`: PKCS12 does not support a distinct key password and keytool silently
+    # ignores -keypass, so a different value here fails at startup with UnrecoverableKeyException.
+    secret: ${ENCRYPT_KEYSTORE_PASSWORD:keystore-secret}
+
+management:
+  # Actuator on a SEPARATE port, so a NetworkPolicy can allow probes and metrics scraping without
+  # exposing the Environment API, and /actuator/env can never be reached on the app port.
+  # Boot creates a management CHILD context for this; ManagementWebSecurityAutoConfiguration
+  # secures it (health/info open, everything else authenticated) because no SecurityFilterChain
+  # is declared in that child context - the chain in SecurityConfig applies to the parent only.
+  server:
+    port: ${MANAGEMENT_PORT:9888}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,busrefresh,env,configprops
+  endpoint:
+    health:
+      show-details: always
+    env:
+      show-values: never
+    configprops:
+      show-values: never
+  health:
+    probes:
+      enabled: true
+
+logging:
+  level:
+    org.springframework.cloud.config.monitor: DEBUG
+    org.springframework.cloud.bus: DEBUG

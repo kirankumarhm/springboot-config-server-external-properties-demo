@@ -1,0 +1,113 @@
+server:
+  # Graceful shutdown: without this a rolling update severs in-flight requests. Pair with
+  # terminationGracePeriodSeconds and a preStop hook so endpoints deregister before SIGTERM.
+  shutdown: graceful
+  port: 8888
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  application:
+    name: config-server
+  # 'awss3' is the profile name Spring Cloud Config keys AwsS3EnvironmentRepository off.
+  profiles:
+    active: awss3
+  cloud:
+    aws:
+      region:
+        static: ${AWS_REGION:us-east-1}
+      # endpoint + static credentials are for the local Floci emulator only. On real AWS both are
+      # omitted so the Default Credential Provider Chain (IRSA / instance profile) takes over.
+      endpoint: ${AWS_ENDPOINT:http://localhost.floci.io:4566}
+      credentials:
+        access-key: ${AWS_ACCESS_KEY_ID:test}
+        secret-key: ${AWS_SECRET_ACCESS_KEY:test}
+      sqs:
+        endpoint: ${AWS_ENDPOINT:http://localhost.floci.io:4566}
+    config:
+      server:
+        awss3:
+          region: ${AWS_REGION:us-east-1}
+          bucket: ${CONFIG_BUCKET:acme-platform-config}
+          endpoint: ${AWS_ENDPOINT:http://localhost.floci.io:4566}
+          # Standard layout: object keys are byte-identical to version A's filenames, so the same
+          # configuration content is portable across all three backends.
+          use-directory-layout: false
+          order: 1
+        health:
+          repositories:
+            inventory-service:
+              name: inventory-service
+              profiles: default
+              label: main
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+
+app:
+  # Used by S3ObjectKeyApplicationMapper to resolve a profile suffix exactly, instead of the
+  # dash-guessing the Git backend is forced into.
+  known-applications: inventory-service,pricing-service
+  security:
+    admin-username: ${CONFIG_ADMIN_USERNAME:config-admin}
+    admin-password: ${CONFIG_ADMIN_PASSWORD:{noop}admin-secret}
+    client-username: ${CONFIG_CLIENT_USERNAME:config-client}
+    client-password: ${CONFIG_CLIENT_PASSWORD:{noop}client-secret}
+  config-change:
+    s3:
+      queue-name: ${CONFIG_CHANGE_QUEUE:config-change-queue}
+      key-prefix: ${CONFIG_KEY_PREFIX:main/}
+
+# Asymmetric encryption for {cipher} values. The private key lives ONLY here; the keystore is a
+# mounted secret and never baked into the image or committed. Operators can be handed the public
+# certificate alone and still encrypt new values.
+encrypt:
+  key-store:
+    location: ${ENCRYPT_KEYSTORE_LOCATION:file:./secrets/config-server.p12}
+    password: ${ENCRYPT_KEYSTORE_PASSWORD:keystore-secret}
+    alias: ${ENCRYPT_KEYSTORE_ALIAS:configkey}
+    # MUST equal `password`: PKCS12 does not support a distinct key password and keytool silently
+    # ignores -keypass, so a different value here fails at startup with UnrecoverableKeyException.
+    secret: ${ENCRYPT_KEYSTORE_PASSWORD:keystore-secret}
+
+management:
+  # Actuator on a SEPARATE port, so a NetworkPolicy can allow probes and metrics scraping without
+  # exposing the Environment API, and /actuator/env can never be reached on the app port.
+  # Boot creates a management CHILD context for this; ManagementWebSecurityAutoConfiguration
+  # secures it (health/info open, everything else authenticated) because no SecurityFilterChain
+  # is declared in that child context - the chain in SecurityConfig applies to the parent only.
+  server:
+    port: ${MANAGEMENT_PORT:9888}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,busrefresh,env,configprops
+  endpoint:
+    health:
+      show-details: always
+    env:
+      show-values: never
+    configprops:
+      show-values: never
+  health:
+    probes:
+      enabled: true
+
+logging:
+  level:
+    com.example.config.server.change: DEBUG
+    # The S3 backend probes every candidate object key for a request - {application,application-
+    # <profile>} x {.properties,.yml,.yaml,.json} - and logs a WARN for each key that does not
+    # exist. With three objects in the bucket most probes miss, which produced ~100 WARN lines
+    # per handful of requests and would bury a real problem in production.
+    #
+    # What this trades away: the same message is used for "object absent" (normal) and "object
+    # present but unparseable" (a real fault), so the latter is now silent here. That is
+    # acceptable because a malformed object cannot pass unnoticed - the properties simply do not
+    # arrive, the client's validation rejects the snapshot, it keeps last-known-good, and the
+    # rejection surfaces in /actuator/health, the config.refresh.failures metric and the audit log.
+    org.springframework.cloud.config.server.environment.S3ConfigFile: ERROR
+    org.springframework.cloud.config.server.environment.AwsS3EnvironmentRepository: ERROR
+    io.awspring.cloud.sqs: INFO

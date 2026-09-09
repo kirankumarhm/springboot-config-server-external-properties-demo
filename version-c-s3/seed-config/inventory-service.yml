@@ -1,0 +1,8 @@
+inventory:
+  warehouse-code: "WH-BLR-01"
+  max-order-quantity: 500
+  express-shipping-enabled: false
+  low-stock-threshold: 25
+  # Stored ENCRYPTED in the bucket. SSE-KMS protects the object at rest; {cipher} protects
+  # the value from anyone with read access to the bucket. Defence in depth.
+  downstream-api-key: '{cipher}AgCrMOi+xiQ79ArYH0FaLVfK4NPoNjpX3G0rRKPr1uEBXRx5CWl/OmRebEsN8lYN9bgyIabej+PROKom+X/GJgXiRcM2LX7m+6BdYhs5CMfiVTgt4lGjbSsbOPek0mvVZx6B+o0I89Rz5NnVzp7SinV3v5VmiKQcIu/4Cmkl+kxF+8lKdSrN4Dp5NXEVOi4EX5D06VGkCf7K4P1xcTuXOZfnjCpD3YUbZXlLdxVwYe1vPuxUt2AdbtbidhSfRutrsABdrj49Ntx6dzZM8v+2LDXRf9ba21YFNZtVC9W6YgBWlbNJteT/3CF00jdlzToSuszMzY1wNgNgVDDyv5Sc58X2V5S2PpesAreEMyx+v//gXA/LW8IuWKliowc6Df1vwICp0j5X4N5+yzWmGKwT0s2vAPsKaoAVwjyqdxKynjufTjx0/zSey/wxgBX/9u4lIWMSYjhaQ6glBgSa+Qx7KVFxnkreR9svnP0FYkBTzZMONxos0yMhJRRfkWkGoC7e/8DbwZU/H/0qH0zrymvmyrKxuQ+IRowyC6rtXhVU13w53Prm7E6hdlysBBHcs9qBM5556ToCBnrquuxKSxQ7IuZyixKEjEQSS2KeGQ/QubHy6DG4yCPGJOV8+dpxifBDn9elzqKIqmWOioC4IPKbP3eq07zlrL7RWsH/v+HzeAyg2Hk1brsnKab4gz0lQrA3KXP4MOeqRoUHxe8tRZM5CTuN+DjS+80NL0hrwDpSvGGfCA=='

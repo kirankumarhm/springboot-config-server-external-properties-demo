@@ -1,0 +1,12 @@
+# TEST-ONLY application.yml, shadowing the production one on the test classpath.
+#
+# The production file activates the awss3 profile, points encrypt.key-store.location at
+# ./secrets/config-server.p12 and configures RabbitMQ. In a test the working directory is the
+# module, where secrets/ does not exist (it lives one level up), so the context fails with
+# "Invalid keystore location" before a single assertion runs - and the S3/Rabbit wiring is not
+# what these tests are about.
+#
+# Each test declares exactly the properties it needs instead.
+spring:
+  main:
+    banner-mode: "off"

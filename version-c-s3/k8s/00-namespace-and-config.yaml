@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: config-demo
+  labels:
+    app.kubernetes.io/part-of: config-demo
+---
+# Non-secret settings. Anything sensitive is in the Secret below, never here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-server-env
+  namespace: config-demo
+data:
+  # In the S3 backend the label is a key PREFIX, so main/ in the bucket IS label "main".
+  CONFIG_KEY_PREFIX: "main/"
+  CONFIG_BUCKET: "acme-platform-config"
+  CONFIG_CHANGE_QUEUE: "config-change-queue"
+  AWS_REGION: "us-east-1"
+  # On real AWS: DELETE the AWS_ENDPOINT line and the static credentials in the Secret, and attach
+  # an IAM role via IRSA instead. The endpoint override exists only for a local emulator.
+  #
+  # KNOWN CONSTRAINT for a local emulator in-cluster: AwsS3EnvironmentRepositoryFactory builds its
+  # own S3Client with no injection point and no path-style option (verified in source), so the SDK
+  # uses virtual-host addressing and needs <bucket>.<endpoint-host> to resolve. Against an
+  # in-cluster emulator that requires a hostAliases entry per bucket, pointing at the emulator
+  # Service's ClusterIP. Against real AWS it just works.
+  # Floci reached over the Docker bridge, where the k3s node also lives.
+  #
+  # Using the IP rather than a hostname is the whole trick: AwsS3EnvironmentRepositoryFactory
+  # builds its own S3Client with no path-style option, so with a hostname the SDK would use
+  # virtual-host addressing and need <bucket>.<host> to resolve in cluster DNS. The SDK
+  # automatically falls back to PATH-style when the endpoint host is a bare IP, so no hostAliases
+  # entry and no per-bucket DNS record is needed.
+  AWS_ENDPOINT: "http://172.17.0.2:4566"
+  RABBITMQ_HOST: "rabbitmq"
+  RABBITMQ_PORT: "5672"
+  ENCRYPT_KEYSTORE_LOCATION: "file:/secrets/config-server.p12"
+  ENCRYPT_KEYSTORE_ALIAS: "configkey"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: client-env
+  namespace: config-demo
+data:
+  CONFIG_SERVER_URI: "http://config-server:8888"
+  RABBITMQ_HOST: "rabbitmq"
+  RABBITMQ_PORT: "5672"
+---
+# Created here with literal values only so the manifests are self-contained and applyable.
+# In a real cluster this object is NOT in git: it comes from External Secrets, Sealed Secrets,
+# Vault injection or SOPS. The passwords below are the same local-development values as the
+# compose stack, and are worthless outside it.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: config-credentials
+  namespace: config-demo
+type: Opaque
+stringData:
+  # Only for a local emulator. On real AWS remove these and use IRSA.
+  AWS_ACCESS_KEY_ID: "test"
+  AWS_SECRET_ACCESS_KEY: "test"
+  # {noop} is acceptable only because these are throwaway local credentials. The delegating
+  # password encoder accepts {bcrypt}$2a$... unchanged, which is what a real deployment supplies.
+  CONFIG_ADMIN_PASSWORD: "{noop}admin-secret"
+  CONFIG_CLIENT_PASSWORD_ENCODED: "{noop}client-secret"
+  # The clients authenticate with the plaintext form.
+  CONFIG_CLIENT_PASSWORD: "client-secret"
+  ENCRYPT_KEYSTORE_PASSWORD: "keystore-secret"
+  RABBITMQ_USERNAME: "guest"
+  RABBITMQ_PASSWORD: "guest"

@@ -1,0 +1,165 @@
+name: CI
+
+# Every version is an independent Maven reactor, so they build in parallel via a matrix.
+# A failure in one does not mask the others (fail-fast is off).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - version-a-git
+          - version-b-jdbc
+          - version-c-s3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      # The keystore is a secret and is NOT committed, but the Config Server fails to start
+      # without one. Generating a throwaway keypair per run is correct: CI never needs to decrypt
+      # the real {cipher} values, only to prove the encryption wiring loads.
+      - name: Generate a throwaway encryption keystore
+        working-directory: ${{ matrix.version }}
+        run: ./scripts/generate-keystore.sh
+
+      # Runs the full gate set: Enforcer, Spotless (check), Checkstyle, SpotBugs, JaCoCo
+      # coverage thresholds, ArchUnit, unit tests and the Testcontainers integration tests.
+      # Docker is present on ubuntu-latest, which is what the *IT tests require.
+      - name: Build and verify
+        working-directory: ${{ matrix.version }}
+        run: mvn -B --no-transfer-progress clean verify
+
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.version }}
+          path: |
+            ${{ matrix.version }}/**/target/surefire-reports/**
+            ${{ matrix.version }}/**/target/failsafe-reports/**
+            ${{ matrix.version }}/**/target/site/jacoco/**
+          retention-days: 7
+          if-no-files-found: warn
+
+  # End-to-end proof that a configuration change propagates to running services. This is the
+  # requirement the whole project exists for, so it gets its own job against real containers
+  # rather than being folded into the unit build.
+  e2e:
+    name: e2e ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        # version-c-s3 is excluded: its stack needs the Floci AWS emulator reachable at a
+        # bucket-prefixed hostname, which the compose stack solves with extra_hosts against the
+        # developer's host. Its change-detection path is covered in-build by SqsChangeDetectorIT.
+        version:
+          - version-a-git
+          - version-b-jdbc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Generate a throwaway encryption keystore
+        working-directory: ${{ matrix.version }}
+        run: ./scripts/generate-keystore.sh
+
+      - name: Build jars
+        working-directory: ${{ matrix.version }}
+        run: mvn -B --no-transfer-progress -Pfast clean install -DskipTests
+
+      # Git identity is required: version A's acceptance suite drives configuration changes by
+      # committing to the config repository, and git refuses to commit without one.
+      - name: Configure git identity for the config repository
+        if: matrix.version == 'version-a-git'
+        working-directory: ${{ matrix.version }}
+        run: |
+          git -C config-repo init -b main 2>/dev/null || true
+          git -C config-repo config user.email "ci@example.com"
+          git -C config-repo config user.name "CI"
+          git -C config-repo add -A
+          git -C config-repo commit -q -m "seed" 2>/dev/null || true
+          ./scripts/install-git-hook.sh
+
+      - name: Start the stack
+        working-directory: ${{ matrix.version }}
+        run: docker compose -f docker/compose.yaml up -d --build
+
+      - name: Wait for every service to report healthy
+        working-directory: ${{ matrix.version }}
+        run: |
+          for i in $(seq 1 60); do
+            sleep 5
+            state=$(docker compose -f docker/compose.yaml ps --format '{{.Health}}' | tr '\n' ' ')
+            echo "[$((i*5))s] $state"
+            if ! echo "$state" | grep -qE 'starting|unhealthy'; then
+              echo "all healthy"; exit 0
+            fi
+          done
+          echo "services did not become healthy"; exit 1
+
+      - name: Run the acceptance suite
+        working-directory: ${{ matrix.version }}
+        run: ./scripts/e2e-test.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: ${{ matrix.version }}
+        run: docker compose -f docker/compose.yaml logs --tail=200
+
+      - name: Tear down
+        if: always()
+        working-directory: ${{ matrix.version }}
+        run: docker compose -f docker/compose.yaml down -v
+
+  # Dependency CVE scan is a separate, scheduled concern: it downloads the NVD database and is
+  # far too slow to sit in the pull-request path.
+  security:
+    name: dependency CVE scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [version-a-git, version-b-jdbc, version-c-s3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+      - name: OWASP dependency-check
+        working-directory: ${{ matrix.version }}
+        run: mvn -B --no-transfer-progress -Psecurity verify -DskipTests

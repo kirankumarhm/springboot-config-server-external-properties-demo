@@ -1,0 +1,47 @@
+# --- build output ---
+target/
+!**/src/**/target/
+*.class
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+
+# --- SECRETS: never commit ---
+# Each version generates its own RSA keypair with scripts/generate-keystore.sh. The private key
+# decrypts every {cipher} value in that version's configuration backend, so it must stay local.
+# The encrypted values themselves ARE committed and are useless without these files.
+secrets/
+*.p12
+*.jks
+*.keystore
+*.pem
+*.key
+
+# --- generated kubeconfigs ---
+# deploy-floci-eks.sh writes one containing k3s client certificates.
+*.kubeconfig
+kubeconfig
+
+# --- local tooling / editor state ---
+.claude/
+.idea/
+.vscode/
+*.iml
+.settings/
+.project
+.classpath
+.factorypath
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- logs ---
+logs/
+*.log
+
+# NOTE: version-a-git/config-repo/ IS committed as plain files, deliberately.
+# It is the configuration "system of record" for version A and must be a git repository at
+# RUNTIME, but it must not be a nested repo inside this one (git would store a gitlink and anyone
+# cloning would get an empty directory). Run `git init -b main` inside it after cloning - the
+# README quick start and .github/workflows/ci.yml both do exactly that.

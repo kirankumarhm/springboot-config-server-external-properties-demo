@@ -1,0 +1,54 @@
+server:
+  # Graceful shutdown: without this a rolling update severs in-flight requests. Pair with
+  # terminationGracePeriodSeconds and a preStop hook so endpoints deregister before SIGTERM.
+  shutdown: graceful
+  port: ${SERVER_PORT:8081}
+
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  application:
+    name: inventory-service
+    # Makes the Spring Cloud Bus service id (app:index:id) unique per instance. Without this,
+    # two instances of the same app can collide and duplicate-event suppression silently drops
+    # a refresh on one of them.
+    index: ${APP_INDEX:${SERVER_PORT:8081}}
+  # No 'optional:' prefix, so an unreachable Config Server is a hard startup failure rather than
+  # a service that starts with no configuration. Retry parameters ride on the URI.
+  config:
+    import: "configserver:${CONFIG_SERVER_URI:http://localhost:8888}?fail-fast=true&max-attempts=6&initial-interval=1000&multiplier=1.5&max-interval=8000"
+  cloud:
+    config:
+      username: ${CONFIG_CLIENT_USERNAME:config-client}
+      password: ${CONFIG_CLIENT_PASSWORD:client-secret}
+      label: ${CONFIG_LABEL:main}
+      request-connect-timeout: 5000
+      request-read-timeout: 15000
+  rabbitmq:
+    host: ${RABBITMQ_HOST:localhost}
+    port: ${RABBITMQ_PORT:5672}
+    username: ${RABBITMQ_USERNAME:guest}
+    password: ${RABBITMQ_PASSWORD:guest}
+
+management:
+  server:
+    port: ${MANAGEMENT_PORT:9081}
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,refresh,busrefresh,configprops,env
+  endpoint:
+    health:
+      show-details: always
+    env:
+      show-values: never
+    configprops:
+      show-values: never
+  health:
+    probes:
+      enabled: true
+
+logging:
+  level:
+    com.example.config: INFO
+    org.springframework.cloud.bus: INFO
