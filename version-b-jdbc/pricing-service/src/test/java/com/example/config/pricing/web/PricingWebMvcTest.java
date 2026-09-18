@@ -5,11 +5,11 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.example.config.commons.ConfigRefreshAuditor;
-import com.example.config.commons.ConfigSnapshotStatus;
 import com.example.config.pricing.api.QuoteResponse;
 import com.example.config.pricing.domain.PricingSettings;
 import com.example.config.pricing.provider.PricingSettingsProvider;
+import com.example.config.pricing.refresh.ConfigRefreshAuditor;
+import com.example.config.pricing.refresh.ConfigSnapshotStatus;
 import com.example.config.pricing.service.PricingService;
 import java.math.BigDecimal;
 import java.time.Instant;

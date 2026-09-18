@@ -1,5 +1,10 @@
 # Spring Cloud Config — External Configuration with Live Refresh
 
+> **New to Spring Cloud Config? Start with [GETTING-STARTED.md](GETTING-STARTED.md).**
+> It assumes no prior knowledge, explains every term before using it, and walks you through
+> running one version and watching a configuration change take effect. This README is the
+> reference — it is dense on purpose and assumes you already know the domain.
+
 Three working, independently runnable implementations of one goal: **a property changed in
 external configuration reaches every running service within seconds, with no restart and no
 redeploy.**
@@ -40,6 +45,8 @@ refresh-safety constraints in [§4](#4-the-core-design-refresh-safe-configuratio
 15. [Findings that contradicted the specification](#15-findings-that-contradicted-the-specification)
 16. [Troubleshooting](#16-troubleshooting)
 17. [Known gaps and roadmap](#17-known-gaps-and-roadmap)
+
+Beginner's guide: [GETTING-STARTED.md](GETTING-STARTED.md)
 
 Design documents: [REQUIREMENTS.md](REQUIREMENTS.md) ·
 [SPECIFICATION.md](SPECIFICATION.md) (version A) ·
@@ -227,7 +234,7 @@ bus event → ContextRefresher.refresh()
               5. publish RefreshScopeRefreshedEvent
                     │
                     ▼
-              AbstractConfigurationSnapshotProvider (listens on step 5, not step 2)
+              <Service>SettingsProvider (listens on step 5, not step 2)
                     validate(propertiesBeans)
                       ├ invalid  → REJECTED: keep last-known-good, metric + audit
                       └ valid    → build immutable snapshot
@@ -387,7 +394,7 @@ Mapped to concrete classes rather than named in the abstract.
 | Pattern | Where | Why it fits |
 |---|---|---|
 | **Externalised Configuration** (12-Factor III) | Whole system | Same artefact runs in every environment |
-| **Template Method** | `AbstractConfigurationSnapshotProvider` | Fixes validate → compare → swap → audit → meter; subclasses supply only `buildSnapshot()` |
+| ~~**Template Method**~~ | *removed with `config-client-commons`* | Once each client owned its own plumbing there was one "subclass" per service, so the abstract base was collapsed into each concrete `<Service>SettingsProvider`. Duplicated algorithm, zero indirection — the trade this project now makes deliberately |
 | **Provider / Facade** | `ConfigurationSnapshotProvider<T>` | One seam between mutable Spring binding and immutable domain state |
 | **Immutable Value Object** | `InventorySettings`, `PricingSettings` | Thread-safe reads, no defensive copying |
 | **Atomic swap (copy-on-write)** | `AtomicReference<T>` in each provider | Lock-free consistency under concurrent load |
@@ -411,21 +418,28 @@ Mapped to concrete classes rather than named in the abstract.
 
 Identical in all three versions except where noted.
 
+**Every service is a self-contained project.** It parents directly to
+`spring-boot-starter-parent`, declares its own dependency management, carries its own quality-gate
+configuration under `config/`, and owns its own `Dockerfile`. Nothing is inherited from the
+version-level `pom.xml`, which is a pure *aggregator* — it lists the three services so one command
+can build them all, and that is all it does. Both of these work:
+
+```bash
+cd version-a-git                    && mvn verify     # all three services
+cd version-a-git/inventory-service  && mvn verify     # just this one, no reference to siblings
+```
+
+Aggregation and inheritance are independent in Maven. Deleting a version's `pom.xml` would cost
+the build-all convenience and change nothing else — a service directory copied somewhere else on
+its own still builds, quality gates included.
+
 ```text
 version-X/
-├── pom.xml                          parent: Boot 4.0.8 + Cloud 2025.1.3 BOM
-├── config-client-commons/           shared refresh plumbing (a library, not an app)
-│   └── src/main/java/com/example/config/commons/
-│       ├── ConfigurationSnapshotProvider.java     the contract
-│       ├── AbstractConfigurationSnapshotProvider.java   the algorithm
-│       ├── ConfigSnapshotStatus.java              version, appliedAt, outcome, changed keys
-│       ├── SharedConfigProperties.java            demo.shared.* (all clients)
-│       ├── EnvironmentChangeKeyRecorder.java       captures changed key NAMES
-│       ├── ConfigRefreshAuditor.java              structured JSON audit + history
-│       ├── ConfigRefreshMetrics.java              Micrometer counters/timers/gauges
-│       ├── ConfigurationHealthIndicator.java      config state in /actuator/health
-│       └── ConfigurationValidationException.java
+├── pom.xml                          AGGREGATOR ONLY — <modules> list, ~33 lines, not a parent
 ├── config-server/
+│   ├── pom.xml                      standalone: parent is spring-boot-starter-parent
+│   ├── Dockerfile                   own; build context is this directory
+│   ├── config/                      own checkstyle + suppressions + spotbugs + dep-check
 │   └── src/main/java/com/example/config/server/
 │       ├── ConfigServerApplication.java
 │       ├── SecurityConfig.java                    2 roles, stateless HTTP Basic
@@ -437,14 +451,26 @@ version-X/
 │           └── [B] PostgresNotifyChangeDetector.java, JdbcRevisionPollingDetector.java
 │               [C] S3EventSqsChangeDetector.java, S3ObjectKeyApplicationMapper.java
 ├── inventory-service/               client 1 — feature flag + numeric limit
+│   ├── pom.xml, Dockerfile, config/    same self-contained shape
+│   └── src/
 ├── pricing-service/                 client 2 — proves scoping; runs as 2 instances
+│   ├── pom.xml, Dockerfile, config/    same self-contained shape
+│   └── src/
 ├── docker/
-│   ├── Dockerfile                   runtime-only, non-root, JRE alpine
-│   └── compose.yaml                 full stack incl. dependencies
+│   └── compose.yaml                 orchestration only — builds each service from its own
+│                                    directory; no shared Dockerfile, no MODULE build-arg
 └── scripts/
     ├── e2e-test.sh                  acceptance suite (idempotent)
     ├── [A] install-git-hook.sh, post-commit
     └── [C] provision-floci.sh
+```
+
+`docker/compose.yaml` stays at the version level deliberately: it wires *several* services plus
+RabbitMQ into one runnable stack, which is orchestration rather than something any single service
+can own. Each service still builds its own image independently:
+
+```bash
+cd version-a-git/inventory-service && mvn package && docker build -t inventory-service .
 ```
 
 Version-specific extras:
@@ -455,12 +481,27 @@ Version-specific extras:
 
 ### Package structure (clients)
 
+There is deliberately **no shared library**. Each client owns its refresh plumbing outright, so the
+two services are independently deployable and neither can be broken by a change made on behalf of
+the other. The cost is that the `refresh/` package is duplicated between them; the benefit is that
+there is no coupling to negotiate.
+
 ```text
 com.example.config.<service>
-├── <Service>Application.java     @SpringBootApplication(scanBasePackages="com.example.config")
-├── config/     setter-bound @ConfigurationProperties
+├── <Service>Application.java     @SpringBootApplication (default component scan)
+├── config/     setter-bound @ConfigurationProperties + SharedConfigProperties (demo.shared.*)
+│               [inventory only] SecretFingerprint — sha256:<16 hex> of a decrypted {cipher}
+├── refresh/    this service's own refresh plumbing:
+│               ├── ConfigurationSnapshotProvider.java   the contract
+│               ├── ConfigSnapshotStatus.java            version, appliedAt, outcome, changed keys
+│               ├── EnvironmentChangeKeyRecorder.java    captures changed key NAMES
+│               ├── ConfigRefreshAuditor.java            structured JSON audit + history
+│               ├── ConfigRefreshMetrics.java            Micrometer counters/timers/gauges
+│               ├── ConfigurationHealthIndicator.java    config state in /actuator/health
+│               └── ConfigurationValidationException.java
 ├── domain/     immutable snapshot records
-├── provider/   extends AbstractConfigurationSnapshotProvider
+├── provider/   <Service>SettingsProvider — implements ConfigurationSnapshotProvider and owns the
+│               validate → compare → atomically swap → audit algorithm
 ├── service/    business logic — reads snapshots, plain singleton
 ├── web/        controllers + dto/
 └── exception/  RFC 9457 handler + domain exceptions
@@ -984,7 +1025,7 @@ marked `[CORRECTED]` in the spec documents.
 | # | The spec assumed | What is actually true |
 |---|---|---|
 | 1 | A `file://` Git repo can be mounted read-only. | **It cannot.** The Config Server uses the repo path as its working directory (`basedir` ignored, no clone) and runs `git checkout`, needing `.git/index.lock`. A `:ro` mount fails, surfacing as the misleading `No such label: master`. |
-| 2 | `/monitor` rejects all requests without a webhook secret, so the validation filter must be disabled locally. | **Not for unsigned requests.** On spring-cloud-config 5.0.5, both the form-encoded and GitHub-shaped payloads return 200 and broadcast with the filter *enabled* and no secret. The local relaxation was deleted. |
+| 2 | `/monitor` rejects all requests without a webhook secret, so the validation filter must be disabled locally. | **The spec was right; finding #2 used to say otherwise and was itself wrong — corrected 2026-09-18.** With the filter *enabled* and no secret, a POST carrying valid `CONFIG_ADMIN` credentials returns `401` + `WWW-Authenticate` (while `POST /encrypt` with the same credentials returns 200, so it is the filter, not auth). `CONFIG_MONITOR_VALIDATION=false` is therefore required for the local `file://` stack, and is set in `docker/compose.yaml`. This hid for weeks because `FileMonitorConfiguration` *also* watches the mounted repo on a ~5 s poll, so propagation looked fine while the documented webhook path was dead — a remote repo has no such watcher and would have had no working trigger at all. |
 | 3 | PostgreSQL works natively with the shipped JDBC SQL; only MySQL needs overrides. | **Backwards.** The defaults select `"KEY"`/`"VALUE"` — uppercase, double-quoted — and PostgreSQL double quotes are case-*sensitive*, so they never match lowercase columns. Either declare uppercase columns or override **both** statements. |
 | 4 | `spring-retry` + `spring-boot-starter-aop` are needed for startup retry. | Neither is needed with `spring.config.import`, and **`spring-boot-starter-aop` no longer exists in Boot 4** (last GA 3.5.16). |
 | 5 | `flyway-core` on the classpath is enough. | **Boot 4 split autoconfiguration into per-technology modules.** `spring-boot-flyway` is required; omitting it fails *silently* — the app starts clean, then `relation "properties" does not exist`. |

@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<!DOCTYPE suppressions PUBLIC
+    "-//Checkstyle//DTD SuppressionFilter Configuration 1.2//EN"
+    "https://checkstyle.org/dtds/suppressions_1_2.dtd">
+
+<!--
+  Narrow, justified suppressions. Each names a specific check and a specific file pattern so it
+  cannot silently grow to cover unrelated code.
+-->
+<suppressions>
+
+  <!--
+    A @SpringBootApplication class holds only a static main, so HideUtilityClassConstructor sees a
+    utility class and demands a private constructor. It is actually a Spring @Configuration class:
+    the container must be able to instantiate and (for some features) subclass it, so a private
+    constructor would break the application. This is a false positive, not a design smell.
+  -->
+  <suppress checks="HideUtilityClassConstructor" files=".*Application\.java$"/>
+
+  <!--
+    ArchUnit rules are declared as static final ArchRule fields with intentionally long,
+    sentence-like names (they appear verbatim in failure output, so readability there beats the
+    naming convention). VisibilityModifier likewise does not apply to a rule-declaration DSL.
+  -->
+  <suppress checks="ConstantName|VisibilityModifier" files=".*ArchitectureRulesTest\.java$"/>
+
+</suppressions>

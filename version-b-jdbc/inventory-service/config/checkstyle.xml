@@ -1,0 +1,134 @@
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+
+<!--
+  Deliberately NOT google_checks.xml.
+
+  Spotless already applies google-java-format, which owns every layout decision (indentation,
+  wrapping, blank lines, import order, whitespace). Enabling google_checks on top of it produces
+  hundreds of findings that either duplicate the formatter or contradict it, and a gate nobody
+  can keep green gets switched off.
+
+  What remains here is only what a formatter cannot decide: semantic defects, API hygiene, and
+  naming. Every rule is severity=error, so `violationSeverity=warning` in the POM means any hit
+  fails the build.
+-->
+<module name="Checker">
+  <property name="severity" value="error"/>
+  <property name="charset" value="UTF-8"/>
+  <property name="fileExtensions" value="java"/>
+
+  <!-- Narrow, per-check suppressions live in a separate file so they stay auditable. -->
+  <module name="SuppressionFilter">
+    <property name="file" value="${config_loc}/checkstyle-suppressions.xml"/>
+  </module>
+
+  <!-- No tab characters; the formatter uses spaces. -->
+  <module name="FileTabCharacter">
+    <property name="eachLine" value="true"/>
+  </module>
+
+  <module name="LineLength">
+    <property name="max" value="120"/>
+    <property name="ignorePattern" value="^ *\* *([^ ]+|\{@link.*)$"/>
+  </module>
+
+  <module name="TreeWalker">
+
+    <!-- ===================== imports ===================== -->
+    <module name="UnusedImports">
+      <property name="processJavadoc" value="true"/>
+    </module>
+    <module name="RedundantImport"/>
+    <module name="AvoidStarImport"/>
+    <!-- Nothing outside this project should be importing internal Spring Boot/Cloud internals. -->
+    <module name="IllegalImport">
+      <property name="illegalPkgs" value="sun, com.sun, jdk.internal"/>
+    </module>
+
+    <!-- ===================== naming ====================== -->
+    <module name="PackageName">
+      <property name="format" value="^[a-z]+(\.[a-z][a-z0-9]*)*$"/>
+    </module>
+    <module name="TypeName"/>
+    <module name="MethodName"/>
+    <module name="ParameterName"/>
+    <module name="LocalVariableName"/>
+    <module name="MemberName"/>
+    <module name="ConstantName">
+      <!--
+        A logger reference is a constant by modifier but not by intent, and the surrounding
+        Spring ecosystem spells it lowercase (Spring Framework itself uses `protected final Log
+        logger`). Permitting log/logger keeps this codebase consistent with the framework it sits
+        on, rather than forcing SHOUTING_CASE on the one field everybody reads past.
+      -->
+      <property name="format" value="^(([A-Z][A-Z0-9]*(_[A-Z0-9]+)*)|log|logger)$"/>
+    </module>
+    <module name="StaticVariableName"/>
+
+    <!-- ===================== correctness ================= -->
+    <module name="EqualsHashCode"/>
+    <module name="CovariantEquals"/>
+    <module name="StringLiteralEquality"/>
+    <module name="NoClone"/>
+    <module name="NoFinalizer"/>
+    <module name="MissingSwitchDefault"/>
+    <module name="FallThrough"/>
+    <module name="DefaultComesLast"/>
+    <module name="SimplifyBooleanExpression"/>
+    <module name="SimplifyBooleanReturn"/>
+    <module name="EmptyStatement"/>
+    <module name="IllegalThrows"/>
+    <module name="EqualsAvoidNull"/>
+    <module name="ModifiedControlVariable"/>
+    <module name="OneStatementPerLine"/>
+    <module name="UnnecessarySemicolonInEnumeration"/>
+    <module name="UnnecessarySemicolonAfterTypeMemberDeclaration"/>
+
+    <!-- Braces are mandatory: a refactor into a single-statement if is a classic bug source. -->
+    <module name="NeedBraces"/>
+
+    <!-- ===================== API hygiene ================= -->
+    <module name="FinalClass"/>
+    <module name="HideUtilityClassConstructor"/>
+    <module name="MutableException"/>
+    <module name="InterfaceIsType"/>
+    <module name="VisibilityModifier">
+      <!-- @ConfigurationProperties classes need non-final mutable fields for setter rebinding. -->
+      <property name="protectedAllowed" value="true"/>
+    </module>
+    <module name="ArrayTypeStyle"/>
+    <module name="UpperEll"/>
+    <module name="ModifierOrder"/>
+    <module name="RedundantModifier"/>
+
+    <!-- ===================== documentation =============== -->
+    <!--
+      Javadoc required on public and protected TYPES only. Requiring it on every method produces
+      "returns the foo" noise that adds nothing; the design decisions in this codebase are
+      documented at type level and at the specific lines where behaviour is surprising.
+    -->
+    <module name="JavadocType">
+      <property name="scope" value="protected"/>
+      <property name="allowMissingParamTags" value="true"/>
+    </module>
+    <module name="NonEmptyAtclauseDescription"/>
+    <!-- JavadocStyle was REMOVED in Checkstyle 14; JavadocType + NonEmptyAtclauseDescription
+         cover what mattered here (presence on types, no empty @param/@return). -->
+
+    <!-- ===================== complexity ================== -->
+    <module name="CyclomaticComplexity">
+      <property name="max" value="12"/>
+    </module>
+    <module name="MethodLength">
+      <property name="max" value="90"/>
+    </module>
+    <module name="ParameterNumber">
+      <!-- Constructor injection legitimately takes several collaborators. -->
+      <property name="max" value="8"/>
+      <property name="ignoreOverriddenMethods" value="true"/>
+    </module>
+  </module>
+</module>

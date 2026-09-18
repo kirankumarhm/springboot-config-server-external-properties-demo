@@ -4,10 +4,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.lenient;
 
-import com.example.config.commons.ConfigSnapshotStatus;
 import com.example.config.pricing.api.QuoteResponse;
 import com.example.config.pricing.domain.PricingSettings;
 import com.example.config.pricing.provider.PricingSettingsProvider;
+import com.example.config.pricing.refresh.ConfigSnapshotStatus;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;

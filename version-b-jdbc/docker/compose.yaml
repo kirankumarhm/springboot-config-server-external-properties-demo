@@ -35,10 +35,10 @@ services:
 
   config-server:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: config-server
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../config-server
+      dockerfile: Dockerfile
     container_name: cfg-jdbc-server
     depends_on:
       postgres:
@@ -72,10 +72,10 @@ services:
 
   inventory-service:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: inventory-service
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../inventory-service
+      dockerfile: Dockerfile
     container_name: cfg-jdbc-inventory
     depends_on:
       config-server:
@@ -96,10 +96,10 @@ services:
 
   pricing-service:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: pricing-service
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../pricing-service
+      dockerfile: Dockerfile
     container_name: cfg-jdbc-pricing
     depends_on:
       config-server:
@@ -120,10 +120,10 @@ services:
 
   pricing-service-2:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: pricing-service
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../pricing-service
+      dockerfile: Dockerfile
     container_name: cfg-jdbc-pricing-2
     depends_on:
       config-server:

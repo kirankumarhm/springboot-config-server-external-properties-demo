@@ -28,7 +28,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * A code review will not reliably catch them; the build will.
  */
 @AnalyzeClasses(
-    packages = "com.example.config",
+    packages = "com.example.config.pricing",
     importOptions = ImportOption.DoNotIncludeTests.class)
 class ArchitectureRulesTest {
 

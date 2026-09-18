@@ -23,13 +23,31 @@ spring:
           # username: ${CONFIG_REPO_USERNAME:}
           # password: ${CONFIG_REPO_PASSWORD:}
         monitor:
-          # Verified empirically on spring-cloud-config 5.0.5: /monitor accepts BOTH the
-          # form-encoded (path=...) and GitHub-shaped payloads with the validation filter
-          # ENABLED and no webhook-secret configured. The documented behaviour that it
-          # "rejects all incoming webhook requests" without secrets does not apply to
-          # unsigned requests, so no local-only relaxation is needed here.
+          # [CORRECTED 2026-09-18] An earlier comment here claimed that, with the validation
+          # filter ENABLED and no webhook-secret configured, /monitor still accepts unsigned
+          # form-encoded (path=...) payloads. That is WRONG, and it was measured, not reasoned:
+          # a POST /monitor carrying valid CONFIG_ADMIN credentials is rejected
+          #
+          #     HTTP/1.1 401
+          #     WWW-Authenticate: Basic realm="Realm"
+          #
+          # while POST /encrypt with the SAME credentials returns 200 — so this is the filter
+          # rejecting an unsigned webhook, not an authentication failure. Flipping this one flag
+          # to false turns the same request into 200 ["inventory-service","inventory"].
+          #
+          # The default stays `true` because that is the correct posture for a REMOTE repo,
+          # where the provider signs each push and the filter verifies the signature. It means
+          # the LOCAL file:// stack must switch it off: there is no provider to sign anything,
+          # so an enabled filter rejects every notification the post-commit hook sends. See
+          # CONFIG_MONITOR_VALIDATION=false in docker/compose.yaml.
+          #
+          # Why this went unnoticed: FileMonitorConfiguration also watches the mounted
+          # config-repo directly and fires refreshes on a ~5s poll, so propagation appeared to
+          # work while the documented webhook path was dead. A remote repo has no such watcher
+          # and would have had NO working trigger at all.
           validation-filter-enabled: ${CONFIG_MONITOR_VALIDATION:true}
-          # For a REMOTE GitHub repo, set a secret so pushes are authenticated by signature:
+          # For a REMOTE GitHub repo, set a secret so pushes are authenticated by signature.
+          # Do that INSTEAD of disabling the filter — never disable it against a public endpoint.
           # github:
           #   webhook-secret: ${GITHUB_WEBHOOK_SECRET}
   rabbitmq:

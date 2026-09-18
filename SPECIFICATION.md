@@ -151,8 +151,8 @@ into a per-refresh context (lowest-precedence listener) purely for the audit rec
 ## 3. Module layout
 
 ```
-springboot-external-properties-demo-II/          (parent pom, packaging=pom)
-├── pom.xml                                      dependencyManagement, plugin mgmt, quality gates
+springboot-external-properties-demo-II/          (aggregator pom, packaging=pom)
+├── pom.xml                                      <modules> list ONLY — see the correction below
 ├── config-repo/                                 local Git repo — the configuration system of record
 │   ├── application.yml                          shared by all clients
 │   ├── inventory-service.yml
@@ -160,17 +160,21 @@ springboot-external-properties-demo-II/          (parent pom, packaging=pom)
 │   ├── pricing-service.yml
 │   └── .git/hooks/post-commit                   installed by scripts/install-git-hook.sh (FR-16)
 ├── config-server/                               Spring Cloud Config Server  :8888
+│   ├── pom.xml                                  standalone; parent = spring-boot-starter-parent
+│   ├── Dockerfile                               own image; build context is this directory
+│   ├── config/                                  own checkstyle / spotbugs / dep-check config
 │   └── src/main/resources/
 │       ├── application.yml                      backend-neutral: security, bus, actuator
 │       ├── application-git.yml                  version A — profile `git`
 │       ├── application-jdbc.yml                 version B — profile `jdbc`
 │       ├── application-awss3.yml                version C — profile `awss3`
 │       └── db/migration/                        Flyway V1/V2 (version B only)
-├── config-client-commons/                       shared library, jar (not a Boot app)  [Q-02]
-│   └── refresh plumbing: snapshot provider base, audit listener, metrics, health, ArchUnit rules
 ├── inventory-service/                           client 1  :8081
+│   └── pom.xml, Dockerfile, config/, src/       same self-contained shape
 ├── pricing-service/                             client 2  :8082 (+ replica :8083)
+│   └── pom.xml, Dockerfile, config/, src/       same self-contained shape
 ├── docker/compose.yaml                          RabbitMQ + PostgreSQL + LocalStack (NFR-40, NFR-53)
+│                                                orchestration only; no shared Dockerfile
 ├── docker/localstack-init/                      bucket, versioning, SQS, notification wiring
 ├── scripts/
 │   ├── install-git-hook.sh
@@ -181,16 +185,52 @@ springboot-external-properties-demo-II/          (parent pom, packaging=pom)
 └── README.md
 ```
 
-Reactor order: `config-client-commons` → `config-server` → `inventory-service` → `pricing-service`.
+Reactor order: `config-server` → `inventory-service` → `pricing-service`.
+
+**[CORRECTED] `config-client-commons` was removed.** It was originally specified as a shared jar
+holding the refresh plumbing (`[Q-02]`). Each client now owns that plumbing in its own
+`refresh/` package instead, so the two services are independently deployable and neither can be
+broken by a change made on behalf of the other. The requirements it carries are unchanged — they
+are simply satisfied twice, once per client. The refresh algorithm moved from an abstract base
+class into each concrete `<Service>SettingsProvider`, since with one subclass per service the
+template-method indirection no longer earned its keep.
+
+**[CORRECTED] the version-level POM is no longer a parent.** It was originally specified as a
+parent POM carrying `dependencyManagement`, plugin management and the quality gates for every
+module. Each service now parents directly to `spring-boot-starter-parent` and inlines all of it,
+alongside its own `config/` directory and its own `Dockerfile`. The version POM was reduced to a
+~33-line aggregator that only lists `<modules>`.
+
+Aggregation and inheritance are independent in Maven, so both of these hold:
+
+```bash
+cd version-a-git                    && mvn verify     # aggregator builds all three
+cd version-a-git/inventory-service  && mvn verify     # standalone, siblings irrelevant
+```
+
+Verified by copying a service directory outside the repository entirely and building it there:
+all quality gates (Spotless, Checkstyle, SpotBugs, JaCoCo, Enforcer, ArchUnit) still run and pass.
+
+The cost is real and accepted: the ~400 lines of build and quality configuration are duplicated
+nine times (3 services × 3 versions), so a toolchain upgrade is nine edits rather than three. That
+is the price of a service directory being movable on its own, which is what was asked for.
+`docker/compose.yaml` deliberately stays at the version level — it wires several services plus a
+broker into one stack, which no single service can own.
 
 ### 3.1 Package structure (each client)
 
 ```
 com.example.config.<service>
 ├── <Service>Application.java
-├── config/            InventoryConfigProperties, JacksonConfig, OpenApiConfig, SecurityConfig
+├── config/            InventoryConfigProperties, SharedConfigProperties (demo.shared.*),
+│                      JacksonConfig, OpenApiConfig, SecurityConfig
+├── refresh/           this client's own plumbing: ConfigurationSnapshotProvider (the contract),
+│                      ConfigSnapshotStatus, EnvironmentChangeKeyRecorder, ConfigRefreshAuditor,
+│                      ConfigRefreshMetrics, ConfigurationHealthIndicator,
+│                      ConfigurationValidationException
 ├── domain/            immutable records: InventorySettings, ...
-├── provider/          InventorySettingsProvider (implements ConfigurationSnapshotProvider)
+├── provider/          InventorySettingsProvider — implements ConfigurationSnapshotProvider and
+│                      owns the validate -> compare -> atomically swap -> audit algorithm
 ├── service/           InventoryService  — business logic, reads snapshots
 ├── web/               InventoryController, ConfigInspectionController
 ├── web/dto/           request/response DTOs
@@ -370,14 +410,30 @@ X-Hub-Signature-256: sha256=<hmac>
 {"commits":[{"modified":["inventory-service.yml"],"added":[],"removed":[]}]}
 ```
 
-> **[CORRECTED] Verified false for unsigned requests.** On spring-cloud-config 5.0.5, `/monitor`
-> returned **200 and broadcast** for BOTH the form-encoded and the GitHub-shaped payload with
-> `validation-filter-enabled: true` and **no** webhook secret configured. Task `T-06` is therefore
-> resolved: no local relaxation is needed, and the implementation keeps the secure default. A
-> `webhook-secret` is still required for a remote GitHub repo so pushes are authenticated by
-> signature. The original claim, retained below for context, was:
+> **[RE-CORRECTED 2026-09-18] The original claim below was RIGHT. The [CORRECTED] note that
+> replaced it was wrong, and is struck through here so the mistake stays visible.**
 >
-> ~~with no webhook secret configured, `/monitor` **rejects all provider webhook requests**.~~ Therefore `spring.cloud.config.server.monitor.github.webhook-secret`
+> Measured against the running stack on 2026-09-18: with `validation-filter-enabled: true` and no
+> webhook secret, a form-encoded `POST /monitor` carrying valid `CONFIG_ADMIN` credentials is
+> rejected with `HTTP 401` and `WWW-Authenticate: Basic realm="Realm"`. `POST /encrypt` with the
+> *same* credentials returns 200, which rules out an authentication fault — it is the filter
+> rejecting an unsigned webhook. Setting `CONFIG_MONITOR_VALIDATION=false` turns the identical
+> request into `200 ["inventory-service","inventory"]`.
+>
+> So `T-06` resolves the other way: **the local `file://` stack does need the relaxation**, and it
+> is applied in `docker/compose.yaml`, not in `application.yml`, whose default stays `true` for
+> the remote path. The error hid because `FileMonitorConfiguration` also polls the mounted repo
+> every ~5 s and fires refreshes itself, so end-to-end propagation passed while the webhook path
+> was dead. A remote repo has no directory to watch and would have had no trigger at all.
+>
+> ~~**[CORRECTED] Verified false for unsigned requests.** On spring-cloud-config 5.0.5, `/monitor`
+> returned 200 and broadcast for BOTH payload shapes with `validation-filter-enabled: true` and no
+> webhook secret configured, so no local relaxation is needed.~~
+>
+> The original, now reinstated claim:
+>
+> With no webhook secret configured, `/monitor` **rejects all provider webhook requests**.
+> Therefore `spring.cloud.config.server.monitor.github.webhook-secret`
 > must be set for the remote path. Relaxations
 > (`spring.cloud.config.server.monitor.validation-filter-enabled: false`, or the per-provider
 > `validation-enabled: false`) are permitted **only** in the `local` profile and must never
@@ -425,7 +481,9 @@ correlation in `NFR-22` / `AC-09`. This is the Adapter pattern applied at the we
 | `spring-boot-configuration-processor` (optional) | Generates `spring-configuration-metadata.json` (`NFR-33`) |
 | ~~`spring-retry` + `spring-boot-starter-aop`~~ | **[CORRECTED] Not required, and not available.** Retry rides on the `spring.config.import` URI and is handled by the config-data implementation; these two are needed only by the legacy bootstrap path (`CON-06`). `spring-boot-starter-aop` was **removed in Spring Boot 4** — its last GA release is 3.5.16. |
 | `springdoc-openapi-starter-webmvc-ui` | API docs (consistent with sibling project) |
-| `config-client-commons` | Shared refresh plumbing |
+| `spring-cloud-context` | `RefreshScopeRefreshedEvent`, `EnvironmentChangeEvent` — declared directly because each client now owns its refresh plumbing |
+| `jackson-databind` | Serialises the structured refresh audit records |
+| ~~`config-client-commons`~~ | **[CORRECTED] Removed.** Nothing is shared between the clients; each owns its refresh plumbing under its own `refresh/` package. |
 
 ### 6.2 `application.yml` (inventory-service shown)
 
@@ -603,7 +661,7 @@ concrete artefacts rather than named in the abstract.
 | **Strategy** | `EnvironmentRepository` (Git / JDBC / S3) selected by profile; `ConfigChangeDetector` per backend; Bus binder (AMQP / Kafka) | Backend, change-detection mechanism, and transport are each swappable without touching clients (`NFR-41`, `NFR-42`, `FR-40`, `FR-41`). |
 | **Adapter** | `CorrelatedPathNotificationExtractor`; the `post-commit` hook | Translates foreign webhook/Git shapes into the internal event model. |
 | **Proxy** | `@RefreshScope` scoped proxies (§6.5) | Deferred, refreshable resolution behind a stable reference. |
-| **Template Method** | `AbstractConfigurationSnapshotProvider` in commons | Fixes the validate → swap → audit → meter algorithm; subclasses supply only `build()`. |
+| ~~**Template Method**~~ | ~~`AbstractConfigurationSnapshotProvider` in commons~~ | **[CORRECTED] Dropped with `config-client-commons`.** With the plumbing owned per client there is one implementation per service, so the algorithm lives directly in each concrete `<Service>SettingsProvider`. |
 | **Repository** | `EnvironmentRepository`, Git as store | Configuration retrieval abstracted from its storage. |
 | **DTO + Mapper** | `web/dto` + MapStruct | Domain records never leak to the wire; response shape can evolve independently. |
 | **Builder** | Response DTOs, error payloads | Readable construction of wide, mostly-optional objects. |
@@ -750,7 +808,7 @@ curl -s localhost:8082/api/v1/config/snapshot | jq .        # unchanged — scop
 | `T-05` | Config Server security | `NFR-10`, `NFR-12` |
 | `T-06` | `/monitor` + Bus/RabbitMQ wiring; **resolve the validation-filter question in §5.4** | `FR-06`, `FR-07`, `FR-11` |
 | `T-07` | `post-commit` hook + installer | `FR-16` |
-| `T-08` | `config-client-commons`: provider template, auditor, metrics, health, ArchUnit rules | `FR-22`, `FR-30`–`FR-32`, `NFR-20`–`NFR-22`, `NFR-30` |
+| `T-08` | Per-client `refresh/` plumbing: snapshot provider, auditor, metrics, health, ArchUnit rules (**[CORRECTED]** no longer a shared `config-client-commons` module) | `FR-22`, `FR-30`–`FR-32`, `NFR-20`–`NFR-22`, `NFR-30` |
 | `T-09` | `inventory-service` end to end | `FR-20`–`FR-24`, `AC-01`, `AC-04` |
 | `T-10` | `pricing-service` + replica | `FR-25`, `AC-02`, `AC-03` |
 | `T-11` | Resilience paths (retry, fail-fast, broker-down, bad config) | `NFR-14`–`NFR-16`, `AC-05`–`AC-07` |

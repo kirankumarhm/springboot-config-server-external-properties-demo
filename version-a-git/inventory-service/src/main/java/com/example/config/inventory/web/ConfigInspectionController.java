@@ -1,9 +1,9 @@
 package com.example.config.inventory.web;
 
-import com.example.config.commons.ConfigRefreshAuditor;
-import com.example.config.commons.ConfigSnapshotStatus;
 import com.example.config.inventory.domain.InventorySettings;
 import com.example.config.inventory.provider.InventorySettingsProvider;
+import com.example.config.inventory.refresh.ConfigRefreshAuditor;
+import com.example.config.inventory.refresh.ConfigSnapshotStatus;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;

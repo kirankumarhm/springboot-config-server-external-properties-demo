@@ -1,23 +1,82 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
-
+  <!--
+    Parents directly to spring-boot-starter-parent, NOT to the version-level POM. This service is
+    a self-contained project: it declares its own dependency management, its own quality gates and
+    its own Checkstyle/SpotBugs configuration under config/, and it builds on its own with
+    `mvn verify` from this directory. The version-level pom.xml only AGGREGATES the services so
+    that one command can build them all; it is not a parent, and deleting it would not affect
+    this build.
+  -->
   <parent>
-    <groupId>com.example.config</groupId>
-    <artifactId>version-b-jdbc</artifactId>
-    <version>1.0.0</version>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.0.8</version>
+    <relativePath />
   </parent>
 
+  <groupId>com.example.config</groupId>
   <artifactId>inventory-service</artifactId>
+  <version>1.0.0</version>
   <name>inventory-service</name>
   <description>Config client 1 - proves scoped refresh and feature-flag driven behaviour</description>
 
+  <properties>
+    <java.version>21</java.version>
+    <spring-cloud.version>2025.1.3</spring-cloud.version>
+
+    <!-- Quality toolchain -->
+    <spotless.version>3.10.1</spotless.version>
+    <google-java-format.version>1.36.1</google-java-format.version>
+    <checkstyle.plugin.version>3.6.0</checkstyle.plugin.version>
+    <checkstyle.version>14.1.0</checkstyle.version>
+    <spotbugs.version>4.10.4.0</spotbugs.version>
+    <jacoco.version>0.8.15</jacoco.version>
+    <enforcer.version>3.6.3</enforcer.version>
+    <archunit.version>1.5.0</archunit.version>
+    <dependency-check.version>13.0.0</dependency-check.version>
+    <!-- Keystore-based {cipher} support. Not managed by the Spring Cloud BOM. -->
+    <spring-security-rsa.version>1.1.5</spring-security-rsa.version>
+    <!-- Not managed by the Spring Boot 4 BOM, unlike Boot 3. -->
+    <testcontainers.version>1.21.4</testcontainers.version>
+
+    <!-- Coverage gate. Overridden per module where a module is legitimately thin. -->
+    <coverage.line.min>0.70</coverage.line.min>
+    <coverage.branch.min>0.60</coverage.branch.min>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-dependencies</artifactId>
+        <version>${spring-cloud.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.security</groupId>
+        <artifactId>spring-security-rsa</artifactId>
+        <version>${spring-security-rsa.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.tngtech.archunit</groupId>
+        <artifactId>archunit-junit5</artifactId>
+        <version>${archunit.version}</version>
+        <scope>test</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>testcontainers-bom</artifactId>
+        <version>${testcontainers.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
   <dependencies>
-    <dependency>
-      <groupId>com.example.config</groupId>
-      <artifactId>config-client-commons</artifactId>
-      <version>${project.version}</version>
-    </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-web</artifactId>
@@ -25,6 +84,20 @@
     <dependency>
       <groupId>org.springframework.cloud</groupId>
       <artifactId>spring-cloud-starter-config</artifactId>
+    </dependency>
+    <!--
+      This service owns its refresh plumbing rather than inheriting it from a shared library, so
+      the two APIs that plumbing is written against are declared directly here instead of being
+      relied on transitively: spring-cloud-context supplies RefreshScopeRefreshedEvent and
+      EnvironmentChangeEvent, and jackson-databind serialises the structured audit records.
+    -->
+    <dependency>
+      <groupId>org.springframework.cloud</groupId>
+      <artifactId>spring-cloud-context</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
     </dependency>
     <dependency>
       <groupId>org.springframework.cloud</groupId>
@@ -64,14 +137,321 @@
       <artifactId>spring-boot-starter-webmvc-test</artifactId>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.jacoco</groupId>
+          <artifactId>jacoco-maven-plugin</artifactId>
+          <version>${jacoco.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
     <plugins>
+
+      <!-- ============================================================
+           Enforcer: fail the build on an inconsistent dependency graph
+           rather than discovering it as a NoSuchMethodError at runtime.
+           ============================================================ -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <version>${enforcer.version}</version>
+        <executions>
+          <execution>
+            <id>enforce-build-sanity</id>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <requireMavenVersion>
+                  <version>[3.9.0,)</version>
+                </requireMavenVersion>
+                <requireJavaVersion>
+                  <version>[21,)</version>
+                </requireJavaVersion>
+                <banDuplicatePomDependencyVersions />
+                <!-- Nothing ships depending on an unreproducible build. -->
+                <requireReleaseDeps>
+                  <message>No SNAPSHOT dependencies are allowed in a release build.</message>
+                </requireReleaseDeps>
+                <bannedDependencies>
+                  <message>A second logging binding on the classpath silently swallows log output.
+
+                    junit:junit is NOT banned, despite JUnit 4 beside JUnit 5 being a real hazard.
+                    Testcontainers 1.x cannot be used without it: PostgreSQLContainer implements
+                    JUnit 4's TestRule, so the interface is required on the test COMPILE classpath.
+                    Only the Jupiter engine is registered, so a stray JUnit 4 test would report
+                    zero tests for its class rather than passing silently.
+
+                    NOTE: commons-logging is deliberately NOT banned. Spring Framework 7 removed
+                    the spring-jcl shim (it is no longer published at all) and spring-core now
+                    declares real commons-logging as a compile dependency, so banning it would
+                    ban the framework. Boot routes it to SLF4J via jcl-over-slf4j.</message>
+                  <excludes>
+                    <exclude>log4j:log4j</exclude>
+                    <exclude>org.slf4j:slf4j-log4j12</exclude>
+                    <exclude>org.slf4j:slf4j-simple</exclude>
+                  </excludes>
+                </bannedDependencies>
+                <!--
+                  requireUpperBoundDeps is deliberately NOT enabled. It reports any transitive
+                  dependency resolved BELOW a version some other path requests - which is exactly
+                  what a curated BOM does on purpose. Spring Boot pins httpclient5 to a tested
+                  version while spring-cloud-stream-binder-rabbit declares a newer one; Spring
+                  Cloud 2025.1.3 is built and tested against Boot 4.0.8, so the BOM is right and
+                  the rule is wrong. Overriding curated versions to satisfy it trades a
+                  hypothetical problem for a real, untested combination. CVE exposure is covered
+                  by the `security` profile instead.
+                -->
+              </rules>
+              <fail>true</fail>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- ============================================================
+           Spotless: google-java-format is the single source of truth for
+           layout, so Checkstyle below carries no whitespace rules and the
+           two cannot disagree. `mvn spotless:apply` fixes violations.
+           ============================================================ -->
+      <plugin>
+        <groupId>com.diffplug.spotless</groupId>
+        <artifactId>spotless-maven-plugin</artifactId>
+        <version>${spotless.version}</version>
+        <configuration>
+          <java>
+            <googleJavaFormat>
+              <version>${google-java-format.version}</version>
+              <style>GOOGLE</style>
+            </googleJavaFormat>
+            <removeUnusedImports />
+            <trimTrailingWhitespace />
+            <endWithNewline />
+          </java>
+          <pom>
+            <sortPom>
+              <expandEmptyElements>false</expandEmptyElements>
+              <spaceBeforeCloseEmptyElement>true</spaceBeforeCloseEmptyElement>
+            </sortPom>
+          </pom>
+        </configuration>
+        <executions>
+          <execution>
+            <id>spotless-check</id>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <phase>validate</phase>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- ============================================================
+           Checkstyle: semantic and API-hygiene rules only.
+           ============================================================ -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-checkstyle-plugin</artifactId>
+        <version>${checkstyle.plugin.version}</version>
+        <configuration>
+          <configLocation>${project.basedir}/config/checkstyle.xml</configLocation>
+          <!-- config_loc is not auto-populated when configLocation is an absolute path. -->
+          <propertyExpansion>config_loc=${project.basedir}/config</propertyExpansion>
+          <consoleOutput>true</consoleOutput>
+          <failOnViolation>true</failOnViolation>
+          <violationSeverity>warning</violationSeverity>
+          <includeTestSourceDirectory>false</includeTestSourceDirectory>
+        </configuration>
+        <dependencies>
+          <dependency>
+            <groupId>com.puppycrawl.tools</groupId>
+            <artifactId>checkstyle</artifactId>
+            <version>${checkstyle.version}</version>
+          </dependency>
+        </dependencies>
+        <executions>
+          <execution>
+            <id>checkstyle-validate</id>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <phase>validate</phase>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- ============================================================
+           SpotBugs: static analysis for real defect patterns.
+           ============================================================ -->
+      <plugin>
+        <groupId>com.github.spotbugs</groupId>
+        <artifactId>spotbugs-maven-plugin</artifactId>
+        <version>${spotbugs.version}</version>
+        <configuration>
+          <effort>Max</effort>
+          <threshold>Medium</threshold>
+          <failOnError>true</failOnError>
+          <excludeFilterFile>${project.basedir}/config/spotbugs-exclude.xml</excludeFilterFile>
+        </configuration>
+        <executions>
+          <execution>
+            <id>spotbugs-verify</id>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <phase>verify</phase>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- ============================================================
+           JaCoCo: coverage gate. Excludes types that are pure data or
+           pure wiring, so the number reflects tested LOGIC rather than
+           being inflated by generated record members and getters.
+           ============================================================ -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <configuration>
+          <excludes>
+            <exclude>**/*Application.class</exclude>
+            <exclude>**/domain/**</exclude>
+            <exclude>**/api/**</exclude>
+            <exclude>**/ConfigSnapshotStatus.class</exclude>
+            <exclude>**/ConfigChangeNotification.class</exclude>
+          </excludes>
+        </configuration>
+        <executions>
+          <execution>
+            <id>jacoco-prepare</id>
+            <goals>
+              <goal>prepare-agent</goal>
+            </goals>
+          </execution>
+          <execution>
+            <id>jacoco-report</id>
+            <goals>
+              <goal>report</goal>
+            </goals>
+            <phase>test</phase>
+          </execution>
+          <execution>
+            <id>jacoco-check</id>
+            <goals>
+              <goal>check</goal>
+            </goals>
+            <phase>verify</phase>
+            <configuration>
+              <haltOnFailure>true</haltOnFailure>
+              <rules>
+                <rule>
+                  <element>BUNDLE</element>
+                  <limits>
+                    <limit>
+                      <counter>LINE</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>${coverage.line.min}</minimum>
+                    </limit>
+                    <limit>
+                      <counter>BRANCH</counter>
+                      <value>COVEREDRATIO</value>
+                      <minimum>${coverage.branch.min}</minimum>
+                    </limit>
+                  </limits>
+                </rule>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Unit tests (*Test) in `test`; integration tests (*IT) in `verify`. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <includes>
+            <include>**/*Test.java</include>
+          </includes>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+            <configuration>
+              <includes>
+                <include>**/*IT.java</include>
+              </includes>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
       <plugin>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!--
+      OWASP dependency-check is not in the default build: it downloads and updates the NVD
+      database, which takes minutes and needs network access, so it belongs in CI on a schedule
+      rather than in every developer build.  Run with: mvn -Psecurity verify
+    -->
+    <profile>
+      <id>security</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.owasp</groupId>
+            <artifactId>dependency-check-maven</artifactId>
+            <version>${dependency-check.version}</version>
+            <configuration>
+              <failBuildOnCVSS>7</failBuildOnCVSS>
+              <suppressionFiles>
+                <suppressionFile>${project.basedir}/config/dependency-check-suppressions.xml</suppressionFile>
+              </suppressionFiles>
+            </configuration>
+            <executions>
+              <execution>
+                <goals>
+                  <goal>check</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+    <!-- Skips the slow gates for a fast inner loop: mvn -Pfast install -->
+    <profile>
+      <id>fast</id>
+      <properties>
+        <spotless.check.skip>true</spotless.check.skip>
+        <checkstyle.skip>true</checkstyle.skip>
+        <spotbugs.skip>true</spotbugs.skip>
+        <jacoco.skip>true</jacoco.skip>
+      </properties>
+    </profile>
+  </profiles>
 </project>

@@ -5,12 +5,12 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.lenient;
 
-import com.example.config.commons.ConfigSnapshotStatus;
 import com.example.config.inventory.api.ReservationRequest;
 import com.example.config.inventory.api.ReservationResponse;
 import com.example.config.inventory.domain.InventorySettings;
 import com.example.config.inventory.exception.OrderQuantityExceededException;
 import com.example.config.inventory.provider.InventorySettingsProvider;
+import com.example.config.inventory.refresh.ConfigSnapshotStatus;
 import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.DisplayName;

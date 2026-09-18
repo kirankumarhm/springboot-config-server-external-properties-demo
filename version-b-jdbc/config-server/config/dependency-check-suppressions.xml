@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Deliberately EMPTY: no CVE is currently suppressed, and that is the intended state.
+
+  The file exists because the `security` profile references it, and OWASP dependency-check fails
+  outright on a missing suppression file. Every future entry must carry a <notes> explaining why
+  the finding does not apply here - a suppression without a justification is indistinguishable
+  from ignoring a real vulnerability.
+-->
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+</suppressions>

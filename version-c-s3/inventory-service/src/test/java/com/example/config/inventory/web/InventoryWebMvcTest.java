@@ -7,13 +7,13 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-import com.example.config.commons.ConfigRefreshAuditor;
-import com.example.config.commons.ConfigSnapshotStatus;
 import com.example.config.inventory.api.ReservationRequest;
 import com.example.config.inventory.api.ReservationResponse;
 import com.example.config.inventory.domain.InventorySettings;
 import com.example.config.inventory.exception.OrderQuantityExceededException;
 import com.example.config.inventory.provider.InventorySettingsProvider;
+import com.example.config.inventory.refresh.ConfigRefreshAuditor;
+import com.example.config.inventory.refresh.ConfigSnapshotStatus;
 import com.example.config.inventory.service.InventoryService;
 import java.time.Instant;
 import java.util.List;

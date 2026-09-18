@@ -740,8 +740,10 @@ This is the measure of whether the abstraction is right. Across all three versio
 
 - **Both client services are byte-identical.** No new dependency, no property change, no code
   change. They talk to the Environment API and listen on the Bus; neither is backend-aware.
-- `config-client-commons` is untouched — snapshot provider, validation, last-known-good, audit,
-  metrics, health.
+- Each client's own `refresh/` plumbing is untouched — snapshot provider, validation,
+  last-known-good, audit, metrics, health. (**[CORRECTED]** this was originally a shared
+  `config-client-commons` module; it is now duplicated per client, and the backend-independence
+  claim holds either way.)
 - The Bus, RabbitMQ, and every `RefreshRemoteApplicationEvent` destination string.
 - Every client-side acceptance criterion (`AC-03`…`AC-07`, `AC-09`, `AC-10`) passes unmodified
   against any backend; the harness is parameterised by profile only.

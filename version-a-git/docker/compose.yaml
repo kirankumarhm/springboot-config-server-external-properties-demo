@@ -17,10 +17,10 @@ services:
 
   config-server:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: config-server
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../config-server
+      dockerfile: Dockerfile
     container_name: cfg-git-server
     depends_on:
       rabbitmq:
@@ -49,6 +49,12 @@ services:
       ENCRYPT_KEYSTORE_ALIAS: configkey
       CONFIG_REPO_URI: file:///config-repo
       CONFIG_REPO_LABEL: main
+      # REQUIRED for the file:// backend. The monitor validation filter verifies a provider's
+      # webhook signature; a local repo has no provider and no secret, so with the filter on
+      # every POST /monitor is rejected 401 and the post-commit hook cannot notify anything.
+      # Measured, not assumed — see the [CORRECTED] note in config-server's application.yml.
+      # A remote GitHub repo must instead leave this true and set github.webhook-secret.
+      CONFIG_MONITOR_VALIDATION: "false"
       RABBITMQ_HOST: rabbitmq
       CONFIG_ADMIN_PASSWORD: "{noop}admin-secret"
       CONFIG_CLIENT_PASSWORD: "{noop}client-secret"
@@ -61,10 +67,10 @@ services:
 
   inventory-service:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: inventory-service
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../inventory-service
+      dockerfile: Dockerfile
     container_name: cfg-git-inventory
     depends_on:
       config-server:
@@ -88,10 +94,10 @@ services:
 
   pricing-service:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: pricing-service
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../pricing-service
+      dockerfile: Dockerfile
     container_name: cfg-git-pricing
     depends_on:
       config-server:
@@ -117,10 +123,10 @@ services:
   # Distinct APP_INDEX keeps the bus service id unique.
   pricing-service-2:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
-      args:
-        MODULE: pricing-service
+      # Each service owns its Dockerfile and is built from its own directory - no shared
+      # build context, and no MODULE argument selecting between siblings.
+      context: ../pricing-service
+      dockerfile: Dockerfile
     container_name: cfg-git-pricing-2
     depends_on:
       config-server:

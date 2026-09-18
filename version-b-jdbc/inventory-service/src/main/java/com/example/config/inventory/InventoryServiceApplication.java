@@ -6,10 +6,10 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 /**
  * Inventory service: a Config Server client that refreshes live.
  *
- * <p>Scans {@code com.example.config} so the shared refresh plumbing in {@code
- * config-client-commons} is picked up alongside this module's own components.
+ * <p>Default component scanning is enough: this service owns its refresh plumbing under {@code
+ * com.example.config.inventory}, so there is no shared library package to reach out to.
  */
-@SpringBootApplication(scanBasePackages = "com.example.config")
+@SpringBootApplication
 public class InventoryServiceApplication {
 
   public static void main(String[] args) {
