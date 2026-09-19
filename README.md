@@ -14,9 +14,9 @@ different storage backends and three genuinely different change-detection mechan
 
 | | Backend | Change trigger | Config server | Clients | Checks |
 |---|---|---|---|---|---|
-| [version-a-git](version-a-git/) | Git repository (`file://`) | `post-commit` hook → `/monitor` → Bus | 8888 | 8081-8083 | **29/29** |
-| [version-b-jdbc](version-b-jdbc/) | PostgreSQL 17.6 | trigger → `pg_notify` → `LISTEN` → Bus | 8898 | 8091-8093 | **33/33** |
-| [version-c-s3](version-c-s3/) | AWS S3 (Floci emulator) | S3 Event Notification → SQS → Bus | 8908 | 8101-8103 | **32/32** |
+| [**version-a-git**](version-a-git/README.md) | Git repository (Remote GitHub / Local) | `post-commit` / Webhook → `/monitor` → Bus | 8888 | 8081-8083 | **29/29** |
+| [**version-b-jdbc**](version-b-jdbc/README.md) | PostgreSQL 17.6 | trigger → `pg_notify` → `LISTEN` → Bus | 8898 | 8091-8093 | **33/33** |
+| [**version-c-s3**](version-c-s3/README.md) | AWS S3 (Floci emulator) | S3 Event Notification → SQS → Bus | 8908 | 8101-8103 | **32/32** |
 
 **354 automated checks** — 260 tests in `mvn verify` (253 unit/slice plus a
 7-test Testcontainers integration suite), and 94 end-to-end acceptance checks against the running
