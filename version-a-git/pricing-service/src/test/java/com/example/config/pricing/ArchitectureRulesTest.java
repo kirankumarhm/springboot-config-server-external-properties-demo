@@ -102,7 +102,7 @@ class ArchitectureRulesTest {
           .that()
           .resideInAPackage("..service..")
           .or()
-          .resideInAPackage("..web..")
+          .resideInAPackage("..controller..")
           .should()
           .dependOnClassesThat()
           .areAnnotatedWith(ConfigurationProperties.class)
@@ -137,8 +137,8 @@ class ArchitectureRulesTest {
           .resideInAPackage("..service..")
           .should()
           .dependOnClassesThat()
-          .resideInAPackage("..web..")
-          .because("dependencies point web -> service, never the reverse");
+          .resideInAPackage("..controller..")
+          .because("dependencies point controller -> service, never the reverse");
 
   @ArchTest
   static final ArchRule no_standard_streams =

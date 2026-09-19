@@ -60,7 +60,8 @@ class SqsChangeDetectorIT {
   static final GenericContainer<?> FLOCI =
       new GenericContainer<>(DockerImageName.parse("floci/floci:latest"))
           .withExposedPorts(4566)
-          .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(3)));
+          .waitingFor(
+              Wait.forLogMessage(".*Ready.*\\n", 1).withStartupTimeout(Duration.ofMinutes(1)));
 
   @Autowired private SqsTemplate sqsTemplate;
   @Autowired private RecordingPublisher publisher;

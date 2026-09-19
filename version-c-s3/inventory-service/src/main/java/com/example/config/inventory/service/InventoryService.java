@@ -1,10 +1,10 @@
 package com.example.config.inventory.service;
 
-import com.example.config.inventory.api.ReservationRequest;
-import com.example.config.inventory.api.ReservationResponse;
 import com.example.config.inventory.domain.InventorySettings;
+import com.example.config.inventory.dto.ReservationRequest;
+import com.example.config.inventory.dto.ReservationResponse;
 import com.example.config.inventory.exception.OrderQuantityExceededException;
-import com.example.config.inventory.provider.InventorySettingsProvider;
+import com.example.config.inventory.refresh.InventorySettingsProvider;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 

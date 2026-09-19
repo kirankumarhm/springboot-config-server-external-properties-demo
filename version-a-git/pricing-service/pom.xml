@@ -37,6 +37,10 @@
     <enforcer.version>3.6.3</enforcer.version>
     <archunit.version>1.5.0</archunit.version>
     <dependency-check.version>13.0.0</dependency-check.version>
+    <!-- OpenAPI 3 / Swagger Documentation -->
+    <springdoc.version>3.1.1</springdoc.version>
+    <findsecbugs.version>1.13.0</findsecbugs.version>
+
     <!-- Keystore-based {cipher} support. Not managed by the Spring Cloud BOM. -->
     <spring-security-rsa.version>1.1.5</spring-security-rsa.version>
 
@@ -103,6 +107,15 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springdoc</groupId>
+      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+      <version>${springdoc.version}</version>
+    </dependency>
     <!-- See inventory-service/pom.xml: no spring-retry / starter-aop needed (CON-06). -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -112,6 +125,11 @@
     <dependency>
       <groupId>com.tngtech.archunit</groupId>
       <artifactId>archunit-junit5</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-test</artifactId>
       <scope>test</scope>
     </dependency>
     <!--
@@ -285,6 +303,13 @@
           <threshold>Medium</threshold>
           <failOnError>true</failOnError>
           <excludeFilterFile>${project.basedir}/config/spotbugs-exclude.xml</excludeFilterFile>
+          <plugins>
+            <plugin>
+              <groupId>com.h3xstream.findsecbugs</groupId>
+              <artifactId>findsecbugs-plugin</artifactId>
+              <version>${findsecbugs.version}</version>
+            </plugin>
+          </plugins>
         </configuration>
         <executions>
           <execution>
@@ -309,7 +334,7 @@
           <excludes>
             <exclude>**/*Application.class</exclude>
             <exclude>**/domain/**</exclude>
-            <exclude>**/api/**</exclude>
+            <exclude>**/dto/**</exclude>
             <exclude>**/ConfigSnapshotStatus.class</exclude>
             <exclude>**/ConfigChangeNotification.class</exclude>
           </excludes>

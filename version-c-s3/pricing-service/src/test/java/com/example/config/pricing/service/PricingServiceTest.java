@@ -1,13 +1,15 @@
 package com.example.config.pricing.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.lenient;
 
-import com.example.config.pricing.api.QuoteResponse;
 import com.example.config.pricing.domain.PricingSettings;
-import com.example.config.pricing.provider.PricingSettingsProvider;
+import com.example.config.pricing.dto.QuoteResponse;
+import com.example.config.pricing.exception.InvalidPricingRequestException;
 import com.example.config.pricing.refresh.ConfigSnapshotStatus;
+import com.example.config.pricing.refresh.PricingSettingsProvider;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.List;
@@ -114,5 +116,19 @@ class PricingServiceTest {
     assertThat(quote.discountAmount()).isEqualByComparingTo("33.33");
     assertThat(quote.discountAmount().scale()).isEqualTo(2);
     assertThat(quote.finalPrice().scale()).isEqualTo(2);
+  }
+
+  @Test
+  @DisplayName("rejects negative base price or blank sku with InvalidPricingRequestException")
+  void rejectsInvalidInputs() {
+    PricingService service = new PricingService(this.settingsProvider);
+
+    assertThatThrownBy(() -> service.quote("", new BigDecimal("100.00")))
+        .isInstanceOf(InvalidPricingRequestException.class)
+        .hasMessageContaining("sku");
+
+    assertThatThrownBy(() -> service.quote("SKU-1", new BigDecimal("-10.00")))
+        .isInstanceOf(InvalidPricingRequestException.class)
+        .hasMessageContaining("basePrice");
   }
 }

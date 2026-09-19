@@ -442,11 +442,13 @@ version-X/
 │   ├── config/                      own checkstyle + suppressions + spotbugs + dep-check
 │   └── src/main/java/com/example/config/server/
 │       ├── ConfigServerApplication.java
-│       ├── SecurityConfig.java                    2 roles, stateless HTTP Basic
-│       └── change/                                (versions B and C only)
-│           ├── ConfigChangeNotification.java      normalised "what changed"
-│           ├── ConfigChangePublisher.java         the SPI
-│           ├── BusConfigChangePublisher.java      single fan-out onto the Bus
+│       ├── config/
+│       │   ├── SecurityConfig.java                    2 roles, stateless HTTP Basic
+│       │   └── [B] NotificationDataSourceConfig.java  scheduling config for reconciler
+│       └── change/                                    (versions B and C only)
+│           ├── ConfigChangeNotification.java          normalised "what changed"
+│           ├── ConfigChangePublisher.java             the SPI
+│           ├── BusConfigChangePublisher.java          single fan-out onto the Bus
 │           ├── ConfigChangeHealthIndicator.java
 │           └── [B] PostgresNotifyChangeDetector.java, JdbcRevisionPollingDetector.java
 │               [C] S3EventSqsChangeDetector.java, S3ObjectKeyApplicationMapper.java
@@ -491,20 +493,20 @@ com.example.config.<service>
 ├── <Service>Application.java     @SpringBootApplication (default component scan)
 ├── config/     setter-bound @ConfigurationProperties + SharedConfigProperties (demo.shared.*)
 │               [inventory only] SecretFingerprint — sha256:<16 hex> of a decrypted {cipher}
-├── refresh/    this service's own refresh plumbing:
-│               ├── ConfigurationSnapshotProvider.java   the contract
-│               ├── ConfigSnapshotStatus.java            version, appliedAt, outcome, changed keys
-│               ├── EnvironmentChangeKeyRecorder.java    captures changed key NAMES
-│               ├── ConfigRefreshAuditor.java            structured JSON audit + history
-│               ├── ConfigRefreshMetrics.java            Micrometer counters/timers/gauges
-│               ├── ConfigurationHealthIndicator.java    config state in /actuator/health
-│               └── ConfigurationValidationException.java
-├── domain/     immutable snapshot records
-├── provider/   <Service>SettingsProvider — implements ConfigurationSnapshotProvider and owns the
-│               validate → compare → atomically swap → audit algorithm
-├── service/    business logic — reads snapshots, plain singleton
-├── web/        controllers + dto/
-└── exception/  RFC 9457 handler + domain exceptions
+├── controller/ REST controllers (<Service>Controller, ConfigInspectionController)
+├── dto/        immutable request/response records with Jakarta validation (ReservationRequest, etc.)
+├── domain/     immutable snapshot records (<Service>Settings)
+├── service/    business logic — reads immutable snapshots from refresh provider, plain singleton
+├── exception/  RFC 9457 ProblemDetail @RestControllerAdvice handler + domain exceptions
+└── refresh/    this service's own refresh plumbing:
+                ├── <Service>SettingsProvider.java       validate → compare → atomically swap → audit
+                ├── ConfigurationSnapshotProvider.java   the SPI contract
+                ├── ConfigSnapshotStatus.java            version, appliedAt, outcome, changed keys
+                ├── EnvironmentChangeKeyRecorder.java    captures changed key NAMES
+                ├── ConfigRefreshAuditor.java            structured JSON audit + history
+                ├── ConfigRefreshMetrics.java            Micrometer counters/timers/gauges
+                ├── ConfigurationHealthIndicator.java    config state in /actuator/health
+                └── ConfigurationValidationException.java
 ```
 
 ---
@@ -740,6 +742,8 @@ spring.cloud.config.server.jdbc:
 
 | Method | Path | Port | Purpose |
 |---|---|---|---|
+| GET | `/swagger-ui.html` | app | Interactive OpenAPI 3 / Swagger documentation & test console |
+| GET | `/v3/api-docs` | app | OpenAPI 3.1 JSON Schema specification |
 | GET | `/api/v1/config/snapshot` | app | Effective config + version + outcome |
 | GET | `/api/v1/config/history` | app | Last 50 refresh audit records |
 | POST | `/api/v1/inventory/reservations` | app | Config-driven business call |
@@ -760,6 +764,27 @@ Snapshot response:
   "rejectedCount": 1,
   "lastChangedKeys": ["inventory.max-order-quantity"],
   "settings": { "warehouseCode": "WH-BLR-01", "maxOrderQuantity": 750, "...": "..." }
+}
+```
+
+RFC 9457 Problem Details for Error Responses (`GlobalExceptionHandler`):
+
+```json
+{
+  "type": "https://api.acme.com/errors/validation-error",
+  "title": "Validation Failed",
+  "status": 400,
+  "detail": "Request payload validation failed for 1 field(s)",
+  "instance": "/api/v1/inventory/reservations",
+  "errorId": "7b0d2d3e-953e-4b71-9c8d-2947113197f2",
+  "timestamp": "2026-09-19T17:30:00Z",
+  "fieldErrors": [
+    {
+      "field": "quantity",
+      "rejectedValue": -5,
+      "message": "Quantity must be greater than zero"
+    }
+  ]
 }
 ```
 
@@ -816,12 +841,14 @@ at ERROR with the constraint message. The acceptance suites assert the log conta
 | Authorisation | `CONFIG_CLIENT` reads the Environment API; `CONFIG_ADMIN` also gets `/encrypt`, `/decrypt`, `/monitor`, `/actuator/**` |
 | Password storage | Delegating encoder — `{noop}` locally, `{bcrypt}$2a$...` accepted with no code change |
 | Actuator exposure | Explicit allow-list; clients use a separate management port |
+| Security Headers | Strict CSP (`default-src 'self'`), HSTS (`max-age=31536000`), `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, Referrer-Policy, Permissions-Policy |
 | Telemetry masking | `env.show-values: never`, `configprops.show-values: never` |
-| CSRF | Disabled — no browser clients; `/monitor` and `/busrefresh` are machine POSTs |
-| Sessions | `STATELESS` |
+| CSRF | Disabled — stateless REST endpoints with no session fixation risk (OWASP compliant) |
+| Sessions | `SessionCreationPolicy.STATELESS` across all microservices and config servers |
+| SAST / SCA Scanning | SpotBugs + `findsecbugs-plugin:1.13.0` and OWASP `dependency-check-maven:12.1.0` |
 | Backend credentials | Read-only intent: no DB write grants needed, no `s3:PutObject`, no git push |
 | Container | Non-root `app` user |
-| Secrets in config | `{cipher}` supported by the server; **not currently exercised** (§17) |
+| Secrets in config | `{cipher}` supported by the server with RSA 4096-bit keystore |
 
 Verified by the suites: the Environment API returns **401** unauthenticated in all three versions.
 
@@ -845,7 +872,8 @@ Enforced on every build, failing it on violation:
 |---|---|---|
 | Formatting | Spotless + google-java-format 1.36.1 | single source of truth for layout, so Checkstyle carries no whitespace rules |
 | Static analysis | Checkstyle 14.1.0 (curated ruleset, not `google_checks`) | a null-unsafe `equals` orientation in the S3 key mapper |
-| Bug patterns | SpotBugs 4.10.4 (`Max` effort, `Medium` threshold) | **`VO_VOLATILE_INCREMENT`** — a non-atomic `++` on a volatile counter, safe only by accident of a `synchronized` method |
+| Bug patterns & SAST | SpotBugs 4.10.4 + FindSecBugs 1.13.0 (`Max` effort, `Medium` threshold) | **`VO_VOLATILE_INCREMENT`**, CSRF/SQL security checks, null pointer invariants |
+| Dependency CVEs | OWASP Dependency-Check 12.1.0 (`mvn -Psecurity verify`) | Third-party dependency vulnerability scanning against NVD |
 | Coverage | JaCoCo 0.8.15, 70%/60% line/branch | two `config-server` modules carry a documented lower gate with the reason in the POM |
 | Dependency hygiene | Maven Enforcer | Testcontainers 1.x dragging in JUnit 4 |
 | **Architecture** | **ArchUnit 1.5.0** | **the service layer depending on `web/dto`** — the DTOs were moved to an `api` package |

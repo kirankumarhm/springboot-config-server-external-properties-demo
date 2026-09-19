@@ -1,8 +1,9 @@
 package com.example.config.pricing.service;
 
-import com.example.config.pricing.api.QuoteResponse;
 import com.example.config.pricing.domain.PricingSettings;
-import com.example.config.pricing.provider.PricingSettingsProvider;
+import com.example.config.pricing.dto.QuoteResponse;
+import com.example.config.pricing.exception.InvalidPricingRequestException;
+import com.example.config.pricing.refresh.PricingSettingsProvider;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import org.springframework.stereotype.Service;
@@ -20,6 +21,13 @@ public class PricingService {
   }
 
   public QuoteResponse quote(String sku, BigDecimal basePrice) {
+    if (sku == null || sku.isBlank()) {
+      throw new InvalidPricingRequestException("sku must not be blank");
+    }
+    if (basePrice == null || basePrice.compareTo(BigDecimal.ZERO) < 0) {
+      throw new InvalidPricingRequestException("basePrice must be greater than or equal to 0");
+    }
+
     // One snapshot read for the whole calculation, so discount and surge always come from the
     // same configuration generation even if a refresh lands mid-request.
     PricingSettings settings = this.settingsProvider.get();

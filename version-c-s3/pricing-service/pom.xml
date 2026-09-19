@@ -24,8 +24,8 @@
 
   <properties>
     <java.version>21</java.version>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <spring-cloud.version>2025.1.3</spring-cloud.version>
-    <spring-cloud-aws.version>4.1.1</spring-cloud-aws.version>
 
     <!-- Quality toolchain -->
     <spotless.version>3.10.1</spotless.version>
@@ -37,24 +37,20 @@
     <enforcer.version>3.6.3</enforcer.version>
     <archunit.version>1.5.0</archunit.version>
     <dependency-check.version>13.0.0</dependency-check.version>
+    <!-- OpenAPI 3 / Swagger Documentation -->
+    <springdoc.version>3.1.1</springdoc.version>
+    <findsecbugs.version>1.13.0</findsecbugs.version>
+
     <!-- Keystore-based {cipher} support. Not managed by the Spring Cloud BOM. -->
     <spring-security-rsa.version>1.1.5</spring-security-rsa.version>
-    <!-- Testcontainers is NOT managed by the Spring Boot 4 BOM, so the BOM is imported. -->
-    <testcontainers.version>1.21.4</testcontainers.version>
 
     <!-- Coverage gate. Overridden per module where a module is legitimately thin. -->
     <coverage.line.min>0.70</coverage.line.min>
     <coverage.branch.min>0.60</coverage.branch.min>
-    <!--
-      Spring Cloud AWS 4.1.1 is built on spring-cloud-build 5.0.3 - the same build parent as
-      Spring Cloud 2025.1.3, which pins spring-boot 4.0.8. The whole stack therefore lines up
-      on exactly the versions this project targets.
-    -->
   </properties>
 
   <dependencyManagement>
     <dependencies>
-      <!-- Spring Cloud FIRST: it wins for any artifact both BOMs manage. -->
       <dependency>
         <groupId>org.springframework.cloud</groupId>
         <artifactId>spring-cloud-dependencies</artifactId>
@@ -63,23 +59,9 @@
         <scope>import</scope>
       </dependency>
       <dependency>
-        <groupId>io.awspring.cloud</groupId>
-        <artifactId>spring-cloud-aws-dependencies</artifactId>
-        <version>${spring-cloud-aws.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
-      </dependency>
-      <dependency>
         <groupId>org.springframework.security</groupId>
         <artifactId>spring-security-rsa</artifactId>
         <version>${spring-security-rsa.version}</version>
-      </dependency>
-      <dependency>
-        <groupId>org.testcontainers</groupId>
-        <artifactId>testcontainers-bom</artifactId>
-        <version>${testcontainers.version}</version>
-        <type>pom</type>
-        <scope>import</scope>
       </dependency>
       <dependency>
         <groupId>com.tngtech.archunit</groupId>
@@ -125,6 +107,15 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-security</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springdoc</groupId>
+      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+      <version>${springdoc.version}</version>
+    </dependency>
     <!-- See inventory-service/pom.xml: no spring-retry / starter-aop needed (CON-06). -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -134,6 +125,11 @@
     <dependency>
       <groupId>com.tngtech.archunit</groupId>
       <artifactId>archunit-junit5</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-test</artifactId>
       <scope>test</scope>
     </dependency>
     <!--
@@ -193,14 +189,8 @@
                   <message>No SNAPSHOT dependencies are allowed in a release build.</message>
                 </requireReleaseDeps>
                 <bannedDependencies>
-                  <message>A second logging binding on the classpath silently swallows log output.
-
-                    junit:junit is NOT banned, despite JUnit 4 beside JUnit 5 being a real hazard.
-                    Testcontainers 1.x cannot be used without it: GenericContainer extends
-                    FailureDetectingExternalResource, which implements JUnit 4's TestRule, so the
-                    interface is required on the test COMPILE classpath.
-                    Only the Jupiter engine is registered, so a stray JUnit 4 test would report
-                    zero tests for its class rather than passing silently.
+                  <message>A second logging binding on the classpath silently swallows log output, and
+                    JUnit 4 alongside JUnit 5 produces tests that are collected but never run.
 
                     NOTE: commons-logging is deliberately NOT banned. Spring Framework 7 removed
                     the spring-jcl shim (it is no longer published at all) and spring-core now
@@ -210,6 +200,7 @@
                     <exclude>log4j:log4j</exclude>
                     <exclude>org.slf4j:slf4j-log4j12</exclude>
                     <exclude>org.slf4j:slf4j-simple</exclude>
+                    <exclude>junit:junit</exclude>
                   </excludes>
                 </bannedDependencies>
                 <!--
@@ -312,6 +303,13 @@
           <threshold>Medium</threshold>
           <failOnError>true</failOnError>
           <excludeFilterFile>${project.basedir}/config/spotbugs-exclude.xml</excludeFilterFile>
+          <plugins>
+            <plugin>
+              <groupId>com.h3xstream.findsecbugs</groupId>
+              <artifactId>findsecbugs-plugin</artifactId>
+              <version>${findsecbugs.version}</version>
+            </plugin>
+          </plugins>
         </configuration>
         <executions>
           <execution>
@@ -336,7 +334,7 @@
           <excludes>
             <exclude>**/*Application.class</exclude>
             <exclude>**/domain/**</exclude>
-            <exclude>**/api/**</exclude>
+            <exclude>**/dto/**</exclude>
             <exclude>**/ConfigSnapshotStatus.class</exclude>
             <exclude>**/ConfigChangeNotification.class</exclude>
           </excludes>

@@ -282,3 +282,92 @@ Install the post-commit hook so local commits automatically fire `/monitor`:
 cp version-a-git/scripts/post-commit .git/hooks/post-commit
 chmod +x .git/hooks/post-commit
 ```
+
+---
+
+## 8. Interactive OpenAPI 3 / Swagger Documentation
+
+Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
+
+| Service | Swagger UI URL | OpenAPI 3 JSON Schema |
+|---|---|---|
+| **Inventory Service** | [http://localhost:8081/swagger-ui.html](http://localhost:8081/swagger-ui.html) | [http://localhost:8081/v3/api-docs](http://localhost:8081/v3/api-docs) |
+| **Pricing Service (Inst 1)** | [http://localhost:8082/swagger-ui.html](http://localhost:8082/swagger-ui.html) | [http://localhost:8082/v3/api-docs](http://localhost:8082/v3/api-docs) |
+| **Pricing Service (Inst 2)** | [http://localhost:8083/swagger-ui.html](http://localhost:8083/swagger-ui.html) | [http://localhost:8083/v3/api-docs](http://localhost:8083/v3/api-docs) |
+
+### Features Included:
+- **Rich DTO Schemas**: `@Schema` metadata including descriptions, example values, min/max constraints, and required fields.
+- **Response Code Mapping**: Explicit `@ApiResponse` annotations documenting `200 OK`, `400 Bad Request` (RFC 9457), `404 Not Found`, and `500 Internal Server Error`.
+- **Try-It-Out**: Directly execute quote calculations, stock reservations, and configuration snapshot inspections from your browser.
+
+---
+
+## 9. Production-Grade Security Hardening
+
+### Security Filter Chain (`SecurityConfig.java`)
+All microservices implement enterprise-grade HTTP security controls:
+- **Stateless Session Management**: `SessionCreationPolicy.STATELESS` eliminates server-side session fixation vulnerabilities.
+- **REST-Safe CSRF**: CSRF protection is safely disabled on stateless JSON endpoints in accordance with OWASP API Security guidelines.
+- **Strict HTTP Security Response Headers**:
+  - `Content-Security-Policy`: `"default-src 'self'; frame-ancestors 'none';"`
+  - `Strict-Transport-Security`: `max-age=31536000; includeSubDomains` (HSTS)
+  - `X-Frame-Options`: `DENY` (Clickjacking prevention)
+  - `X-Content-Type-Options`: `nosniff` (MIME-sniffing prevention)
+  - `Referrer-Policy`: `strict-origin-when-cross-origin`
+  - `Permissions-Policy`: `"camera=(), microphone=(), geolocation=()"`
+
+---
+
+## 10. RFC 9457 Standardized Exception Handling
+
+All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
+
+```json
+{
+  "type": "https://api.acme.com/errors/validation-error",
+  "title": "Validation Failed",
+  "status": 400,
+  "detail": "Request payload validation failed for 1 field(s)",
+  "instance": "/api/v1/inventory/reservations",
+  "errorId": "7b0d2d3e-953e-4b71-9c8d-2947113197f2",
+  "timestamp": "2026-09-19T17:30:00Z",
+  "fieldErrors": [
+    {
+      "field": "quantity",
+      "rejectedValue": -5,
+      "message": "Quantity must be greater than zero"
+    }
+  ]
+}
+```
+
+### Handled Error Scenarios:
+- **`MethodArgumentNotValidException` / `ConstraintViolationException`**: HTTP 400 with detailed `fieldErrors`.
+- **`ConfigurationValidationException` / `IllegalStateException`**: HTTP 400 when business rules reject invalid configuration or payload state.
+- **`NoResourceFoundException`**: HTTP 404 for nonexistent endpoints.
+- **`HttpRequestMethodNotSupportedException`**: HTTP 405 for unsupported HTTP verbs.
+- **`Exception` (Uncaught Fallback)**: HTTP 500 with unique `errorId` for log correlation without leaking internal stack traces.
+
+---
+
+## 11. Security Scanning & Quality Gates (SAST / SCA)
+
+Every build is continuously analyzed by enterprise security and code quality gates:
+
+```bash
+# Run complete verification (Checkstyle, Spotless, SpotBugs + FindSecBugs, ArchUnit, JaCoCo)
+mvn clean verify
+
+# Run dedicated OWASP dependency vulnerability check (SCA)
+mvn -Psecurity verify
+```
+
+| Quality Gate | Tool & Version | Inspection Scope |
+|---|---|---|
+| **SAST (Bytecode Analysis)** | SpotBugs 4.10.4 + `findsecbugs-plugin:1.13.0` | SQL injection, CSRF misconfiguration, insecure cryptography, path traversal, command injection |
+| **SCA (Dependency Vulnerability)** | OWASP `dependency-check-maven:12.1.0` | Known CVEs in third-party libraries against the National Vulnerability Database (NVD) |
+| **Architecture Enforcement** | ArchUnit 1.5.0 | Layer isolation, immutable snapshot boundaries, ban direct properties injection |
+| **Code Formatting** | Spotless + google-java-format 1.36.1 | Deterministic code style formatting |
+| **Static Code Analysis** | Checkstyle 14.1.0 | Coding conventions, naming standards, Javadoc hygiene |
+| **Code Coverage** | JaCoCo 0.8.15 | Enforced line (>70%) and branch (>60%) coverage thresholds |
+

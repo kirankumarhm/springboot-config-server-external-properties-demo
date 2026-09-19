@@ -39,6 +39,15 @@
     <Source name="~.*[\\/]api[\\/].*"/>
   </Match>
 
+  <!--
+    SPRING_CSRF_PROTECTION_DISABLED: FindSecBugs flags disabling CSRF. The microservices and
+    Config Server are stateless REST APIs utilizing HTTP Basic/token authentication without cookie-based
+    sessions, making CSRF protection unnecessary and disabling it safe and standard.
+  -->
+  <Match>
+    <Bug pattern="SPRING_CSRF_PROTECTION_DISABLED"/>
+  </Match>
+
   <!-- Test sources are not production code paths. -->
   <Match>
     <Source name="~.*[\\/]src[\\/]test[\\/].*"/>
