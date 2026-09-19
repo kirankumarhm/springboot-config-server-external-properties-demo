@@ -14,11 +14,12 @@ spring:
       server:
         git:
           # Externalised so the same image runs against a local repo or a remote GitHub repo.
-          uri: ${CONFIG_REPO_URI:file:///config-repo}
+          uri: ${CONFIG_REPO_URI:https://github.com/kirankumarhm/springboot-config-server-external-properties-demo.git}
+          search-paths: ${CONFIG_REPO_SEARCH_PATHS:version-a-git/config-repo}
           default-label: ${CONFIG_REPO_LABEL:main}
           timeout: 10
+          force-pull: ${CONFIG_REPO_FORCE_PULL:true}
           # Remote-only settings, kept here for the switch to GitHub:
-          # force-pull: true
           # basedir: /var/tmp/config-repo-cache
           # username: ${CONFIG_REPO_USERNAME:}
           # password: ${CONFIG_REPO_PASSWORD:}

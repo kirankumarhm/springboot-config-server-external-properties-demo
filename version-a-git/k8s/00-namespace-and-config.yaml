@@ -17,8 +17,8 @@ data:
   # cluster. The Config Server treats the repository directory as its working tree and performs a
   # real `git checkout`, so multiple replicas would need one shared RWX volume and would corrupt
   # each other. A remote URI makes each pod clone into its own ephemeral basedir instead.
-  # Set this to a repository you control before applying.
-  CONFIG_REPO_URI: "https://github.com/YOUR-ORG/YOUR-CONFIG-REPO.git"
+  CONFIG_REPO_URI: "https://github.com/kirankumarhm/springboot-config-server-external-properties-demo.git"
+  CONFIG_REPO_SEARCH_PATHS: "version-a-git/config-repo"
   RABBITMQ_HOST: "rabbitmq"
   RABBITMQ_PORT: "5672"
   ENCRYPT_KEYSTORE_LOCATION: "file:/secrets/config-server.p12"

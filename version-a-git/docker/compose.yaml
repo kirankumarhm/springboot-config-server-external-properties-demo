@@ -47,14 +47,15 @@ services:
       ENCRYPT_KEYSTORE_LOCATION: file:/secrets/config-server.p12
       ENCRYPT_KEYSTORE_PASSWORD: keystore-secret
       ENCRYPT_KEYSTORE_ALIAS: configkey
-      CONFIG_REPO_URI: file:///config-repo
-      CONFIG_REPO_LABEL: main
+      CONFIG_REPO_URI: ${CONFIG_REPO_URI:-https://github.com/kirankumarhm/springboot-config-server-external-properties-demo.git}
+      CONFIG_REPO_SEARCH_PATHS: ${CONFIG_REPO_SEARCH_PATHS:-version-a-git/config-repo}
+      CONFIG_REPO_LABEL: ${CONFIG_REPO_LABEL:-main}
       # REQUIRED for the file:// backend. The monitor validation filter verifies a provider's
       # webhook signature; a local repo has no provider and no secret, so with the filter on
       # every POST /monitor is rejected 401 and the post-commit hook cannot notify anything.
       # Measured, not assumed — see the [CORRECTED] note in config-server's application.yml.
       # A remote GitHub repo must instead leave this true and set github.webhook-secret.
-      CONFIG_MONITOR_VALIDATION: "false"
+      CONFIG_MONITOR_VALIDATION: ${CONFIG_MONITOR_VALIDATION:-false}
       RABBITMQ_HOST: rabbitmq
       CONFIG_ADMIN_PASSWORD: "{noop}admin-secret"
       CONFIG_CLIENT_PASSWORD: "{noop}client-secret"
