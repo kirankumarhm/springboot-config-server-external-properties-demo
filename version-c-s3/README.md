@@ -174,6 +174,63 @@ RabbitMQ comes with an interactive web dashboard running out of the box:
    - *How to match queue to service?* Click any queue &rarr; check **Consumers** to see the service name.
 4. **Live Activity**: Upload an updated YAML to S3 and watch the **Message Rates** graph spike in real time!
 
+### Why RabbitMQ instead of Kafka for Spring Cloud Bus?
+
+Both **RabbitMQ** and **Apache Kafka** are supported by Spring Cloud Bus (`spring-cloud-starter-bus-amqp` vs `spring-cloud-starter-bus-kafka`). However, for a **configuration management bus**, **RabbitMQ is the industry-standard recommendation**:
+
+#### A. The Nature of the Workload: "Ephemeral Broadcast" vs "Event Stream"
+
+| Aspect | Spring Cloud Bus Requirement | RabbitMQ (Chosen) | Apache Kafka |
+|---|---|---|---|
+| **Message Type** | Rare, tiny notification signals *(e.g. "Pricing config updated")* | **Natural fit**: Built for point-in-time message routing. | **Mismatch**: Built for continuous streams of business data (millions of events/sec). |
+| **History / Replay** | **Not needed**: If a pod boots up tomorrow, it pulls fresh config via HTTP `GET`. It does not need to replay past refresh events. | Discards messages immediately after delivery. | Retains and stores messages to disk in commit logs. |
+| **Dynamic Scaling** | Pods scale from 2 to 50 and back down dynamically. | **Ephemeral Queues (`[AD]`)**: Creates a temporary queue on pod startup; deletes it the millisecond the pod terminates. | **Consumer Group Metadata**: Every replica needs a unique random Consumer Group, leaving behind orphaned metadata in Kafka when pods die. |
+| **Resource Footprint** | Background infrastructure should be lightweight. | **~40–60 MB RAM**, starts in 2 seconds. | **~600 MB–1.5 GB RAM** (JVM + KRaft/Zookeeper), starts in 20–30s. |
+
+#### B. The "Megaphone" Analogy (RabbitMQ) vs "The Permanent Archive" (Kafka)
+- **RabbitMQ is a Megaphone**: When a config changes, Config Server shouts into the megaphone. Any microservice currently alive hears it and refreshes. If no one is listening or a pod is dead, the sound disappears. This is **exactly** what configuration refresh needs.
+- **Kafka is a Recording Studio with Permanent Tape**: Kafka writes every shout onto disk, tracks offsets, and organizes data into partitions. For an occasional 1 KB config refresh ping once a week, spinning up Kafka partitions and storage segments is massive overkill.
+
+#### C. Comparison Matrix
+
+| Feature | RabbitMQ (Default) | Apache Kafka |
+|---|---|---|
+| **Spring Cloud Starter** | `spring-cloud-starter-bus-amqp` | `spring-cloud-starter-bus-kafka` |
+| **Broker Memory Usage** | ~50 MB RAM | ~800 MB+ RAM |
+| **Queue Lifecycle** | Automatically deleted on pod exit (`[AD]`) | Topic partition offsets must be managed/rebalanced |
+| **Routing Flexibility** | Native Topic Exchanges (`pricing-service:**`) | Requires topic-per-service or manual payload filtering |
+| **Local Dev & CI/CD Speed** | Instant startup in Docker/Testcontainers | Slower Docker spin-up |
+
+#### D. Swapping to Kafka (If Required by Enterprise Policy)
+If your organization mandates Apache Kafka, Spring Cloud Bus supports it via a simple **1-line dependency swap**:
+
+**1. In `pom.xml`**:
+```xml
+<!-- Replace RabbitMQ: -->
+<!-- <dependency>
+       <groupId>org.springframework.cloud</groupId>
+       <artifactId>spring-cloud-starter-bus-amqp</artifactId>
+     </dependency> -->
+
+<!-- With Kafka: -->
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-starter-bus-kafka</artifactId>
+</dependency>
+```
+
+**2. In `application.yml`**:
+```yaml
+spring:
+  cloud:
+    bus:
+      id: ${spring.application.name}:${random.uuid}
+  kafka:
+    bootstrap-servers: localhost:9092
+```
+
+All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refresh mechanics remain **100% identical**.
+
 ---
 
 ## 5. Quick Start: Build and Run
