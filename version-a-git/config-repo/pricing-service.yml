@@ -1,5 +1,5 @@
 pricing:
   currency: "INR"
-  discount-percentage: 10.0
+  discount-percentage: 5.0
   surge-pricing-enabled: false
   surge-multiplier: 2.5
