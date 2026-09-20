@@ -301,6 +301,79 @@ Version B on minikube is the same shape with two substitutions: PostgreSQL repla
 (the detector becomes a `LISTEN/NOTIFY` listener plus a revision poller), and a NetworkPolicy
 restricts port 5432 to the Config Server alone so no other pod can bypass the audit trigger.
 
+### 3.7 Understanding RabbitMQ & Spring Cloud Bus (Layman's Guide & Web UI)
+
+If you are new to distributed systems, message brokers, or Spring Cloud Bus, here is a simple breakdown of how RabbitMQ links Config Server and your microservices.
+
+#### 1. The Core Problem RabbitMQ Solves (The "Megaphone" Analogy)
+Imagine a teacher (Config Server) needs to tell a classroom of 50 students (microservice instances) that the class schedule has changed:
+- **Without RabbitMQ (Point-to-Point HTTP)**: The teacher must walk up to each student's desk one by one and whisper the update. If students are coming and going (auto-scaling pods), the teacher has to maintain a live roster. If one student is asleep or busy (unresponsive pod), the teacher gets stuck waiting.
+- **With RabbitMQ & Spring Cloud Bus (Pub/Sub Broadcast)**: The teacher speaks once into a **megaphone** (RabbitMQ). Every student hears the announcement simultaneously. The teacher doesn't need to know who is in the room, where they sit, or if new students just walked in.
+
+```mermaid
+graph TD
+    subgraph ConfigServer["1. The Announcer (Config Server)"]
+        CS["Config Server<br/>(Detects Git push, SQL change, or S3 upload)"]
+    end
+
+    subgraph Broker["2. The Megaphone (RabbitMQ)"]
+        Ex["Exchange: springCloudBus<br/>(Topic Exchange)"]
+        Q1["Queue: inventory-service-queue"]
+        Q2["Queue: pricing-service-1-queue"]
+        Q3["Queue: pricing-service-2-queue"]
+        Ex --> Q1
+        Ex --> Q2
+        Ex --> Q3
+    end
+
+    subgraph Microservices["3. The Listeners (Client Microservices)"]
+        Inv["Inventory Service<br/>(:8081)"]
+        Prc1["Pricing Service (Inst 1)<br/>(:8082)"]
+        Prc2["Pricing Service (Inst 2)<br/>(:8083)"]
+        Q1 -. Delivers Event .-> Inv
+        Q2 -. Delivers Event .-> Prc1
+        Q3 -. Delivers Event .-> Prc2
+    end
+
+    CS -- "Publishes 1 Message:<br/>'pricing-service:** changed'" --> Ex
+    Prc1 -- "4. Pulls new config (HTTP GET)" --> CS
+    Prc2 -- "4. Pulls new config (HTTP GET)" --> CS
+```
+
+#### 2. How the Link Works Step-by-Step
+1. **Connection & Registration**: At startup, every microservice and Config Server establishes an AMQP connection to RabbitMQ (`port 5672`).
+2. **Dynamic Private Queues**: Each microservice instance creates a temporary, auto-delete queue bound to the `springCloudBus` Topic Exchange.
+3. **Change Event Published**: When a property is updated, Config Server sends a single `RefreshRemoteApplicationEvent` JSON payload to `springCloudBus` specifying the target destination (e.g., `pricing-service:**` or `**` for all).
+4. **Broadcast Routing**: RabbitMQ instantly clones and routes the event to the queues of all connected services.
+5. **Smart Processing**:
+   - **Target Match**: If the destination matches the service (`pricing-service`), it queries Config Server over HTTP (`GET /pricing-service/default/main`), validates the new values, and atomically swaps its active configuration in memory with **zero downtime**.
+   - **Target Mismatch**: If the destination doesn't match (`inventory-service`), it discards the message with zero overhead.
+
+#### 3. How to See and Inspect RabbitMQ in Real-Time (Web Management UI)
+
+Every version includes a pre-configured RabbitMQ Management Web Dashboard:
+
+| Version | Web Management UI URL | Credentials | Broker AMQP Port |
+|---|---|---|---|
+| **Version A (Git)** | [http://localhost:15672](http://localhost:15672) | `guest` / `guest` | `5672` |
+| **Version B (PostgreSQL)** | [http://localhost:15673](http://localhost:15673) | `guest` / `guest` | `5673` |
+| **Version C (AWS S3)** | [http://localhost:15674](http://localhost:15674) | `guest` / `guest` | `5674` |
+
+#### 4. What to Look for in the RabbitMQ Dashboard:
+1. **Overview Tab**:
+   - Check **Connections**: You will see active connections from `cfg-*-server`, `cfg-*-inventory`, `cfg-*-pricing`, and `cfg-*-pricing-2` (4 active client connections).
+   - Check **Channels**: Each Spring Cloud Bus listener maintains an open channel waiting for messages.
+2. **Exchanges Tab**:
+   - Click on the **`springCloudBus`** exchange (`topic` type).
+   - Scroll to **Bindings**: You will see each connected microservice's auto-generated queue bound with `#` routing key.
+3. **Queues Tab**:
+   - Inspect individual queues named `springCloudBus.anonymous.<random-hash>`.
+   - Each queue corresponds to one running instance.
+4. **Live Verification (Watch Messages Flow)**:
+   - Open RabbitMQ UI `Overview` page in your browser.
+   - Run a config change (e.g. edit YAML in Git, update SQL row in Postgres, or upload file to S3).
+   - Watch the **Message Rates / Queued Messages** graph immediately spike with message delivery in real-time!
+
 ---
 
 ## 4. The core design: refresh-safe configuration

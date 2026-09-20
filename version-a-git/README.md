@@ -105,7 +105,49 @@ sequenceDiagram
 
 ---
 
-## 4. Quick Start: Build and Run
+## 4. Understanding RabbitMQ & Spring Cloud Bus (Layman's Guide & Web UI)
+
+### The Core Role of RabbitMQ (The "Megaphone" Analogy)
+Think of **RabbitMQ** as a central **broadcast megaphone**:
+- **Without RabbitMQ**: Config Server would need to maintain a list of all running instances across all environments and call each instance's HTTP `/actuator/refresh` endpoint one by one. If you have 50 pricing service replicas or instances scaling up and down, Config Server gets overwhelmed or out of sync.
+- **With RabbitMQ & Spring Cloud Bus**: When you push a Git commit, Config Server simply shouts **once** into RabbitMQ's topic exchange (`springCloudBus`): *"Hey everyone, `pricing-service` configuration has changed!"*. RabbitMQ automatically duplicates and delivers this message to every connected service's private queue.
+
+```mermaid
+graph TD
+    CS["Config Server (:8888)<br/>(Receives Git commit /monitor webhook)"]
+    Ex["RabbitMQ Exchange: springCloudBus<br/>(Topic Exchange :5672)"]
+    Q1["Queue: inventory-service"]
+    Q2["Queue: pricing-service-1"]
+    Q3["Queue: pricing-service-2"]
+    Inv["Inventory Service (:8081)<br/>(Ignores, not for me)"]
+    Prc1["Pricing Service 1 (:8082)<br/>(Matches! Pulls new config)"]
+    Prc2["Pricing Service 2 (:8083)<br/>(Matches! Pulls new config)"]
+
+    CS -- "1. Publishes 1 message:<br/>'pricing-service:**'" --> Ex
+    Ex --> Q1 --> Inv
+    Ex --> Q2 --> Prc1
+    Ex --> Q3 --> Prc2
+    Prc1 -- "2. Pulls updated config" --> CS
+    Prc2 -- "2. Pulls updated config" --> CS
+```
+
+### Accessing the RabbitMQ Web Management Dashboard
+
+RabbitMQ comes with an interactive web dashboard running out of the box:
+
+- **Web Dashboard URL**: [http://localhost:15672](http://localhost:15672)
+- **Username**: `guest`
+- **Password**: `guest`
+
+#### What to observe in the RabbitMQ UI:
+1. **Connections Tab**: See 4 active AMQP connections (`cfg-git-server`, `cfg-git-inventory`, `cfg-git-pricing`, `cfg-git-pricing-2`).
+2. **Exchanges Tab**: Click on **`springCloudBus`** to see the routing bindings to each microservice.
+3. **Queues Tab**: See the temporary, auto-delete queues created by each microservice instance (`springCloudBus.anonymous.*`).
+4. **Live Activity**: Push a Git commit and watch the Message Rate graph spike in real time!
+
+---
+
+## 5. Quick Start: Build and Run
 
 ### Prerequisites
 - **Java 21**
@@ -144,7 +186,9 @@ All 5 containers will report `(healthy)`:
 
 ---
 
-## 5. Configuration & Environment Variables
+---
+
+## 6. Configuration & Environment Variables
 
 | Variable | Default Value | Description |
 |---|---|---|
@@ -159,7 +203,7 @@ All 5 containers will report `(healthy)`:
 
 ---
 
-## 6. Testing Guide
+## 7. Testing Guide
 
 ### A. Automated End-to-End Test Suite
 Run the full automated acceptance suite that validates zero-downtime live refresh, SLA (<5s), secret decryption, multi-instance broadcasting, and validation error rollback:
@@ -268,7 +312,7 @@ If an operator commits an invalid value (e.g. `discount-percentage: 95.0`, viola
 
 ---
 
-## 7. Automating Refresh (Webhooks & Hooks)
+## 8. Automating Refresh (Webhooks & Hooks)
 
 ### Option A: GitHub Webhook Setup
 1. In your GitHub repo, navigate to **Settings** &rarr; **Webhooks** &rarr; **Add webhook**.
@@ -285,7 +329,7 @@ chmod +x .git/hooks/post-commit
 
 ---
 
-## 8. Interactive OpenAPI 3 / Swagger Documentation
+## 9. Interactive OpenAPI 3 / Swagger Documentation
 
 Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
 
@@ -302,7 +346,7 @@ Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagg
 
 ---
 
-## 9. Production-Grade Security Hardening
+## 10. Production-Grade Security Hardening
 
 ### Security Filter Chain (`SecurityConfig.java`)
 All microservices implement enterprise-grade HTTP security controls:
@@ -318,7 +362,7 @@ All microservices implement enterprise-grade HTTP security controls:
 
 ---
 
-## 10. RFC 9457 Standardized Exception Handling
+## 11. RFC 9457 Standardized Exception Handling
 
 All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
 
@@ -350,7 +394,7 @@ All uncaught exceptions and validation errors are intercepted by `@RestControlle
 
 ---
 
-## 11. Security Scanning & Quality Gates (SAST / SCA)
+## 12. Security Scanning & Quality Gates (SAST / SCA)
 
 Every build is continuously analyzed by enterprise security and code quality gates:
 

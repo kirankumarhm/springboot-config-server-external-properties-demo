@@ -123,7 +123,53 @@ sequenceDiagram
 
 ---
 
-## 4. Quick Start: Build and Run
+## 4. Understanding RabbitMQ & Spring Cloud Bus (Layman's Guide & Web UI)
+
+### The Core Role of RabbitMQ (The "Megaphone" Analogy)
+Think of **RabbitMQ** as a central **broadcast megaphone**:
+- **Without RabbitMQ**: Config Server would need to maintain an inventory of every client container IP/port and call each service's HTTP `/actuator/refresh` endpoint one by one.
+- **With RabbitMQ & Spring Cloud Bus**: When an S3 object is uploaded, S3 sends an event to SQS. Config Server reads SQS and shouts **once** into RabbitMQ's topic exchange (`springCloudBus`): *"Hey everyone, `pricing-service` configuration has changed!"*. RabbitMQ automatically duplicates and delivers this message to every connected service's private queue.
+
+```mermaid
+graph TD
+    S3["AWS S3 Bucket<br/>(Upload pricing-service.yml)"]
+    SQS["AWS SQS Queue<br/>(s3:ObjectCreated notification)"]
+    CS["Config Server (:8908)<br/>(SQS listener receives message)"]
+    Ex["RabbitMQ Exchange: springCloudBus<br/>(Topic Exchange :5674)"]
+    Q1["Queue: inventory-service"]
+    Q2["Queue: pricing-service-1"]
+    Q3["Queue: pricing-service-2"]
+    Inv["Inventory Service (:8101)<br/>(Ignores, not for me)"]
+    Prc1["Pricing Service 1 (:8102)<br/>(Matches! Pulls new config)"]
+    Prc2["Pricing Service 2 (:8103)<br/>(Matches! Pulls new config)"]
+
+    S3 -- "1. S3 Event" --> SQS
+    SQS -- "2. Read SQS" --> CS
+    CS -- "3. Publishes 1 message:<br/>'pricing-service:**'" --> Ex
+    Ex --> Q1 --> Inv
+    Ex --> Q2 --> Prc1
+    Ex --> Q3 --> Prc2
+    Prc1 -- "4. Pulls updated S3 YAML" --> CS
+    Prc2 -- "4. Pulls updated S3 YAML" --> CS
+```
+
+### Accessing the RabbitMQ Web Management Dashboard
+
+RabbitMQ comes with an interactive web dashboard running out of the box:
+
+- **Web Dashboard URL**: [http://localhost:15674](http://localhost:15674)
+- **Username**: `guest`
+- **Password**: `guest`
+
+#### What to observe in the RabbitMQ UI:
+1. **Connections Tab**: See 4 active AMQP connections (`cfg-s3-server`, `cfg-s3-inventory`, `cfg-s3-pricing`, `cfg-s3-pricing-2`).
+2. **Exchanges Tab**: Click on **`springCloudBus`** to see the routing bindings to each microservice.
+3. **Queues Tab**: See the temporary, auto-delete queues created by each microservice instance (`springCloudBus.anonymous.*`).
+4. **Live Activity**: Upload an updated YAML to S3 and watch the Message Rate graph spike in real time!
+
+---
+
+## 5. Quick Start: Build and Run
 
 ### Step 1: Ensure Local AWS Emulator (Floci) is Running
 ```bash
@@ -165,7 +211,7 @@ All containers will report `(healthy)`:
 
 ---
 
-## 5. Testing Guide
+## 6. Testing Guide
 
 ### A. Automated Acceptance Test Suite
 ```bash
@@ -247,7 +293,7 @@ Both instances will show:
 
 ---
 
-## 7. Interactive OpenAPI 3 / Swagger Documentation
+## 8. Interactive OpenAPI 3 / Swagger Documentation
 
 Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
 
@@ -264,7 +310,7 @@ Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagg
 
 ---
 
-## 8. Production-Grade Security Hardening
+## 9. Production-Grade Security Hardening
 
 ### Security Filter Chain (`SecurityConfig.java`)
 All microservices implement enterprise-grade HTTP security controls:
@@ -280,7 +326,7 @@ All microservices implement enterprise-grade HTTP security controls:
 
 ---
 
-## 9. RFC 9457 Standardized Exception Handling
+## 10. RFC 9457 Standardized Exception Handling
 
 All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
 
@@ -312,7 +358,7 @@ All uncaught exceptions and validation errors are intercepted by `@RestControlle
 
 ---
 
-## 10. Security Scanning & Quality Gates (SAST / SCA)
+## 11. Security Scanning & Quality Gates (SAST / SCA)
 
 Every build is continuously analyzed by enterprise security and code quality gates:
 

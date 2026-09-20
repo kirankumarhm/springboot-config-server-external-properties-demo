@@ -115,7 +115,51 @@ sequenceDiagram
 
 ---
 
-## 4. Quick Start: Build and Run
+## 4. Understanding RabbitMQ & Spring Cloud Bus (Layman's Guide & Web UI)
+
+### The Core Role of RabbitMQ (The "Megaphone" Analogy)
+Think of **RabbitMQ** as a central **broadcast megaphone**:
+- **Without RabbitMQ**: Config Server would need to maintain a database of every client IP/port and send individual HTTP `/actuator/refresh` calls to each service. If 50 pricing pods are running, Config Server has to call each one manually.
+- **With RabbitMQ & Spring Cloud Bus**: When a SQL `UPDATE` happens, PostgreSQL notifies Config Server via `pg_notify`. Config Server then shouts **once** into RabbitMQ's topic exchange (`springCloudBus`): *"Hey everyone, `pricing-service` configuration has changed!"*. RabbitMQ automatically duplicates and delivers this message to every connected service's private queue.
+
+```mermaid
+graph TD
+    DB["PostgreSQL 17.6<br/>(SQL UPDATE & pg_notify)"]
+    CS["Config Server (:8898)<br/>(LISTEN thread receives notification)"]
+    Ex["RabbitMQ Exchange: springCloudBus<br/>(Topic Exchange :5673)"]
+    Q1["Queue: inventory-service"]
+    Q2["Queue: pricing-service-1"]
+    Q3["Queue: pricing-service-2"]
+    Inv["Inventory Service (:8091)<br/>(Ignores, not for me)"]
+    Prc1["Pricing Service 1 (:8092)<br/>(Matches! Pulls new config)"]
+    Prc2["Pricing Service 2 (:8093)<br/>(Matches! Pulls new config)"]
+
+    DB -- "1. pg_notify" --> CS
+    CS -- "2. Publishes 1 message:<br/>'pricing-service:**'" --> Ex
+    Ex --> Q1 --> Inv
+    Ex --> Q2 --> Prc1
+    Ex --> Q3 --> Prc2
+    Prc1 -- "3. Pulls updated SQL properties" --> CS
+    Prc2 -- "3. Pulls updated SQL properties" --> CS
+```
+
+### Accessing the RabbitMQ Web Management Dashboard
+
+RabbitMQ comes with an interactive web dashboard running out of the box:
+
+- **Web Dashboard URL**: [http://localhost:15673](http://localhost:15673)
+- **Username**: `guest`
+- **Password**: `guest`
+
+#### What to observe in the RabbitMQ UI:
+1. **Connections Tab**: See 4 active AMQP connections (`cfg-jdbc-server`, `cfg-jdbc-inventory`, `cfg-jdbc-pricing`, `cfg-jdbc-pricing-2`).
+2. **Exchanges Tab**: Click on **`springCloudBus`** to see the routing bindings to each microservice.
+3. **Queues Tab**: See the temporary, auto-delete queues created by each microservice instance (`springCloudBus.anonymous.*`).
+4. **Live Activity**: Run a SQL `UPDATE` in Postgres and watch the Message Rate graph spike in real time!
+
+---
+
+## 5. Quick Start: Build and Run
 
 ### Step 1: Generate Keystore
 ```bash
@@ -148,7 +192,7 @@ All 5 containers will report `(healthy)`:
 
 ---
 
-## 5. Database Schema & Flyway Migrations
+## 6. Database Schema & Flyway Migrations
 
 The database schema is automatically created and managed by Flyway on Config Server startup:
 
@@ -184,7 +228,7 @@ FOR EACH ROW EXECUTE FUNCTION fn_notify_config_change();
 
 ---
 
-## 6. Testing Guide
+## 7. Testing Guide
 
 ### A. Automated Acceptance Test Suite
 ```bash
@@ -259,7 +303,7 @@ Both instances immediately calculate:
 
 ---
 
-## 7. Interactive OpenAPI 3 / Swagger Documentation
+## 8. Interactive OpenAPI 3 / Swagger Documentation
 
 Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
 
@@ -276,7 +320,7 @@ Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagg
 
 ---
 
-## 8. Production-Grade Security Hardening
+## 9. Production-Grade Security Hardening
 
 ### Security Filter Chain (`SecurityConfig.java`)
 All microservices implement enterprise-grade HTTP security controls:
@@ -292,7 +336,7 @@ All microservices implement enterprise-grade HTTP security controls:
 
 ---
 
-## 9. RFC 9457 Standardized Exception Handling
+## 10. RFC 9457 Standardized Exception Handling
 
 All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
 
@@ -324,7 +368,7 @@ All uncaught exceptions and validation errors are intercepted by `@RestControlle
 
 ---
 
-## 10. Security Scanning & Quality Gates (SAST / SCA)
+## 11. Security Scanning & Quality Gates (SAST / SCA)
 
 Every build is continuously analyzed by enterprise security and code quality gates:
 
