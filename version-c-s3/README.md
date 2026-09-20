@@ -162,10 +162,17 @@ RabbitMQ comes with an interactive web dashboard running out of the box:
 - **Password**: `guest`
 
 #### What to observe in the RabbitMQ UI:
-1. **Connections Tab**: See 4 active AMQP connections (`cfg-s3-server`, `cfg-s3-inventory`, `cfg-s3-pricing`, `cfg-s3-pricing-2`).
-2. **Exchanges Tab**: Click on **`springCloudBus`** to see the routing bindings to each microservice.
-3. **Queues Tab**: See the temporary, auto-delete queues created by each microservice instance (`springCloudBus.anonymous.*`).
-4. **Live Activity**: Upload an updated YAML to S3 and watch the Message Rate graph spike in real time!
+1. **Connections Tab ("The Phone Lines")**:
+   - You will see 4 active AMQP connections.
+   - **Service Name Identification**: Thanks to the `ConnectionNameStrategy` bean (`RabbitConfig.java`), connections display human-readable names (`config-server:8908`, `inventory-service:8101`, `pricing-service:8102`, `pricing-service:8103`).
+   - *Tip*: Click the `+/-` icon on the top-right of the table to enable the **Client-provided name** column, or click any connection to inspect its details.
+2. **Exchanges Tab ("The Router")**:
+   - Click on **`springCloudBus`** (`topic` type) to see the broadcast bindings to each microservice's queue (`#`).
+3. **Queues and Streams Tab ("The Inboxes")**:
+   - See the temporary, auto-delete queues created by each microservice instance (`springCloudBus.anonymous.*`).
+   - *Why anonymous names?* To ensure fan-out delivery so that every replica receives the refresh broadcast.
+   - *How to match queue to service?* Click any queue &rarr; check **Consumers** to see the service name.
+4. **Live Activity**: Upload an updated YAML to S3 and watch the **Message Rates** graph spike in real time!
 
 ---
 

@@ -360,19 +360,22 @@ Every version includes a pre-configured RabbitMQ Management Web Dashboard:
 | **Version C (AWS S3)** | [http://localhost:15674](http://localhost:15674) | `guest` / `guest` | `5674` |
 
 #### 4. What to Look for in the RabbitMQ Dashboard:
-1. **Overview Tab**:
-   - Check **Connections**: You will see active connections from `cfg-*-server`, `cfg-*-inventory`, `cfg-*-pricing`, and `cfg-*-pricing-2` (4 active client connections).
-   - Check **Channels**: Each Spring Cloud Bus listener maintains an open channel waiting for messages.
-2. **Exchanges Tab**:
+
+1. **Connections Tab ("The Phone Lines")**:
+   - You will see **4 active connections** representing your 4 microservices.
+   - **Service Name Identification**: Thanks to the `ConnectionNameStrategy` bean configured in each service's `RabbitConfig.java`, each connection sets a descriptive **Client-provided name** (e.g. `config-server:8888`, `inventory-service:8081`, `pricing-service:8082`).
+   - *Tip*: In the RabbitMQ table, click the `+/-` icon on the top-right of the table to enable the **Client-provided name** column, or click any connection row to inspect its client properties.
+2. **Exchanges Tab ("The Router")**:
    - Click on the **`springCloudBus`** exchange (`topic` type).
-   - Scroll to **Bindings**: You will see each connected microservice's auto-generated queue bound with `#` routing key.
-3. **Queues Tab**:
-   - Inspect individual queues named `springCloudBus.anonymous.<random-hash>`.
-   - Each queue corresponds to one running instance.
-4. **Live Verification (Watch Messages Flow)**:
-   - Open RabbitMQ UI `Overview` page in your browser.
-   - Run a config change (e.g. edit YAML in Git, update SQL row in Postgres, or upload file to S3).
-   - Watch the **Message Rates / Queued Messages** graph immediately spike with message delivery in real-time!
+   - Scroll down to **Bindings**: You will see each microservice's queue bound to this exchange with routing pattern `#`.
+3. **Queues and Streams Tab ("The Inboxes")**:
+   - You will see 4 queues named `springCloudBus.anonymous.<random-hash>`.
+   - **Why `anonymous.<hash>`?** Spring Cloud Bus generates unique queue names for each replica so that broadcasts are delivered to **every** replica (fan-out pattern). If they shared the same static queue name, RabbitMQ would load-balance messages, causing only one pod to refresh while other pods remain stale!
+   - **How to know which queue belongs to which service?** Click on any queue name &rarr; scroll to **Consumers** &rarr; you will see the consumer's connection name (e.g. `pricing-service:8082`).
+4. **Live Activity (Watch Messages Flow)**:
+   - Keep the RabbitMQ UI `Overview` page open.
+   - Trigger a config update (commit Git change, update Postgres row, or upload to S3).
+   - Watch the **Message Rates** (`incoming` and `deliver / get`) immediately spike from 0 to 1 in real time!
 
 ---
 
