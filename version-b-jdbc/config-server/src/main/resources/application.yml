@@ -60,6 +60,10 @@ spring:
               name: inventory-service
               profiles: default
               label: main
+    stream:
+      rabbit:
+        binder:
+          connection-name-prefix: ${spring.application.name}:${APP_INDEX:${SERVER_PORT:8898}}
   rabbitmq:
     host: ${RABBITMQ_HOST:localhost}
     port: ${RABBITMQ_PORT:5672}

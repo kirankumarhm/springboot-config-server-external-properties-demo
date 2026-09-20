@@ -23,6 +23,10 @@ spring:
       label: ${CONFIG_LABEL:main}
       request-connect-timeout: 5000
       request-read-timeout: 15000
+    stream:
+      rabbit:
+        binder:
+          connection-name-prefix: ${spring.application.name}:${APP_INDEX:${SERVER_PORT:8082}}
   rabbitmq:
     host: ${RABBITMQ_HOST:localhost}
     port: ${RABBITMQ_PORT:5672}
