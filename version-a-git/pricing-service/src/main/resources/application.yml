@@ -9,10 +9,14 @@ spring:
     timeout-per-shutdown-phase: 20s
   application:
     name: pricing-service
-    index: ${APP_INDEX:${SERVER_PORT:8082}}
   config:
     import: "configserver:${CONFIG_SERVER_URI:http://localhost:8888}?fail-fast=true&max-attempts=6&initial-interval=1000&multiplier=1.5&max-interval=8000"
   cloud:
+    bus:
+      # Makes the Spring Cloud Bus service id (app:index:id) unique per instance. Without this,
+      # two instances of the same app can collide and duplicate-event suppression silently drops
+      # a refresh on one of them.
+      id: ${spring.application.name}:${APP_INDEX:${SERVER_PORT:8082}}:${random.uuid}
     config:
       username: ${CONFIG_CLIENT_USERNAME:config-client}
       password: ${CONFIG_CLIENT_PASSWORD:client-secret}
@@ -35,13 +39,13 @@ management:
   endpoint:
     health:
       show-details: always
+      probes:
+        enabled: true
     env:
       show-values: never
     configprops:
       show-values: never
-  health:
-    probes:
-      enabled: true
+
 
 logging:
   level:

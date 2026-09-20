@@ -93,13 +93,12 @@ management:
   endpoint:
     health:
       show-details: always
+      probes:
+        enabled: true
     env:
       show-values: never
     configprops:
       show-values: never
-  health:
-    probes:
-      enabled: true
 
 logging:
   level:
