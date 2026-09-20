@@ -8,17 +8,15 @@ import org.springframework.context.annotation.Configuration;
 /**
  * RabbitMQ configuration for Spring AMQP and Spring Cloud Bus.
  *
- * <p>Provides a descriptive {@link ConnectionNameStrategy} so that active connections appear with
- * human-readable service names (e.g. {@code inventory-service:8091}) in the RabbitMQ Management Web
- * UI.
+ * <p>Provides a clean {@link ConnectionNameStrategy} so that active connections appear with clean
+ * service names (e.g. {@code inventory-service}) in the RabbitMQ Management Web UI.
  */
 @Configuration
 public class RabbitConfig {
 
   @Bean
   public ConnectionNameStrategy connectionNameStrategy(
-      @Value("${spring.application.name:inventory-service}") String appName,
-      @Value("${server.port:8080}") String port) {
-    return connectionFactory -> appName + ":" + port;
+      @Value("${spring.application.name:inventory-service}") String appName) {
+    return connectionFactory -> appName;
   }
 }
