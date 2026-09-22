@@ -3,7 +3,7 @@ inventory:
   # AC-04 flips express-shipping-enabled to true.
   # AC-05 sets max-order-quantity to an invalid value (e.g. 99999) to prove
   # the client keeps its last-known-good snapshot instead of adopting it.
-  max-order-quantity: 500
+  max-order-quantity: 400
   express-shipping-enabled: true
   low-stock-threshold: 25
   # Stored ENCRYPTED at rest. The Config Server holds the only copy of the private key
