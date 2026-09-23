@@ -41,8 +41,6 @@ ok()   { PASS=$((PASS+1)); echo "  ${GREEN}PASS${OFF}  $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "  ${RED}FAIL${OFF}  $1"; }
 head2(){ echo; echo "${BOLD}$1${OFF}"; }
 
-SECRET_LOG_CONTAINER="cfg-git-inventory"
-check_store_has_no_plaintext() { grep -rl "ak_live_3f9c2b7e41d84a6f" "$REPO" 2>/dev/null; }
 
 # Waits until an application's snapshot version exceeds a baseline. Prints elapsed seconds.
 wait_for_version_above() {
@@ -268,34 +266,10 @@ else
 fi
 
 # ---------------------------------------------------------------- summary
-# ---------------------------------------------------------------- AC-08
-head2 "AC-08  secrets are encrypted at rest and decrypted server-side"
-EXPECTED_FP="sha256:9fb8b8e0e535fecf"   # sha256("ak_live_3f9c2b7e41d84a6f")[:16]
-
-fp=$(field "$INV" settings.downstreamApiKeyFingerprint)
-[ "$fp" = "$EXPECTED_FP" ] && ok "client received the DECRYPTED secret (fingerprint $fp)" \
-                          || bad "fingerprint $fp != $EXPECTED_FP"
-
-body=$(snap "$INV")
-echo "$body" | grep -q 'ak_live_3f9c2b7e41d84a6f' && bad "the API response LEAKS the secret" \
-                                                  || ok "the secret never appears in the API response"
-echo "$body" | grep -q '{cipher}' && bad "an undecrypted {cipher} placeholder reached the client" \
-                                  || ok "no undecrypted {cipher} placeholder reached the client"
-
-logs=$(docker logs "$SECRET_LOG_CONTAINER" 2>&1 | grep -c 'ak_live_3f9c2b7e41d84a6f' || true)
-[ "${logs:-0}" -eq 0 ] && ok "the secret never appears in the client logs" \
-                       || bad "the secret appears in the logs $logs times"
-
-served=$(curl -s -u "$ADMIN" "$SERVER/inventory-service/default/main" | grep -c 'ak_live_3f9c2b7e41d84a6f' || true)
-[ "${served:-0}" -ge 1 ] && ok "Config Server serves it decrypted (it holds the only private key)" \
-                         || bad "Config Server did not serve a decrypted value"
-
-if [ -n "$(check_store_has_no_plaintext)" ]; then
-  bad "the configuration store contains the PLAINTEXT secret"
-else
-  ok "the configuration store contains only ciphertext"
-fi
-
+# ---------------------------------------------------------------- NFR-10
+head2 "NFR-10  the encryption endpoints require authentication"
+# No configuration value is {cipher}-encrypted any more, so there is no decrypted secret to
+# assert on. The endpoints still exist, and their access control is still worth asserting.
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: text/plain' --data-binary x "$SERVER/encrypt")
 [ "$code" = "401" ] && ok "/encrypt rejects unauthenticated callers" || bad "/encrypt returned $code"
 

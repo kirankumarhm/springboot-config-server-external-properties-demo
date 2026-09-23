@@ -270,11 +270,15 @@ from its siblings.
 ./scripts/generate-keystore.sh
 ```
 
-One of the settings is a password (`downstream-api-key`). It is stored **encrypted** in the
-configuration file — if you open `config-repo/inventory-service.yml` you'll see a long
-unreadable string starting with `{cipher}`. The Config Server holds the only copy of the key that
-decrypts it, and decrypts it before handing it to a client. So the encrypted form is what sits in
-Git, where anyone can read it, and that's fine. This script creates that key.
+The Config Server can store secrets **encrypted**: you write a long unreadable string starting
+with `{cipher}` into the configuration file, the Config Server holds the only copy of the key that
+decrypts it, and it decrypts the value before handing it to a client. So the encrypted form is what
+sits in Git, where anyone can read it, and that's fine. This script creates that key.
+
+None of the settings in this demo are encrypted right now, so nothing depends on the key being
+correct. You still need to run this script, because the Config Server is configured to load the
+keystore at startup and will not start without it. If you want to try encryption yourself, see the
+`/encrypt` walkthrough in `version-a-git/README.md`.
 
 **Step 4 — install the Git hook.**
 
@@ -337,8 +341,7 @@ curl -s localhost:8081/api/v1/config/snapshot | jq .
     "expressShippingEnabled": true,
     "lowStockThreshold": 25,
     "bannerMessage": "Configured centrally via Spring Cloud Config - Git backend",
-    "environmentLabel": "production-like",
-    "downstreamApiKeyFingerprint": "sha256:..."
+    "environmentLabel": "production-like"
   }
 }
 ```
@@ -354,9 +357,6 @@ Read that response field by field, because you will be using it for the rest of 
   adopted), `NO_CHANGE` (asked, but nothing was different), or `REJECTED` (new values were
   invalid and were refused — section 8).
 - **`rejectedCount`** — how many times bad configuration has been refused.
-- **`downstreamApiKeyFingerprint`** — note what is *not* here: the actual password. This endpoint
-  shows a one-way hash of it instead, so you can confirm the right secret arrived without the
-  endpoint leaking it.
 
 Now call an actual business endpoint and watch configuration drive behaviour:
 

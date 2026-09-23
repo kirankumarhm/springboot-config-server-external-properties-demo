@@ -62,13 +62,6 @@ srcs=$(probe 'http://config-admin:admin-secret@localhost:8888/inventory-service/
 [ "${srcs:-0}" -ge 2 ] 2>/dev/null && ok "Environment API serves $srcs property sources from S3" \
                                    || bad "property sources=${srcs:-0}"
 
-head2 "Encryption: {cipher} decrypted server-side, secret never exposed"
-fp=$(snap_field "${INV_IPS[0]}" 8081 "['settings']['downstreamApiKeyFingerprint']")
-[ "$fp" = "sha256:9fb8b8e0e535fecf" ] && ok "client holds the decrypted secret (fingerprint $fp)" \
-                                      || bad "fingerprint=$fp"
-probe "http://${INV_IPS[0]}:8081/api/v1/config/snapshot" | grep -q 'ak_live_' \
-  && bad "the API response leaks the secret" || ok "the secret is absent from the API response"
-
 head2 "Management port is separate and protected"
 n401=$(k -n $NS exec deploy/config-server -c config-server -- \
   sh -c 'wget -qS -O /dev/null http://localhost:9888/actuator/env 2>&1 | grep -c 401 || true' 2>/dev/null)

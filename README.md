@@ -14,12 +14,12 @@ different storage backends and three genuinely different change-detection mechan
 
 | | Backend | Change trigger | Config server | Clients | Checks |
 |---|---|---|---|---|---|
-| [**version-a-git**](version-a-git/README.md) | Git repository (Remote GitHub / Local) | `post-commit` / Webhook → `/monitor` → Bus | 8888 | 8081-8083 | **29/29** |
-| [**version-b-jdbc**](version-b-jdbc/README.md) | PostgreSQL 17.6 | trigger → `pg_notify` → `LISTEN` → Bus | 8898 | 8091-8093 | **33/33** |
-| [**version-c-s3**](version-c-s3/README.md) | AWS S3 (Floci emulator) | S3 Event Notification → SQS → Bus | 8908 | 8101-8103 | **32/32** |
+| [**version-a-git**](version-a-git/README.md) | Git repository (Remote GitHub / Local) | `post-commit` / Webhook → `/monitor` → Bus | 8888 | 8081-8083 | **23/23** |
+| [**version-b-jdbc**](version-b-jdbc/README.md) | PostgreSQL 17.6 | trigger → `pg_notify` → `LISTEN` → Bus | 8898 | 8091-8093 | **27/27** |
+| [**version-c-s3**](version-c-s3/README.md) | AWS S3 (Floci emulator) | S3 Event Notification → SQS → Bus | 8908 | 8101-8103 | **26/26** |
 
-**354 automated checks** — 260 tests in `mvn verify` (253 unit/slice plus a
-7-test Testcontainers integration suite), and 94 end-to-end acceptance checks against the running
+**428 automated checks** — 352 tests in `mvn verify` (345 unit/slice plus a
+7-test Testcontainers integration suite), and 76 end-to-end acceptance checks against the running
 Docker stacks, each E2E suite run twice consecutively to prove idempotency. Measured propagation: **0.1–0.6 s** typical.
 
 Every module builds under an enforced quality gate: Spotless (google-java-format), Checkstyle,
@@ -62,10 +62,10 @@ Kubernetes.** Detail in [§14](#14-portability-and-kubernetes-readiness).
 Two of the three are verified running on Kubernetes:
 
 - **Version B on minikube** — 2 Config Server replicas, 2 pricing replicas, PodDisruptionBudget;
-  **12 in-cluster checks pass**, including a `psql` UPDATE reaching all three client pods with
+  **10 in-cluster checks pass**, including a `psql` UPDATE reaching all three client pods with
   **zero pod restarts**.
 - **Version C on Floci EKS** — Floci's EKS service provisions a real `rancher/k3s` control plane;
-  **14 in-cluster checks pass**, including an `aws s3 cp` reaching all three client pods with zero
+  **12 in-cluster checks pass**, including an `aws s3 cp` reaching all three client pods with zero
   restarts. One command: `version-c-s3/k8s/deploy-floci-eks.sh` (unique image tag per deploy, and it
   asserts the cluster is running the image it just built).
 
@@ -101,7 +101,7 @@ prerequisite outstanding.
 | Multi-replica Config Server | ✅ 2 replicas (safe for JDBC: no shared filesystem) |
 | CI | ✅ GitHub Actions: build matrix, E2E matrix, scheduled CVE scan |
 | **Version A on Kubernetes** | ⚠️ Needs a **remote** Git URI — `file://` cannot work in a cluster (§14.2) |
-| **Version C on Kubernetes** | ✅ **Verified on Floci EKS** (real k3s control plane), 14 in-cluster checks |
+| **Version C on Kubernetes** | ✅ **Verified on Floci EKS** (real k3s control plane), 12 in-cluster checks |
 | Broker HA / persistence | ⚠️ Single RabbitMQ pod, no persistence. Use a managed broker or the Cluster Operator. |
 | HPA | ❌ Not included; needs metrics-server and a meaningful scaling signal |
 
@@ -625,7 +625,6 @@ there is no coupling to negotiate.
 com.example.config.<service>
 ├── <Service>Application.java     @SpringBootApplication (default component scan)
 ├── config/     setter-bound @ConfigurationProperties + SharedConfigProperties (demo.shared.*)
-│               [inventory only] SecretFingerprint — sha256:<16 hex> of a decrypted {cipher}
 ├── controller/ REST controllers (<Service>Controller, ConfigInspectionController)
 ├── dto/        immutable request/response records with Jakarta validation (ReservationRequest, etc.)
 ├── domain/     immutable snapshot records (<Service>Settings)
@@ -1244,7 +1243,7 @@ Specified but **not implemented** — stated plainly rather than left to be disc
 |---|---|
 | **Testcontainers ITs only exist for version B** | B's SQL (migrations, triggers, transactional `NOTIFY`) is verified in `mvn verify`. A and C have no in-build integration layer, so their broadcast path is still proven only by `scripts/e2e-test.sh` against a running stack. |
 | ~~No quality gates~~ | **Done.** Enforcer, Spotless, Checkstyle, SpotBugs, JaCoCo and ArchUnit all enforced; ArchUnit makes the setter-binding and no-`@Validated` constraints executable rather than documented. |
-| ~~`{cipher}` encryption unused~~ | **Done.** RSA 4096 PKCS12 keystore per version; a real secret is encrypted at rest in all three stores and proven decrypted client-side via a SHA-256 fingerprint (`AC-08`). |
+| **`{cipher}` encryption wired but unused** | The RSA 4096 PKCS12 keystore and the `/encrypt` / `/decrypt` endpoints are configured and authenticated in all three versions, but no configuration value is encrypted any more. The one `{cipher}` secret (`inventory.downstream-api-key`) was removed, because a keystore that cannot decrypt it serves the key back as `invalid.<key>` and the client then fails `@NotBlank` at startup — a decryption fault that presents as a validation bug. `AC-08` is therefore no longer exercised; only the endpoint authorisation is asserted (`NFR-10`). |
 | **No Kubernetes manifests** | See §14. Graceful shutdown is now configured; the manifests, Secrets and the management-port split are not. |
 | **Config-server actuator shares the app port** | Splitting it needs a security chain for Boot's child management context plus a test asserting 401 on that port, or the split would expose `/actuator/env` and `/actuator/busrefresh` unauthenticated. The reason is recorded in each `config-server/application.yml`. |
 | ~~No CI pipeline~~ | **Done.** `.github/workflows/ci.yml`: 3-way build matrix, E2E matrix for A and B, CVE scan on demand. |

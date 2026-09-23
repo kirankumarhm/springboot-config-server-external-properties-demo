@@ -14,10 +14,4 @@ public record InventorySettings(
     boolean expressShippingEnabled,
     int lowStockThreshold,
     String bannerMessage,
-    String environmentLabel,
-    /**
-     * Fingerprint of the decrypted downstream API key - deliberately NOT the key itself. This
-     * record is serialised straight onto an inspection endpoint, so carrying the secret here would
-     * undo the reason it is encrypted at rest.
-     */
-    String downstreamApiKeyFingerprint) {}
+    String environmentLabel) {}

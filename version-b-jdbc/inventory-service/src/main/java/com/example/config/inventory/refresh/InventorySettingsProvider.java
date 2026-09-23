@@ -1,7 +1,6 @@
 package com.example.config.inventory.refresh;
 
 import com.example.config.inventory.config.InventoryConfigProperties;
-import com.example.config.inventory.config.SecretFingerprint;
 import com.example.config.inventory.config.SharedConfigProperties;
 import com.example.config.inventory.domain.InventorySettings;
 import jakarta.annotation.PostConstruct;
@@ -197,8 +196,7 @@ public class InventorySettingsProvider
         this.properties.isExpressShippingEnabled(),
         this.properties.getLowStockThreshold(),
         this.shared.getBannerMessage(),
-        this.shared.getEnvironmentLabel(),
-        SecretFingerprint.of(this.properties.getDownstreamApiKey()));
+        this.shared.getEnvironmentLabel());
   }
 
   /**

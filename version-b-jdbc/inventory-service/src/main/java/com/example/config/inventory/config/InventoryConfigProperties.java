@@ -37,12 +37,6 @@ public class InventoryConfigProperties {
   @Min(0)
   private int lowStockThreshold;
 
-  /**
-   * Stored in the configuration backend as a {@code {cipher}} value and decrypted by the Config
-   * Server before it is served, so this client only ever sees plaintext and never holds the key.
-   */
-  @NotBlank private String downstreamApiKey;
-
   public String getWarehouseCode() {
     return this.warehouseCode;
   }
@@ -69,14 +63,6 @@ public class InventoryConfigProperties {
 
   public int getLowStockThreshold() {
     return this.lowStockThreshold;
-  }
-
-  public String getDownstreamApiKey() {
-    return this.downstreamApiKey;
-  }
-
-  public void setDownstreamApiKey(String downstreamApiKey) {
-    this.downstreamApiKey = downstreamApiKey;
   }
 
   public void setLowStockThreshold(int lowStockThreshold) {

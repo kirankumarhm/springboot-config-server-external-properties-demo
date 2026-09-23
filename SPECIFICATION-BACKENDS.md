@@ -8,7 +8,7 @@ additional backends and everything they change.
 |---|---|
 | Spec version | 1.0 (draft for approval) |
 | Date | 2026-08-30 |
-| Status | **Implemented. Version B in [version-b-jdbc/](version-b-jdbc/) — 33/33 checks passing. Version C in [version-c-s3/](version-c-s3/) — 32/32 checks passing.** Corrections from the running system are marked **[CORRECTED]**; full list in [README.md](README.md#findings-that-contradict-the-original-specification). |
+| Status | **Implemented. Version B in [version-b-jdbc/](version-b-jdbc/) — 27/27 checks passing. Version C in [version-c-s3/](version-c-s3/) — 26/26 checks passing.** Corrections from the running system are marked **[CORRECTED]**; full list in [README.md](README.md#findings-that-contradict-the-original-specification). |
 | Approved decisions | One config-server, three Spring profiles · PostgreSQL · `LISTEN/NOTIFY` + revision poller · LocalStack with S3→SQS |
 
 ---
@@ -616,6 +616,12 @@ even inside an encrypted bucket — SSE protects against storage-layer compromis
 protects against anyone with read access to the bucket. Defence in depth; `NFR-11` is unchanged
 across all three versions.
 
+> **[CORRECTED]** No configuration value is `{cipher}`-encrypted any more. The single encrypted
+> secret was removed from all three stores because it coupled client startup to the Config
+> Server's keystore: a ciphertext the keystore cannot decrypt is served back as
+> `invalid.<key>`, which the client then rejects with `@NotBlank` and fails to start. SSE-KMS on
+> the bucket is unaffected, and the `/encrypt` workflow remains available and authenticated.
+
 Credentials in production come from IRSA / instance profile, never static keys. The static-key
 properties above exist solely so LocalStack works with its `test`/`test` dummies.
 
@@ -725,7 +731,7 @@ silently falling back to Git. That is the correct trade (`NFR-16`) but must be a
 | Operational cost | Lowest | DB to run, patch, back up | Managed; near-zero ops |
 | HA story | Needs `ssh:` + `force-pull` per replica | Native (DB is already HA) | Native (S3 is already HA) |
 | Bulk/programmatic edits | Awkward | **Natural (SQL)** | Awkward (whole-object rewrite) |
-| Secret handling | `{cipher}` | `{cipher}` | `{cipher}` + SSE-KMS |
+| Secret handling | `{cipher}` (available, unused) | `{cipher}` (available, unused) | `{cipher}` (available, unused) + SSE-KMS |
 | Best suited to | Team-reviewed config as code | Config edited by tooling/an admin UI, or already-DB-centric shops | AWS-native platforms, large config sets, minimal ops |
 
 Recommendation, if one must be chosen for production: **Git** when configuration should be

@@ -91,9 +91,7 @@ class InventoryWebMvcTest {
   @DisplayName("GET /config/snapshot exposes version, outcome and effective settings")
   void exposesSnapshot() throws Exception {
     given(this.settingsProvider.get())
-        .willReturn(
-            new InventorySettings(
-                "WH-BLR-01", 500, true, 25, "banner", "local", "sha256:deadbeefdeadbeef"));
+        .willReturn(new InventorySettings("WH-BLR-01", 500, true, 25, "banner", "local"));
     given(this.settingsProvider.status())
         .willReturn(
             new ConfigSnapshotStatus(
@@ -120,9 +118,7 @@ class InventoryWebMvcTest {
   @DisplayName("a rejected refresh surfaces lastFailureReason in the snapshot response")
   void exposesFailureReasonWhenRejected() throws Exception {
     given(this.settingsProvider.get())
-        .willReturn(
-            new InventorySettings(
-                "WH-BLR-01", 500, true, 25, "banner", "local", "sha256:deadbeefdeadbeef"));
+        .willReturn(new InventorySettings("WH-BLR-01", 500, true, 25, "banner", "local"));
     given(this.settingsProvider.status())
         .willReturn(
             new ConfigSnapshotStatus(

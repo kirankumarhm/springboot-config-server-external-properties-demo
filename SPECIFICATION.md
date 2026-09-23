@@ -7,7 +7,7 @@ Companion to [REQUIREMENTS.md](REQUIREMENTS.md). Requirement IDs (`FR-xx`, `NFR-
 |---|---|
 | Spec version | 1.2 |
 | Date | 2026-08-30 |
-| Status | **Implemented in [version-a-git/](version-a-git/) — 29/29 acceptance checks passing.** Several statements below were corrected by what the running system actually did; see [README.md](README.md#findings-that-contradict-the-original-specification) for the full list. Corrections are marked **[CORRECTED]** inline. |
+| Status | **Implemented in [version-a-git/](version-a-git/) — 23/23 acceptance checks passing.** Several statements below were corrected by what the running system actually did; see [README.md](README.md#findings-that-contradict-the-original-specification) for the full list. Corrections are marked **[CORRECTED]** inline. |
 | Scope of this document | **Version A — Git backend.** Versions B (PostgreSQL/JDBC) and C (AWS S3) are specified in [SPECIFICATION-BACKENDS.md](SPECIFICATION-BACKENDS.md). Everything in §6 (clients), §7 (patterns), §8 (cross-cutting) and §10 (testing) applies unchanged to all three. |
 
 ---
@@ -273,9 +273,16 @@ inventory:
   max-order-quantity: 500          # AC-05 flips this to an invalid value
   express-shipping-enabled: false  # AC-04 flips this to true
   low-stock-threshold: 25
-  downstream:
-    api-key: "{cipher}AQBv7k...."  # AC-08 — never plaintext (NFR-11)
 ```
+
+> **[CORRECTED]** The specified `downstream.api-key` was implemented flat, as
+> `inventory.downstream-api-key`, and has since been **removed entirely**. It was the only
+> `{cipher}` value in the project, and it made client startup depend on the Config Server's
+> keystore being able to decrypt it: on a keystore/ciphertext mismatch the server serves the key
+> renamed to `invalid.downstream-api-key`, the client binds `null`, and `@NotBlank` aborts
+> startup — a decryption fault that presents as a validation bug. `AC-08` is consequently no
+> longer exercised. The keystore and the `/encrypt` / `/decrypt` endpoints remain wired and
+> authenticated (`FR-04`, `NFR-10`); nothing is encrypted at rest any more.
 
 `config-repo/pricing-service.yml`:
 ```yaml
@@ -549,7 +556,7 @@ public class InventoryConfigProperties {
     @Min(1) @Max(10_000) private int maxOrderQuantity;
     private boolean expressShippingEnabled;
     @Min(0) private int lowStockThreshold;
-    @Valid @NotNull private Downstream downstream = new Downstream();
+    // [CORRECTED] the specified @Valid Downstream holder was removed - see §5.1
     // getters + setters — setters are REQUIRED, see below
 }
 ```
@@ -715,6 +722,11 @@ plaintext in memory only. Keys live in a keystore supplied by environment variab
 wraps `POST /encrypt`. A CI check greps the repository for high-entropy strings and known secret
 patterns and fails on a hit.
 
+> **[CORRECTED]** The mechanism is wired but no longer used: the project's only `{cipher}` value
+> was removed (see §5.1), so `AC-08` is not exercised. `NFR-11` still holds trivially — there is
+> no secret in any configuration store to leak. What is still asserted is that `/encrypt` and
+> `/decrypt` reject unauthenticated callers (`NFR-10`).
+
 ### 8.3 Resilience summary
 
 | Failure | Behaviour | Requirement |
@@ -804,7 +816,7 @@ curl -s localhost:8082/api/v1/config/snapshot | jq .        # unchanged — scop
 | `T-01` | Parent POM: BOM import, Java 21, plugin management, quality gates | `CON-01`, `CON-02`, `NFR-31` |
 | `T-02` | `config-repo` seeded and initialised as a Git repo | `FR-02` |
 | `T-03` | `config-server` with Git backend + Environment API | `FR-01`–`FR-03`, `FR-05` |
-| `T-04` | Encryption keystore + `/encrypt` + a `{cipher}` value in the repo | `FR-04`, `NFR-11`, `AC-08` |
+| `T-04` | Encryption keystore + `/encrypt` (**[CORRECTED]** the `{cipher}` value in the repo was removed — see §8.2) | `FR-04`, `NFR-11` |
 | `T-05` | Config Server security | `NFR-10`, `NFR-12` |
 | `T-06` | `/monitor` + Bus/RabbitMQ wiring; **resolve the validation-filter question in §5.4** | `FR-06`, `FR-07`, `FR-11` |
 | `T-07` | `post-commit` hook + installer | `FR-16` |
@@ -843,7 +855,7 @@ documentation coverage for Config Server (`CON-01`, `R-07`).
 | Requirement | Design | Test |
 |---|---|---|
 | `FR-01`–`FR-03` | §5.1, §5.2 | `T-03` server tests |
-| `FR-04` | §5.2, §8.2 | `AC-08` |
+| `FR-04` | §5.2, §8.2 | ~~`AC-08`~~ withdrawn — `/encrypt` authorisation only (§8.2) |
 | `FR-05` | §5.2 env indirection | `AC-12` |
 | `FR-06`, `FR-07` | §5.4, §5.5 | `AC-01`, `AC-02` |
 | `FR-10`–`FR-12` | §2.2, §6.1, §6.2 | `AC-01`, `AC-03` |
@@ -856,7 +868,7 @@ documentation coverage for Config Server (`CON-01`, `R-07`).
 | `FR-25` | §3 modules | `AC-02` |
 | `FR-30`, `FR-31` | §6.3(3), §8.1 | `AC-05`, `AC-09` |
 | `NFR-01`–`NFR-03` | §2.2, §6.3 lock-free read | Testcontainers timing assert, `AC-10` |
-| `NFR-10`–`NFR-12` | §5.3, §6.2 masking, §8.2 | `AC-08` |
+| `NFR-10`–`NFR-12` | §5.3, §6.2 masking, §8.2 | ~~`AC-08`~~ withdrawn — `/encrypt` authorisation only (§8.2) |
 | `NFR-13`–`NFR-16` | §4.3, §8.3 | `AC-06`, `AC-07` |
 | `NFR-20`–`NFR-22` | §8.1 | `AC-05`, `AC-09` |
 | `NFR-30`–`NFR-34` | §3.1, §7, §10 | `AC-11`, this table |

@@ -51,7 +51,6 @@ class InventorySettingsProviderTest {
     properties.setMaxOrderQuantity(500);
     properties.setExpressShippingEnabled(false);
     properties.setLowStockThreshold(25);
-    properties.setDownstreamApiKey("downstream-api-key-value");
     return properties;
   }
 
@@ -237,30 +236,6 @@ class InventorySettingsProviderTest {
   // ===================================================================================
   // Snapshot assembly
   // ===================================================================================
-
-  @Test
-  @DisplayName("the snapshot carries a FINGERPRINT of the secret, never the secret itself")
-  void snapshotNeverCarriesTheSecret() {
-    String fingerprint = this.provider.get().downstreamApiKeyFingerprint();
-
-    assertThat(fingerprint).startsWith("sha256:");
-    assertThat(fingerprint).doesNotContain("downstream-api-key-value");
-    assertThat(this.provider.get().toString())
-        .as("the record is serialised onto an inspection endpoint; it must not leak the secret")
-        .doesNotContain("downstream-api-key-value");
-  }
-
-  @Test
-  @DisplayName("a missing secret is rejected, not silently served as blank")
-  void missingSecretIsRejected() {
-    InventorySettings good = this.provider.get();
-
-    this.properties.setDownstreamApiKey("  ");
-    this.provider.applyRefresh("test");
-
-    assertThat(this.provider.get()).isEqualTo(good);
-    assertThat(this.provider.status().lastOutcome()).isEqualTo(ConfigSnapshotStatus.REJECTED);
-  }
 
   @Test
   @DisplayName("snapshot merges application-specific and shared configuration")

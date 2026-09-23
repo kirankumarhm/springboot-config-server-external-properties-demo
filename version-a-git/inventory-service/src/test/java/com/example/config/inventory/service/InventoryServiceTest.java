@@ -50,8 +50,7 @@ class InventoryServiceTest {
   }
 
   private static InventorySettings settings(int maxQty, boolean express, int lowStock) {
-    return new InventorySettings(
-        "WH-BLR-01", maxQty, express, lowStock, "banner", "local", "sha256:deadbeefdeadbeef");
+    return new InventorySettings("WH-BLR-01", maxQty, express, lowStock, "banner", "local");
   }
 
   @Test

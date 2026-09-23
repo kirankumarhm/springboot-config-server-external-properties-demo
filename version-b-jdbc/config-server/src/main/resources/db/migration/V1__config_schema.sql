@@ -71,10 +71,6 @@ INSERT INTO properties (application, profile, label, "key", "value") VALUES
     ('inventory-service', NULL, 'main', 'inventory.max-order-quantity',    '500'),
     ('inventory-service', NULL, 'main', 'inventory.express-shipping-enabled', 'false'),
     ('inventory-service', NULL, 'main', 'inventory.low-stock-threshold',   '25'),
-    -- Stored ENCRYPTED at rest: only the Config Server holds the private key. A DBA with full
-    -- SELECT on this table still cannot read the secret.
-    ('inventory-service', NULL, 'main', 'inventory.downstream-api-key',
-     '{cipher}AgAaMg0lHwxemtMcCZRdNtat+1qQkwjyDW0HaFXQ6b98xyQQXHI7f4koxx7iJ+YuKAkJLBM8uz4IP43FFr0mfHdFqtt2cItvcgtsDujzK9XCwx+x864/V+5FVGzrOUPbcMSMlKcs83NwRRNuf14he8A0jz03tQp3M7ZTYe+ME1GuV7VEw2Yg9lerbtjcO2/CISGXhykYbDPhq+ypIVjEVuBC3pAYvpDKTWLQqpjllndjy5+/BMlYCKkydyGnD5WtGf0+ogYmtgEiJ5VTbki/AYag3hsoV1b1M7oLGPeDmRQ+c5R4BpHCXGqBe7CWwUXh0DpuIAMIMpgefnySe9e53XdT0nBTt/l2UGy2ENslsd8vO1JCiTTmgp65UgfOYuhDzPmZ69IHp8+hi2JRZf1GV0B+qPCCQ+2eQ0eksQ04VdtTY+BSg49U0AtN+qA8zsI6R4YwBSOFlez6PH4aUopb6dCUd7jv1udsOXrFhl90Ch1KjeDF2O9fW81rErarW0hovHazj9+YtHaJoYBy10R/uXGcku9Dk7jLinGtN7vsByBbnbTGLOrnNL0rDEBTUu6skCocxW59N+7Coq1ZoWQ49ckw9EG6bRdZGsf2vsPl1zab9pHZqpzlBbLLBjM9DsrQOp3x8NHbjm0S76JdJt7PJP4GITdep0j221i5xA/R1ZXF6vkWsK0GXrIWxKP7nzXWSofW+vVEyRFdv7oTwbEuEhDx6Xc/sfcHa14y0szwHwaDxw=='),
     ('pricing-service',   NULL, 'main', 'pricing.currency',                'INR'),
     ('pricing-service',   NULL, 'main', 'pricing.discount-percentage',     '10.0'),
     ('pricing-service',   NULL, 'main', 'pricing.surge-pricing-enabled',   'false'),

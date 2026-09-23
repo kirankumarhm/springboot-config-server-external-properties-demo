@@ -37,8 +37,7 @@ class InventoryConfigPropertiesBindingTest {
             "inventory.warehouse-code=WH-BLR-01",
             "inventory.max-order-quantity=500",
             "inventory.express-shipping-enabled=true",
-            "inventory.low-stock-threshold=25",
-            "inventory.downstream-api-key=plaintext-after-server-side-decryption")
+            "inventory.low-stock-threshold=25")
         .run(
             context -> {
               InventoryConfigProperties properties =
@@ -60,8 +59,7 @@ class InventoryConfigPropertiesBindingTest {
         .withPropertyValues(
             "inventory.warehouse-code=WH-BLR-01",
             "inventory.max-order-quantity=99999",
-            "inventory.low-stock-threshold=25",
-            "inventory.downstream-api-key=plaintext-after-server-side-decryption")
+            "inventory.low-stock-threshold=25")
         .run(
             context -> {
               assertThat(context).hasNotFailed();
@@ -79,7 +77,6 @@ class InventoryConfigPropertiesBindingTest {
     properties.setMaxOrderQuantity(750);
     properties.setExpressShippingEnabled(true);
     properties.setLowStockThreshold(40);
-    properties.setDownstreamApiKey("k");
 
     assertThat(properties.getWarehouseCode()).isEqualTo("WH-NEW");
     assertThat(properties.getMaxOrderQuantity()).isEqualTo(750);

@@ -6,6 +6,3 @@ inventory:
   max-order-quantity: 400
   express-shipping-enabled: true
   low-stock-threshold: 25
-  # Stored ENCRYPTED at rest. The Config Server holds the only copy of the private key
-  # and decrypts this before serving it; the client never sees the ciphertext.
-  downstream-api-key: '{cipher}AgBWlwxdGuFaLfb1+AK4GOLdrjRXoWvphM0GJAdn5bNWoB2jaJcpaJKcq18fHmGSZQCtsUod0M3bF1VT+/YWlgES29VX0grfMJfX3+QXW1vqdYakYqcqqu3tt3lUfwzhPFGSEvCFLuETZoKbDVrYZFQXRiKnSrI3e3Ky3xkXZPu0tbk/WyNoMPTdZYo716Ia/1EsCDtpdSmbo3x5vNnj6BiNUJhuFPh2hCgQ6DjmkstAGm9vnMvFQb/yNeE/3H+RR8YVwvcgYkw/Kki+6KyY3xHCCw92wo7GaPaTvE9gY9sfmt+2pg+/uCPm/iBrh60/+aCl4ZWFyl+oSIR2p4oZFAzBtyiQzx633i6kquOSGgw9Y88yZHlSxzQeM2R+4Dhzbk1VyXtXTXBdoh8WtMDJ8w6+IzPLD6YCHY8Ui8Tcxz5EGGKPAoNH1KfiAX6XDqQQ4+XEQs7N4fzA8pcRu0xiWU4dfRfGoYNpNhHuQU+h9zTdWXgVfCFHv1k6ikUqh4m/05kYP4b8q21wHjBu6X/m1jhXtlZlmQcV9u/NFNZN/Ec1LEzVDDcudrDxbi8No5ZM44wHT1986IUX4+2K5UODNn+cc1m+KI8OcbyakAq2rqZiZyff6knm6WokcTO6WCfvaY540DyiP3EEM9C/iv5pc1Ke0ZsNgBUoEpZ/xTR8J/zW4Xp3AMf0+QhoJErCvgb2PqnAZmsF+CDWSjBN6f4fFiB8X86RzVVjAuLQaS0GCfVb/w=='
