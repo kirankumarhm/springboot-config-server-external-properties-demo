@@ -650,13 +650,30 @@ applies the manifests in order, waits for each rollout, and runs `./k8s/verify-i
 | `02-config-server.yaml` | Config Server (2 replicas) + Service |
 | `03-clients.yaml` | `inventory-service` (1 replica) and `pricing-service` (2 replicas) + Services |
 
-The keystore is **not** in any manifest - it is a real secret, created from the local file:
+The keystore is **not** in any manifest - it is a real secret (and `secrets/` is gitignored), so
+it is created from the local file. **This is mandatory:** `k8s/02-config-server.yaml` mounts a
+volume whose `secretName` is `config-encryption-keystore`, and Kubernetes will not start a
+container whose volumes cannot be mounted. Skip it and the pods sit in `ContainerCreating` with:
+
+```
+Warning  FailedMount  54s (x8 over 118s)  kubelet  MountVolume.SetUp failed for volume
+         "encryption-keystore" : secret "config-encryption-keystore" not found
+```
+
+Note the relative path - this must run from `version-c-s3/`:
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-c-s3/   # the --from-file path is relative to it
 kubectl -n config-demo create secret generic config-encryption-keystore \
   --from-file=config-server.p12=secrets/config-server.p12
 ```
+
+The name left of the `=` is what the container sees as `/secrets/config-server.p12`, which is what
+`ENCRYPT_KEYSTORE_LOCATION` points at. If you hit the error above, just create the Secret - the
+kubelet retries the mount, so the stuck pods start on their own; `kubectl -n config-demo rollout
+restart deployment/config-server` stops the waiting. To *replace* a Secret that holds a stale
+keystore, add `--dry-run=client -o yaml | kubectl apply -f -`. `./k8s/deploy-minikube.sh` does all
+of this for you, which is why it cannot be forgotten there.
 
 Three constraints are specific to this backend and each one blocks the deployment if missed:
 

@@ -872,7 +872,7 @@ minikube image ls | grep -E "config-git-demo|rabbitmq"
 A *namespace* is just a labelled drawer that keeps these objects separate from everything else.
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-a-git/   # paths below are relative to it
 kubectl apply -f k8s/00-namespace-and-config.yaml
 ```
 
@@ -893,16 +893,69 @@ That one file creates four things:
 
 ### 13.9 Step 7 — Hand the keystore to the cluster
 
-The keystore is a genuine secret, so it is never written into a manifest in Git. Create it
-directly from your local file:
+**This step is mandatory. Skipping it leaves the Config Server pods stuck forever**, because
+`k8s/02-config-server.yaml` declares the keystore as a volume sourced from a Secret that only this
+command creates:
+
+```yaml
+volumes:
+  - name: encryption-keystore
+    secret:
+      secretName: config-encryption-keystore    # <- created by the command below, not by any manifest
+      defaultMode: 0400
+```
+
+Kubernetes will not start a container whose volumes cannot be mounted, so the pod never reaches
+the application at all - you never even see the `Invalid keystore location` error from section 5,
+because the JVM does not run. What you get instead is a pod sitting in `ContainerCreating` and
+this in `kubectl describe pod`:
+
+```
+Warning  FailedMount  54s (x8 over 118s)  kubelet  MountVolume.SetUp failed for volume
+         "encryption-keystore" : secret "config-encryption-keystore" not found
+```
+
+The keystore is a genuine secret, so it is deliberately **never written into a manifest in Git**
+(and `secrets/` is gitignored). Create it directly from your local file - note the relative path,
+so this must run from `version-a-git/`:
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-a-git/   # the --from-file path is relative to it
 kubectl -n config-demo create secret generic config-encryption-keystore \
   --from-file=config-server.p12=secrets/config-server.p12
 ```
 
-*(In a real company this comes from Vault, Sealed Secrets, or External Secrets instead.)*
+Confirm it landed, and that the key inside it is named `config-server.p12` - the name on the left
+of the `=` is what the container sees as `/secrets/config-server.p12`, which is what
+`ENCRYPT_KEYSTORE_LOCATION` points at:
+
+```bash
+# from: anywhere (these are just HTTP calls)
+kubectl -n config-demo get secret config-encryption-keystore -o jsonpath='{.data}' | tr ',' '\n'
+```
+
+**Recovering if you already hit the error:** just create the Secret. Nothing needs redeploying -
+the kubelet retries the mount with backoff, so the stuck pods pick it up and start within a minute
+or so. To stop waiting:
+
+```bash
+# from: anywhere (these are just HTTP calls)
+kubectl -n config-demo rollout restart deployment/config-server
+kubectl -n config-demo rollout status deployment/config-server --timeout=300s
+```
+
+If you generated a keystore *after* creating the Secret, the Secret still holds the old key. Replace
+it rather than creating it:
+
+```bash
+# from: version-a-git/   # the --from-file path is relative to it
+kubectl -n config-demo create secret generic config-encryption-keystore \
+  --from-file=config-server.p12=secrets/config-server.p12 \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+*(In a real company this comes from Vault, Sealed Secrets, or External Secrets instead - which is
+also why `./k8s/deploy-minikube.sh` does this for you and you cannot forget it there.)*
 
 ### 13.10 Step 8 — Start the three tiers, in order
 
@@ -912,7 +965,7 @@ their first breath.
 **RabbitMQ first.** The `rollout status` command simply waits until it is genuinely ready:
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-a-git/   # paths below are relative to it
 kubectl apply -f k8s/01-dependencies.yaml
 kubectl -n config-demo rollout status deployment/rabbitmq --timeout=300s
 ```
@@ -920,7 +973,7 @@ kubectl -n config-demo rollout status deployment/rabbitmq --timeout=300s
 **Then the Config Server** (two copies, for redundancy):
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-a-git/   # paths below are relative to it
 kubectl apply -f k8s/02-config-server.yaml
 kubectl -n config-demo rollout status deployment/config-server --timeout=300s
 ```
@@ -928,7 +981,7 @@ kubectl -n config-demo rollout status deployment/config-server --timeout=300s
 **Then the two client apps:**
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-a-git/   # paths below are relative to it
 kubectl apply -f k8s/03-clients.yaml
 kubectl -n config-demo rollout status deployment/inventory-service --timeout=300s
 kubectl -n config-demo rollout status deployment/pricing-service  --timeout=300s
@@ -1155,6 +1208,8 @@ kubectl -n config-demo logs <pod-name> --previous   # if it already crashed and 
 | What you see | What it means | Fix |
 |---|---|---|
 | `ErrImageNeverPull` / `ImagePullBackOff` | The image tag in the manifest does not exist in the cluster | Re-check 13.6 and 13.7; the tag must match **exactly** |
+| `FailedMount ... secret "config-encryption-keystore" not found`, pod stuck `ContainerCreating` | Step 13.9 was skipped - the Secret the pod mounts the keystore from does not exist | Run the command in 13.9 (from `version-a-git/`); the kubelet retries the mount, so the pod starts on its own |
+| `FailedMount ... secret "config-credentials" not found` | `k8s/00-namespace-and-config.yaml` was never applied | Run 13.8 first - it creates the namespace, both ConfigMaps and that Secret |
 | Pod stuck `0/1 Running`, restarts climbing | The app starts then fails its health check | `kubectl logs` it; usually it cannot reach the Config Server or RabbitMQ |
 | Logs show `TransportException` / `x509` | The pod cannot clone from GitHub | Test the VM's own access: `minikube ssh -- curl -sS -o /dev/null -w "%{http_code}\n" https://github.com` |
 | Logs show `NumberFormatException: "tcp://10.x.x.x:5672"` | Kubernetes auto-injected a `RABBITMQ_PORT` variable that collided with ours | `enableServiceLinks: false` must be present in the pod spec (it already is) |

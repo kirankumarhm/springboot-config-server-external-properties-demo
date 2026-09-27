@@ -727,13 +727,30 @@ waits for each rollout, and finally runs `./k8s/verify-in-cluster.sh`.
 | `02-config-server.yaml` | Config Server (2 replicas) + Service |
 | `03-clients.yaml` | `inventory-service` and `pricing-service` (2 replicas) + Services |
 
-The keystore is **not** in any manifest - it is a real secret, created from the local file:
+The keystore is **not** in any manifest - it is a real secret (and `secrets/` is gitignored), so
+it is created from the local file. **This is mandatory:** `k8s/02-config-server.yaml` mounts a
+volume whose `secretName` is `config-encryption-keystore`, and Kubernetes will not start a
+container whose volumes cannot be mounted. Skip it and the pods sit in `ContainerCreating` with:
+
+```
+Warning  FailedMount  54s (x8 over 118s)  kubelet  MountVolume.SetUp failed for volume
+         "encryption-keystore" : secret "config-encryption-keystore" not found
+```
+
+Note the relative path - this must run from `version-b-jdbc/`:
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-b-jdbc/   # the --from-file path is relative to it
 kubectl -n config-demo create secret generic config-encryption-keystore \
   --from-file=config-server.p12=secrets/config-server.p12
 ```
+
+The name left of the `=` is what the container sees as `/secrets/config-server.p12`, which is what
+`ENCRYPT_KEYSTORE_LOCATION` points at. If you hit the error above, just create the Secret - the
+kubelet retries the mount, so the stuck pods start on their own; `kubectl -n config-demo rollout
+restart deployment/config-server` stops the waiting. To *replace* a Secret that holds a stale
+keystore, add `--dry-run=client -o yaml | kubectl apply -f -`. `./k8s/deploy-minikube.sh` does all
+of this for you, which is why it cannot be forgotten there.
 
 Two things worth knowing before you run it:
 
@@ -758,7 +775,7 @@ kubectl -n config-demo exec statefulset/postgres -- \
 Reach the services from the host, and verify:
 
 ```bash
-# from: anywhere (these are just HTTP calls)
+# from: version-b-jdbc/   # paths below are relative to it
 kubectl -n config-demo port-forward svc/inventory-service 8081:8081
 kubectl -n config-demo port-forward svc/config-server 9888:9888
 ./k8s/verify-in-cluster.sh    # asserts every pod IP individually, not through the Service
