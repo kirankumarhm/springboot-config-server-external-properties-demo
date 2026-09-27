@@ -11,9 +11,18 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------------------------
 # PREREQUISITE - this stack will NOT come up without it:
-#   Set CONFIG_REPO_URI in k8s/00-namespace-and-config.yaml to a reachable Git remote, and CONFIG_REPO_USERNAME/PASSWORD in the Secret. The file:// backend CANNOT run in a cluster.
-# Only version B was verified running on minikube; these manifests are schema-valid against the
-# cluster API but depend on the external resource above.
+#   CONFIG_REPO_URI in k8s/00-namespace-and-config.yaml must point at a REACHABLE Git remote.
+#   The file:// backend CANNOT run in a cluster: the Config Server treats the repository
+#   directory as its working tree and performs a real `git checkout`, so replicas would need one
+#   shared RWX volume and would corrupt each other.
+#
+#   The default URI is this project's own public GitHub repo, which clones anonymously - so
+#   CONFIG_REPO_USERNAME/PASSWORD in the Secret are left as REPLACE_ME on purpose and are never
+#   bound (username/password are commented out in config-server/application.yml). Point the URI
+#   at a PRIVATE remote and you must fill both in, and uncomment those two lines.
+#
+#   The verification step below COMMITS AND PUSHES to that remote (and pushes a revert
+#   afterwards), so you need push access to it.
 # ---------------------------------------------------------------------------------------------
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +41,12 @@ minikube status >/dev/null 2>&1 || {
 }
 
 echo "==> Building jars"
-(cd "$ROOT" && mvn -B -q -Pfast clean install -DskipTests)
+# -q by default keeps the deploy output readable, but it also means a slow build looks hung.
+# Override for a noisy run, or add -o to skip remote dependency resolution entirely when the
+# local repository is already warm:
+#   MVN_FLAGS="-B -o -Pfast" ./k8s/deploy-minikube.sh
+MVN_FLAGS="${MVN_FLAGS:--B -q -Pfast}"
+(cd "$ROOT" && mvn $MVN_FLAGS clean install -DskipTests)
 
 echo "==> Building images on the host daemon"
 (cd "$ROOT" && docker compose -f docker/compose.yaml build config-server inventory-service pricing-service >/dev/null)
@@ -81,10 +95,16 @@ Reach the services from the host with:
   kubectl -n config-demo port-forward svc/inventory-service 8081:8081
   kubectl -n config-demo port-forward svc/config-server 9888:9888
 
-Change configuration (this is the whole point - no restart, no redeploy):
-  kubectl -n config-demo exec statefulset/postgres -- \
-    psql -U config_admin -d configdb -c \
-    "UPDATE properties SET \"value\"='750' WHERE application='inventory-service' AND \"key\"='inventory.max-order-quantity';"
+Change configuration (this is the whole point - no restart, no redeploy). The Git backend's
+source of truth is the REMOTE, so edit, commit and push, then broadcast one refresh:
+  vi version-a-git/config-repo/inventory-service.yml    # e.g. max-order-quantity: 750
+  git commit -am "raise max order quantity" && git push
+
+  # /monitor rejects even correctly signed payloads, so trigger the bus directly:
+  kubectl -n config-demo exec deploy/config-server -c config-server -- \
+    wget -qO- --post-data='' \
+    --header="Authorization: Basic $(printf 'config-admin:admin-secret' | base64)" \
+    http://localhost:9888/actuator/busrefresh
 
 Tear down:
   kubectl delete namespace config-demo

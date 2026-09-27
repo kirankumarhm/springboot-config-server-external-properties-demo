@@ -31,7 +31,9 @@ metadata:
   labels:
     app: config-server
 spec:
-  replicas: 2          # safe for the JDBC backend: no shared filesystem, no working tree
+  # Safe here only because the backend is a REMOTE Git URI: each pod clones into its own
+  # ephemeral basedir, so there is no shared working tree for replicas to corrupt.
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
