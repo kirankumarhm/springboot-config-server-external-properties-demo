@@ -286,6 +286,45 @@ All 6 containers will report `(healthy)`:
 
 The tags come from `name: config-jdbc-demo` on line 1 of `docker/compose.yaml` (`<project>-<service>:latest`). The Kubernetes manifests in `k8s/` reference these exact strings.
 
+### Step 5: Shut Down
+
+> **Read this before typing `docker compose down`.** Look at the `postgres` service in
+> `docker/compose.yaml`: there is **no `volumes:` entry**, so the data directory lives in the
+> container's writable layer. That makes the two commands mean very different things here:
+>
+> | Command | Effect on the configuration database |
+> |---|---|
+> | `docker compose stop` | **Survives** - the container still exists |
+> | `docker compose down` | **Destroyed**, along with the whole `properties_history` audit trail |
+>
+> Version A's configuration lives in Git and version C's in S3, both outside Docker, so no
+> teardown can lose them. In version B the database **is** the source of truth.
+
+`./scripts/teardown-docker.sh` accounts for that: it runs `pg_dump` into
+`scripts/backups/configdb-<timestamp>.sql` **before** removing anything, and stops to ask if the
+dump fails.
+
+```bash
+./scripts/teardown-docker.sh                # dump, then remove the containers and network
+./scripts/teardown-docker.sh --stop         # put it away and KEEP the database
+./scripts/teardown-docker.sh --no-dump      # skip the dump (only sensible with --stop)
+./scripts/teardown-docker.sh --volumes      # also remove anonymous volumes
+./scripts/teardown-docker.sh --images       # also remove the 3 images built here
+./scripts/teardown-docker.sh --base-images  # also remove postgres:17.6 and rabbitmq:4-management
+./scripts/teardown-docker.sh --jars         # also run `mvn clean`
+./scripts/teardown-docker.sh --all -y       # --volumes --images --jars, no prompt
+```
+
+Restore a dump into a fresh stack with:
+```bash
+docker exec -i cfg-jdbc-postgres psql -U config_admin -d configdb < scripts/backups/configdb-<timestamp>.sql
+```
+
+> **`--base-images` has a side effect worth knowing.** `k8s/deploy-minikube.sh` loads
+> `postgres:17.6` and `rabbitmq:4-management` from the **host** daemon into minikube, because the
+> VM cannot pull them itself. Removing them here breaks the Kubernetes deploy until you pull them
+> again.
+
 ---
 
 ## 6. Configuration & Environment Variables

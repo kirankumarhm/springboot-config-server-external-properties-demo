@@ -258,6 +258,31 @@ All 5 containers will report `(healthy)`:
 
 The tags come from `name: config-git-demo` on line 1 of `docker/compose.yaml` (`<project>-<service>:latest`). The Kubernetes manifests in `k8s/` reference these exact strings - see section 13.6.
 
+### Step 5: Shut Down
+
+`./scripts/teardown-docker.sh` is tiered, prints what it is about to do, and asks first:
+
+```bash
+./scripts/teardown-docker.sh                # remove the containers and network; next `up` is instant
+./scripts/teardown-docker.sh --stop         # only stop them; resume with `docker compose start`
+./scripts/teardown-docker.sh --volumes      # also remove anonymous volumes (RabbitMQ leaves one per `up`)
+./scripts/teardown-docker.sh --images       # also remove the 3 images built here (next `up` must rebuild)
+./scripts/teardown-docker.sh --base-images  # also remove rabbitmq:4-management (see the warning below)
+./scripts/teardown-docker.sh --hook         # also uninstall config-repo/.git/hooks/post-commit
+./scripts/teardown-docker.sh --jars         # also run `mvn clean`
+./scripts/teardown-docker.sh --all -y       # --volumes --images --jars, no prompt
+```
+
+**`config-repo/` is never touched** - it *is* the configuration, and it is its own Git repository.
+The script does warn if a leftover test value (`e2e-*`, `k8s-verified-*`, `test-*`) is still
+sitting in it, because the next `up` would serve that value as if it were real.
+
+> **`--base-images` has a side effect worth knowing.** `k8s/deploy-minikube.sh` loads
+> `rabbitmq:4-management` from the **host** daemon into minikube, because the VM cannot pull it
+> itself. Removing it here breaks the Kubernetes deploy until you `docker pull` it again.
+
+The equivalent by hand is `docker compose -f docker/compose.yaml down` (add `-v` for volumes).
+
 ---
 
 ## 6. Configuration & Environment Variables

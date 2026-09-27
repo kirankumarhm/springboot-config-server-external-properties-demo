@@ -291,6 +291,35 @@ The tags come from `name: config-s3-demo` on line 1 of `docker/compose.yaml` (`<
 
 **Floci runs outside this Compose stack** (`floci start`), so there is no S3/SQS container. Reaching it from inside a container needs the two `extra_hosts` entries at the top of `docker/compose.yaml`: `localhost.floci.io` and `acme-platform-config.localhost.floci.io`, both mapped to `host-gateway`. The bucket-prefixed one is not optional - the AWS SDK uses **virtual-host-style** addressing (`<bucket>.<host>`) against a custom endpoint, and `AwsS3EnvironmentRepositoryFactory` builds its own `S3Client` with no path-style option to turn that off.
 
+### Step 7: Shut Down
+
+`./scripts/teardown-docker.sh` is tiered, prints what it is about to do, and asks first:
+
+```bash
+./scripts/teardown-docker.sh                     # remove the containers and network
+./scripts/teardown-docker.sh --stop              # only stop them; resume with `docker compose start`
+./scripts/teardown-docker.sh --volumes           # also remove anonymous volumes
+./scripts/teardown-docker.sh --images            # also remove built images, incl. per-deploy 1.0.0-* tags
+./scripts/teardown-docker.sh --base-images       # also remove rabbitmq:4-management
+./scripts/teardown-docker.sh --jars              # also run `mvn clean`
+./scripts/teardown-docker.sh --stop-floci        # also `floci stop` (bucket and queues survive)
+./scripts/teardown-docker.sh --all -y            # --volumes --images --jars, no prompt
+```
+
+**No option above can lose your configuration** - it lives in S3, outside Docker. The one that
+can is deliberately separate:
+
+```bash
+./scripts/teardown-docker.sh --purge-aws         # empties the bucket and deletes both queues
+```
+
+Recover from that by re-running `./scripts/provision-floci.sh`, which re-seeds from
+`seed-config/`. `--stop-floci` is also separate from `--stop` on purpose: other projects may be
+using the emulator, and a stop preserves the bucket and queues either way.
+
+> `--images` also sweeps the `1.0.0-<timestamp>` tags that `k8s/deploy-floci-eks.sh` creates on
+> every EKS deploy. Nothing else cleans those up, and they accumulate one set per deploy.
+
 ---
 
 ## 6. Configuration & Environment Variables

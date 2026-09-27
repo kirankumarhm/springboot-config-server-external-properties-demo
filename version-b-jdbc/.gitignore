@@ -3,3 +3,8 @@ secrets/
 *.jks
 *.p12
 .DS_Store
+
+# Database dumps written by the teardown scripts before they delete the namespace or the
+# postgres container. They contain the configuration, not secrets, but they are local state.
+scripts/backups/
+k8s/backups/
