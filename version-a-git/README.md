@@ -215,35 +215,163 @@ All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refre
 
 ## 5. Quick Start: Build and Run
 
-### Prerequisites
-- **Java 21**
-- **Maven 3.9+**
-- **Docker & Docker Compose**
+### Where to run these commands
 
-### Step 1: Generate Encryption Keystore
-Generate the RSA 4096-bit PKCS12 keystore used to decrypt `{cipher}` values:
+Almost everything runs from **`version-a-git/`**, not from the repository root. Every code block
+below starts with a `# from: ...` comment saying which directory it assumes, and those paths are
+relative to wherever you cloned this project.
+
+```
+springboot-external-properties-demo-II/     <- repository root ("the project repo")
+├── version-a-git/                          <- run nearly everything from HERE
+│   ├── config-repo/                        <- the configuration files being served
+│   ├── config-server/  inventory-service/  pricing-service/
+│   ├── docker/compose.yaml                 <- referenced as docker/compose.yaml, so cwd matters
+│   ├── k8s/                                <- deploy / verify / teardown scripts
+│   ├── scripts/                            <- keystore, git hook, e2e test, docker teardown
+│   └── secrets/                            <- generated, gitignored, never committed
+├── version-b-jdbc/
+└── version-c-s3/
+```
+
+To get there from a fresh clone:
+
 ```bash
-cd version-a-git
+# from: wherever you keep your projects
+git clone https://github.com/kirankumarhm/springboot-config-server-external-properties-demo.git
+cd springboot-config-server-external-properties-demo/version-a-git
+```
+
+Two exceptions to "run it from `version-a-git/`", both about Git rather than the build:
+
+| What you are doing | Run it from | Why |
+|---|---|---|
+| Editing config for the **remote** backend (the default) | the **repository root** | The Config Server clones *this project's* GitHub repo and reads `version-a-git/config-repo/` inside it. The commit has to go to that repo, so it must be pushed from the root. |
+| Editing config for the **local `file://`** backend | **`version-a-git/config-repo/`** | That directory is *its own* separate Git repository with no remote. The `file://` backend serves **its** commits, and the post-commit hook lives in *its* `.git/hooks`. |
+
+> **This catches people out, so it is worth stating plainly: the same three YAML files belong to
+> two different Git repositories.** `version-a-git/config-repo/*.yml` are tracked by the project
+> repo *and* by the standalone repo at `version-a-git/config-repo/.git`. Committing in the root
+> does nothing for a `file://` server; committing inside `config-repo/` never reaches GitHub. Check
+> which one you are in with `git rev-parse --show-toplevel`.
+
+### Prerequisites
+- **Java 21** and **Maven 3.9+** (`java -version`, `mvn -v`)
+- **Docker & Docker Compose** with Docker Desktop running (`docker ps`)
+- **`keytool`** - ships with the JDK, so Java 21 covers it
+- **`jq`** and **`python3`** - used by the curl examples and by `scripts/e2e-test.sh`
+
+Check all of them in one go:
+
+```bash
+# from: version-a-git/
+java -version && mvn -v && docker ps >/dev/null && keytool -help >/dev/null 2>&1 && jq --version && python3 -V
+```
+
+### Step 1: Generate the Encryption Keystore
+
+```bash
+# from: version-a-git/
 ./scripts/generate-keystore.sh
 ```
-*(Creates `secrets/config-server.p12` with alias `configkey` and password `keystore-secret`)*
+
+**Why this step exists at all**, since nothing in `config-repo/` is currently encrypted: the
+Config Server is configured with `encrypt.key-store.*` in
+`config-server/src/main/resources/application.yml`, and Spring Cloud Config resolves that keystore
+while it is still *preparing the environment* - before the application context is even built. If
+the file is not there, the server does not start degraded, it **does not start at all**:
+
+```
+java.lang.IllegalStateException: Invalid keystore location
+    at org.springframework.cloud.bootstrap.encrypt.TextEncryptorUtils.createTextEncryptor(...)
+```
+
+So this is a hard prerequisite for Steps 3 onward, not an optional security extra. It is also the
+first step because the keystore is **not in Git** (`secrets/` is gitignored) - a fresh clone has
+no keystore, and that is deliberate: a private key in a repository is a private key you have to
+assume is compromised.
+
+**What the script creates** (it is idempotent - run it twice and the second run prints
+`Keystore already exists` and changes nothing):
+
+| Property | Value | Where it comes from |
+|---|---|---|
+| Path | `version-a-git/secrets/config-server.p12` | fixed, relative to the script |
+| Format | PKCS12 | `-storetype PKCS12` |
+| Key | RSA 4096-bit, valid 10 years | `-keyalg RSA -keysize 4096 -validity 3650` |
+| Alias | `configkey` | `$ENCRYPT_KEYSTORE_ALIAS`, default `configkey` |
+| Password | `keystore-secret` | `$ENCRYPT_KEYSTORE_PASSWORD`, default `keystore-secret` |
+| Permissions | `600` (owner read/write only) | `chmod 600` |
+
+Those last three must match what the server is told to look for. Compose passes them as
+`ENCRYPT_KEYSTORE_ALIAS` / `ENCRYPT_KEYSTORE_PASSWORD` (section 6); Kubernetes takes the file as a
+Secret and the password from `config-credentials` (section 13.9). Inspect what you generated:
+
+```bash
+# from: version-a-git/
+keytool -list -keystore secrets/config-server.p12 -storepass keystore-secret
+```
+
+**Why a keystore (asymmetric) rather than a plain `encrypt.key` (symmetric).** With an RSA keypair
+the private key never leaves the Config Server, and an operator can be handed only the public
+certificate and still *encrypt* new values. A shared symmetric secret gives everyone who can
+encrypt the ability to decrypt, which for production credentials is the whole problem.
+
+> **PKCS12 has no separate key password, and that is a real trap.** `keytool` silently ignores
+> `-keypass` for a PKCS12 store, so `encrypt.key-store.secret` **must equal**
+> `encrypt.key-store.password`. Set them differently and startup fails with
+> `UnrecoverableKeyException: Get Key failed: Given final block not properly padded`. (JKS does
+> support separate passwords, but it is a deprecated proprietary format.)
+
+**What you can now do with it** - this is the part the step is *for*. Once the stack is up
+(Step 3), encrypt a secret and store the ciphertext in Git instead of the plaintext:
+
+```bash
+# from: anywhere - these are just HTTP calls
+CIPHER=$(curl -s -u config-admin:admin-secret -X POST http://localhost:8888/encrypt \
+  -H "Content-Type: text/plain" --data-binary "s3cr3t-db-password")
+echo "$CIPHER"
+```
+
+Paste that into any file under `config-repo/` prefixed with `{cipher}`:
+
+```yaml
+inventory:
+  api-key: "{cipher}AQBv0K...the long base64 blob..."
+```
+
+Clients never see the ciphertext. The Config Server decrypts on the way out with the private key
+and serves the plaintext, so `{cipher}` is transparent to the application.
+
+> **The failure mode to recognise.** If a `{cipher}` value cannot be decrypted with the current
+> keystore - typically because the keystore was regenerated after the value was encrypted, which
+> produces a *new* keypair - the Config Server does not error. It serves the key renamed to
+> `invalid.<key>` with the value `<n/a>`. The client then fails validation on a missing property
+> and it looks like an application bug. If you see `invalid.` anywhere in an Environment API
+> response, the keystore no longer matches the ciphertext: re-encrypt the value with the current
+> key, or restore the keystore that encrypted it.
+>
+> Note that `config-repo/` currently contains **no `{cipher}` values**, so nothing in the default
+> setup exercises decryption. The keystore is still mandatory, for the startup reason above.
 
 ### Step 2: Build Application JARs
 The Dockerfiles are **runtime-only** (`eclipse-temurin:21-jre-alpine`, `COPY target/<service>-1.0.0.jar`), so the jars must exist on the host *before* the images are built:
 ```bash
-cd version-a-git
+# from: version-a-git/
 mvn -Pfast package
 ```
 *(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar. Add `-o` if Maven stalls checking the network for dependencies it already has.)*
 
 ### Step 3: Run with Docker Compose
 ```bash
+# from: version-a-git/
 docker compose -f docker/compose.yaml build --no-cache
 docker compose -f docker/compose.yaml up -d
 ```
 
 ### Step 4: Verify Container Status
 ```bash
+# from: version-a-git/
 docker ps
 ```
 All 5 containers will report `(healthy)`:
@@ -263,6 +391,7 @@ The tags come from `name: config-git-demo` on line 1 of `docker/compose.yaml` (`
 `./scripts/teardown-docker.sh` is tiered, prints what it is about to do, and asks first:
 
 ```bash
+# from: version-a-git/
 ./scripts/teardown-docker.sh                # remove the containers and network; next `up` is instant
 ./scripts/teardown-docker.sh --stop         # only stop them; resume with `docker compose start`
 ./scripts/teardown-docker.sh --volumes      # also remove anonymous volumes (RabbitMQ leaves one per `up`)
@@ -319,7 +448,7 @@ check maps to an acceptance criterion in [REQUIREMENTS.md](../REQUIREMENTS.md) -
 AC-03, AC-04, AC-05 and FR-31/AC-09:
 
 ```bash
-cd version-a-git
+# from: version-a-git/
 ./scripts/e2e-test.sh
 ```
 
@@ -333,6 +462,7 @@ It needs the Compose stack up (section 5), `python3` on the PATH, and it **commi
 #### 1. Verify Config Server Environment & Decryption API
 Fetch resolved properties for `pricing-service` and `inventory-service`:
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Pricing service configuration (from GitHub / Git)
 curl -s -u config-client:client-secret http://localhost:8888/pricing-service/default/main | jq .
 
@@ -343,6 +473,7 @@ curl -s -u config-client:client-secret http://localhost:8888/inventory-service/d
 #### 2. Test Encrypting and Decrypting Secrets
 Encrypt a secret with Config Server's active RSA key:
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Encrypt
 CIPHER=$(curl -s -u config-admin:admin-secret -X POST http://localhost:8888/encrypt \
   -H "Content-Type: text/plain" --data-binary "my_super_secret_token")
@@ -356,6 +487,7 @@ curl -s -u config-admin:admin-secret -X POST http://localhost:8888/decrypt \
 #### 3. Inspect Microservice Configuration Snapshots
 Check the active configuration loaded into memory by each service:
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Inventory Service Snapshot
 curl -s http://localhost:8081/api/v1/config/snapshot | jq .
 
@@ -369,6 +501,7 @@ curl -s http://localhost:8083/api/v1/config/snapshot | jq .
 Each service also exposes its refresh audit trail - one entry per refresh, with the changed keys
 but never their values:
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s http://localhost:8081/api/v1/config/history | jq .
 ```
 The first entry of every service has `trigger: "startup"`; a bus-delivered refresh appears as a
@@ -376,6 +509,7 @@ separate entry.
 
 #### 4. Test Business Endpoints
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Test Inventory reservation
 curl -s -X POST http://localhost:8081/api/v1/inventory/reservations \
   -H 'Content-Type: application/json' \
@@ -407,6 +541,7 @@ Two supported triggers. Use the one that matches your backend:
 **a. `/monitor`** - the webhook path, on the **app** port. This is what a Git provider (or the
 post-commit hook) calls, and what the local Compose stack uses:
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s -u config-admin:admin-secret -X POST http://localhost:8888/monitor \
   -d "path=pricing-service.yml"
 ```
@@ -423,6 +558,7 @@ named application, which is exactly what section 4 illustrates.
 **b. `/actuator/busrefresh`** - the operator path, on the **management** port (`9898` on the host).
 Use it for a remote repo, or any time you want to broadcast by hand:
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -i -X POST -u config-admin:admin-secret \
   -H "Content-Type: application/json" \
   http://localhost:9898/actuator/busrefresh
@@ -434,6 +570,7 @@ refresh that had no effect. Append `/pricing-service:**` to scope it to one appl
 #### Step 3: Verify Updated Live State
 Without restarting containers, query the quote endpoints:
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s "http://localhost:8082/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 curl -s "http://localhost:8083/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 ```
@@ -469,7 +606,7 @@ If an operator commits an invalid value (e.g. `discount-percentage: 95.0`, viola
 belongs in *its* hooks directory - not in the outer project repo. Use the installer, which puts it
 in the right place:
 ```bash
-cd version-a-git
+# from: version-a-git/
 ./scripts/install-git-hook.sh
 ```
 It copies `scripts/post-commit` to `config-repo/.git/hooks/post-commit` and makes it executable.
@@ -550,6 +687,7 @@ All uncaught exceptions and validation errors are intercepted by `@RestControlle
 Every build is continuously analyzed by enterprise security and code quality gates:
 
 ```bash
+# from: version-a-git/
 # Run complete verification (Checkstyle, Spotless, SpotBugs + FindSecBugs, ArchUnit, JaCoCo)
 mvn clean verify
 
@@ -572,6 +710,7 @@ Each of the three services is a **standalone Maven project** parented directly t
 inherited from it - so a single service builds on its own:
 
 ```bash
+# from: version-a-git/
 cd inventory-service && mvn verify
 ```
 
@@ -617,6 +756,7 @@ You need `java` 21, `maven`, `docker` (Docker Desktop running), `minikube`, `kub
 `python3`. Check them all at once:
 
 ```bash
+# from: version-a-git/
 java -version && mvn -v && docker ps >/dev/null && minikube version && kubectl version --client && python3 -V
 ```
 
@@ -626,28 +766,35 @@ proves the mechanism by pushing a real commit.
 ### 13.3 Step 1 — Start the cluster
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 minikube start --driver=docker --cpus=4 --memory=6g --disk-size=20g
 ```
 
 Confirm it is alive. `Ready` is what you are looking for:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl get nodes
 ```
 
 ### 13.4 Step 2 — Create the encryption keystore
 
-This is a password-protected file the Config Server uses to decrypt `{cipher}` secrets. Skip if
-`secrets/config-server.p12` already exists.
+The same file as Step 1 of section 5, for the same reason: **without it the Config Server will not
+start**, whether in Docker or in Kubernetes. Section 5 Step 1 explains what it is and how to use
+it; the script is idempotent, so running it again when `secrets/config-server.p12` already exists
+is harmless and changes nothing.
 
 ```bash
-cd version-a-git
+# from: version-a-git/
 ./scripts/generate-keystore.sh
 ```
+
+In the cluster this file becomes a Secret rather than a mounted directory - step 13.9 creates it.
 
 ### 13.5 Step 3 — Compile the Java code
 
 ```bash
+# from: version-a-git/
 mvn -B -Pfast clean install -DskipTests
 ```
 
@@ -662,6 +809,7 @@ only want the jars. Wait for `BUILD SUCCESS`.
 ### 13.6 Step 4 — Build the Docker images (this is where the tags come from)
 
 ```bash
+# from: version-a-git/
 docker compose -f docker/compose.yaml build config-server inventory-service pricing-service
 ```
 
@@ -680,12 +828,14 @@ their `image:` fields. **If they do not match, the pods will never start** — s
 actually exist before continuing:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 docker images | grep config-git-demo
 ```
 
 You should see three lines. If a name differs, either rename the image:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 docker tag <the-name-you-actually-got> config-git-demo-config-server:latest
 ```
 
@@ -696,6 +846,7 @@ or change the `image:` field in the manifest to match. Do not guess — make the
 The cluster is a separate machine and cannot see your laptop's images yet.
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 for img in config-git-demo-config-server:latest \
            config-git-demo-inventory-service:latest \
            config-git-demo-pricing-service:latest \
@@ -708,6 +859,7 @@ done
 This is slow and silent — each image is a few hundred MB. Verify all four arrived:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 minikube image ls | grep -E "config-git-demo|rabbitmq"
 ```
 
@@ -720,6 +872,7 @@ minikube image ls | grep -E "config-git-demo|rabbitmq"
 A *namespace* is just a labelled drawer that keeps these objects separate from everything else.
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl apply -f k8s/00-namespace-and-config.yaml
 ```
 
@@ -744,6 +897,7 @@ The keystore is a genuine secret, so it is never written into a manifest in Git.
 directly from your local file:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo create secret generic config-encryption-keystore \
   --from-file=config-server.p12=secrets/config-server.p12
 ```
@@ -758,6 +912,7 @@ their first breath.
 **RabbitMQ first.** The `rollout status` command simply waits until it is genuinely ready:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl apply -f k8s/01-dependencies.yaml
 kubectl -n config-demo rollout status deployment/rabbitmq --timeout=300s
 ```
@@ -765,6 +920,7 @@ kubectl -n config-demo rollout status deployment/rabbitmq --timeout=300s
 **Then the Config Server** (two copies, for redundancy):
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl apply -f k8s/02-config-server.yaml
 kubectl -n config-demo rollout status deployment/config-server --timeout=300s
 ```
@@ -772,6 +928,7 @@ kubectl -n config-demo rollout status deployment/config-server --timeout=300s
 **Then the two client apps:**
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl apply -f k8s/03-clients.yaml
 kubectl -n config-demo rollout status deployment/inventory-service --timeout=300s
 kubectl -n config-demo rollout status deployment/pricing-service  --timeout=300s
@@ -780,6 +937,7 @@ kubectl -n config-demo rollout status deployment/pricing-service  --timeout=300s
 Now look at everything:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo get pods
 ```
 
@@ -803,11 +961,13 @@ Cluster addresses are private. `port-forward` makes them reachable from your bro
 Run each in **its own terminal** and leave it running:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Terminal 1 - the inventory app
 kubectl -n config-demo port-forward svc/inventory-service 8081:8081
 ```
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Terminal 2 - the Config Server's admin port
 kubectl -n config-demo port-forward svc/config-server 9888:9888
 ```
@@ -815,6 +975,7 @@ kubectl -n config-demo port-forward svc/config-server 9888:9888
 ### 13.12 Step 10 — Check it is really reading GitHub
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s -u config-client:client-secret \
   http://localhost:8081/api/v1/config/snapshot | python3 -m json.tool
 ```
@@ -827,6 +988,7 @@ To see the proof that it came from Git rather than from inside the jar, ask the 
 directly. Open a third terminal:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo port-forward svc/config-server 8888:8888
 curl -s -u config-client:client-secret \
   http://localhost:8888/application/default | python3 -m json.tool
@@ -849,6 +1011,7 @@ This is the whole point of the project. Four moves: **edit → commit → push �
 **First, note what you are starting from** (remember the `version` number):
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s http://localhost:8081/api/v1/config/snapshot \
   | python3 -c 'import sys,json;d=json.load(sys.stdin);print("version",d["version"],"->",d["settings"]["environmentLabel"])'
 ```
@@ -864,6 +1027,7 @@ demo:
 **2 and 3. Commit and push.** Pushing is not optional — the cluster reads GitHub, not your disk:
 
 ```bash
+# from: the repository root
 git add version-a-git/config-repo/application.yml
 git commit -m "test: change environment label"
 git push
@@ -873,6 +1037,7 @@ git push
 and re-fetches:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -i -X POST -u config-admin:admin-secret \
   -H "Content-Type: application/json" \
   http://localhost:9888/actuator/busrefresh
@@ -887,6 +1052,7 @@ You want **`HTTP/1.1 204`**. 204 means "done, nothing to say back" — that is s
 **Now watch the change arrive**, within a second or two:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s http://localhost:8081/api/v1/config/snapshot \
   | python3 -c 'import sys,json;d=json.load(sys.stdin);print("version",d["version"],"->",d["settings"]["environmentLabel"])'
 ```
@@ -897,6 +1063,7 @@ The `version` has gone up by one and the label is your new text.
 still be the original age:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo get pods
 ```
 
@@ -913,6 +1080,7 @@ would silently get stale settings — the exact bug this design exists to preven
 Ask each pod by its own IP, bypassing load balancing:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 for ip in $(kubectl -n config-demo get pods -l app=pricing-service \
               -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'); do
   echo -n "pod $ip -> "
@@ -930,6 +1098,7 @@ cluster network. Starting a fresh helper pod would need an image download this V
 To run all of this automatically:
 
 ```bash
+# from: version-a-git/
 ./k8s/verify-in-cluster.sh
 ```
 
@@ -945,6 +1114,7 @@ for confirmation first. Tearing down cheaply is the default because the expensiv
 image build and `minikube image load` - is slow to undo:
 
 ```bash
+# from: version-a-git/
 ./k8s/teardown-minikube.sh                   # delete the config-demo namespace only; next deploy is fast
 ./k8s/teardown-minikube.sh --images          # also drop the 4 loaded images (next deploy must rebuild)
 ./k8s/teardown-minikube.sh --jars            # also run `mvn clean`
@@ -960,6 +1130,7 @@ holds a `k8s-verified-*` test value that needs reverting.
 The equivalent by hand:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl delete namespace config-demo   # delete just this stack
 minikube stop                          # stop the cluster, keep it for next time
 minikube delete                        # delete the cluster completely
@@ -974,6 +1145,7 @@ Start here, always. The `describe` output ends with an `Events:` list that usual
 problem outright:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo get pods
 kubectl -n config-demo describe pod <pod-name>
 kubectl -n config-demo logs <pod-name>

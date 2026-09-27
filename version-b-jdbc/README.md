@@ -242,35 +242,159 @@ All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refre
 
 ## 5. Quick Start: Build and Run
 
-### Prerequisites
-- **Java 21**
-- **Maven 3.9+**
-- **Docker & Docker Compose**
-- **`python3`** and **`jq`** (used by `scripts/e2e-test.sh` and the curl examples below)
+### Where to run these commands
 
-### Step 1: Generate Keystore
-Generates the RSA 4096-bit PKCS12 keystore used to decrypt `{cipher}` values:
+Everything below runs from **`version-b-jdbc/`**, not from the repository root. Every code block
+starts with a `# from: ...` comment saying which directory it assumes.
+
+```
+springboot-external-properties-demo-II/     <- repository root
+├── version-a-git/
+├── version-b-jdbc/                         <- run everything from HERE
+│   ├── config-server/                      <- also holds db/migration/*.sql (the schema)
+│   ├── inventory-service/  pricing-service/
+│   ├── docker/compose.yaml                 <- referenced as docker/compose.yaml, so cwd matters
+│   ├── k8s/                                <- deploy / verify / teardown scripts
+│   ├── scripts/                            <- keystore, e2e test, docker teardown
+│   └── secrets/                            <- generated, gitignored, never committed
+└── version-c-s3/
+```
+
+To get there from a fresh clone:
+
 ```bash
-cd version-b-jdbc
+# from: wherever you keep your projects
+git clone https://github.com/kirankumarhm/springboot-config-server-external-properties-demo.git
+cd springboot-config-server-external-properties-demo/version-b-jdbc
+```
+
+Unlike version A there is no configuration directory to edit and no Git repository to commit to:
+**the database is the configuration**, so changes are `UPDATE` statements run against PostgreSQL
+(section 8.C). The seed values live in `config-server/src/main/resources/db/migration/V1__config_schema.sql`
+and are inserted by Flyway on first startup.
+
+### Prerequisites
+- **Java 21** and **Maven 3.9+** (`java -version`, `mvn -v`)
+- **Docker & Docker Compose** with Docker Desktop running (`docker ps`)
+- **`keytool`** - ships with the JDK, so Java 21 covers it
+- **`jq`** and **`python3`** - used by the curl examples and by `scripts/e2e-test.sh`
+- **`psql`** is *not* needed on the host: every SQL example runs it inside the container with
+  `docker exec`
+
+Check all of them in one go:
+
+```bash
+# from: version-b-jdbc/
+java -version && mvn -v && docker ps >/dev/null && keytool -help >/dev/null 2>&1 && jq --version && python3 -V
+```
+
+### Step 1: Generate the Encryption Keystore
+
+```bash
+# from: version-b-jdbc/
 ./scripts/generate-keystore.sh
 ```
-*(Creates `secrets/config-server.p12` with alias `configkey` and password `keystore-secret`)*
+
+**Why this step exists at all**, since nothing seeded into the database is currently encrypted:
+the Config Server is configured with `encrypt.key-store.*` in
+`config-server/src/main/resources/application.yml`, and Spring Cloud Config resolves that keystore
+while it is still *preparing the environment* - before the application context is even built. If
+the file is not there, the server does not start degraded, it **does not start at all**:
+
+```
+java.lang.IllegalStateException: Invalid keystore location
+    at org.springframework.cloud.bootstrap.encrypt.TextEncryptorUtils.createTextEncryptor(...)
+```
+
+So this is a hard prerequisite for Steps 3 onward, not an optional security extra. It is also the
+first step because the keystore is **not in Git** (`secrets/` is gitignored) - a fresh clone has
+no keystore, and that is deliberate: a private key in a repository is a private key you have to
+assume is compromised.
+
+**What the script creates** (it is idempotent - run it twice and the second run prints
+`Keystore already exists` and changes nothing):
+
+| Property | Value | Where it comes from |
+|---|---|---|
+| Path | `version-b-jdbc/secrets/config-server.p12` | fixed, relative to the script |
+| Format | PKCS12 | `-storetype PKCS12` |
+| Key | RSA 4096-bit, valid 10 years | `-keyalg RSA -keysize 4096 -validity 3650` |
+| Alias | `configkey` | `$ENCRYPT_KEYSTORE_ALIAS`, default `configkey` |
+| Password | `keystore-secret` | `$ENCRYPT_KEYSTORE_PASSWORD`, default `keystore-secret` |
+| Permissions | `600` (owner read/write only) | `chmod 600` |
+
+Those last three must match what the server is told to look for - Compose passes them as
+`ENCRYPT_KEYSTORE_ALIAS` / `ENCRYPT_KEYSTORE_PASSWORD` (section 6), and Kubernetes takes the file
+as a Secret with the password from `config-credentials` (section 9). Inspect what you generated:
+
+```bash
+# from: version-b-jdbc/
+keytool -list -keystore secrets/config-server.p12 -storepass keystore-secret
+```
+
+**Why a keystore (asymmetric) rather than a plain `encrypt.key` (symmetric).** With an RSA keypair
+the private key never leaves the Config Server, and an operator - or a DBA writing rows by hand,
+which is very much the model in this version - can be handed only the public certificate and still
+*encrypt* new values. A shared symmetric secret gives everyone who can encrypt the ability to
+decrypt.
+
+> **PKCS12 has no separate key password, and that is a real trap.** `keytool` silently ignores
+> `-keypass` for a PKCS12 store, so `encrypt.key-store.secret` **must equal**
+> `encrypt.key-store.password`. Set them differently and startup fails with
+> `UnrecoverableKeyException: Get Key failed: Given final block not properly padded`.
+
+**What you can now do with it.** Once the stack is up (Step 3), encrypt a secret and store the
+ciphertext in the `properties` table instead of the plaintext - so the credential is unreadable
+even to someone with `SELECT` on the database:
+
+```bash
+# from: anywhere (these are just HTTP calls)
+CIPHER=$(curl -s -u config-admin:admin-secret -X POST http://localhost:8898/encrypt \
+  -H "Content-Type: text/plain" --data-binary "s3cr3t-db-password")
+echo "$CIPHER"
+```
+
+```bash
+# from: version-b-jdbc/
+docker exec -i cfg-jdbc-postgres psql -U config_admin -d configdb <<SQL
+INSERT INTO properties (application, profile, label, "key", "value")
+VALUES ('inventory-service', NULL, 'main', 'inventory.api-key', '{cipher}$CIPHER');
+SQL
+```
+
+Clients never see the ciphertext: the Config Server decrypts on the way out with the private key
+and serves the plaintext, so `{cipher}` is transparent to the application. The `INSERT` also fires
+the notification trigger, so the new value propagates immediately (section 7).
+
+> **The failure mode to recognise.** If a `{cipher}` value cannot be decrypted with the current
+> keystore - typically because the keystore was regenerated after the value was encrypted, which
+> produces a *new* keypair - the Config Server does not error. It serves the key renamed to
+> `invalid.<key>` with the value `<n/a>`. The client then fails validation on a missing property
+> and it looks like an application bug. If you see `invalid.` anywhere in an Environment API
+> response, the keystore no longer matches the ciphertext: re-encrypt the value with the current
+> key, or restore the keystore that encrypted it.
+>
+> Note that the seeded configuration contains **no `{cipher}` values**, so nothing in the default
+> setup exercises decryption. The keystore is still mandatory, for the startup reason above.
 
 ### Step 2: Build Application JARs
 The Dockerfiles are **runtime-only** (`eclipse-temurin:21-jre-alpine`, `COPY target/<service>-1.0.0.jar`), so the jars must exist on the host *before* the images are built:
 ```bash
+# from: version-b-jdbc/
 mvn -Pfast package
 ```
-*(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar.)*
+*(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar. Add `-o` if Maven stalls checking the network for dependencies it already has.)*
 
 ### Step 3: Run with Docker Compose
 ```bash
+# from: version-b-jdbc/
 docker compose -f docker/compose.yaml build --no-cache
 docker compose -f docker/compose.yaml up -d
 ```
 
 ### Step 4: Verify Container Status
 ```bash
+# from: version-b-jdbc/
 docker ps
 ```
 All 6 containers will report `(healthy)`:
@@ -305,6 +429,7 @@ The tags come from `name: config-jdbc-demo` on line 1 of `docker/compose.yaml` (
 dump fails.
 
 ```bash
+# from: version-b-jdbc/
 ./scripts/teardown-docker.sh                # dump, then remove the containers and network
 ./scripts/teardown-docker.sh --stop         # put it away and KEEP the database
 ./scripts/teardown-docker.sh --no-dump      # skip the dump (only sensible with --stop)
@@ -317,6 +442,7 @@ dump fails.
 
 Restore a dump into a fresh stack with:
 ```bash
+# from: version-b-jdbc/
 docker exec -i cfg-jdbc-postgres psql -U config_admin -d configdb < scripts/backups/configdb-<timestamp>.sql
 ```
 
@@ -479,7 +605,7 @@ AC-05, AC-13 (plain SQL propagates), AC-14 (a rolled-back change must not broadc
 produces one broadcast) and AC-17 (`properties_history` replaces `git log`).
 
 ```bash
-cd version-b-jdbc
+# from: version-b-jdbc/
 ./scripts/e2e-test.sh
 ```
 
@@ -493,6 +619,7 @@ asserts is **8 seconds** - looser than version A's 5, because AC-15 deliberately
 
 #### 1. Query Config Server Environment API
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Pricing Service configuration from PostgreSQL
 curl -s -u config-client:client-secret http://localhost:8898/pricing-service/default/main | jq .
 
@@ -502,6 +629,7 @@ curl -s -u config-client:client-secret http://localhost:8898/inventory-service/d
 
 #### 2. Query Client Service Snapshots
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Inventory Service
 curl -s http://localhost:8091/api/v1/config/snapshot | jq .
 
@@ -516,11 +644,13 @@ curl -s http://localhost:8091/api/v1/config/history | jq .
 The change-detection path has its own health indicator, so a dead `LISTEN` thread is visible
 rather than silent:
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s http://localhost:9899/actuator/health | jq '.components.configChange'
 ```
 
 #### 3. Test Business Logic
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Inventory reservation
 curl -s -X POST http://localhost:8091/api/v1/inventory/reservations \
   -H 'Content-Type: application/json' \
@@ -537,6 +667,7 @@ curl -s "http://localhost:8092/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" 
 #### Step 1: Update Property in PostgreSQL
 Connect directly to Postgres and change a property:
 ```bash
+# from: version-b-jdbc/
 docker exec -i cfg-jdbc-postgres psql -U config_admin -d configdb <<'SQL'
 UPDATE properties
 SET "value" = '30.0', updated_at = now()
@@ -549,6 +680,7 @@ SQL
 
 To watch the audit trail and the revision counter move with it:
 ```bash
+# from: version-b-jdbc/
 docker exec -i cfg-jdbc-postgres psql -U config_admin -d configdb -c \
   'SELECT operation, "key", old_value, new_value, changed_at FROM properties_history ORDER BY history_id DESC LIMIT 5;'
 docker exec -i cfg-jdbc-postgres psql -U config_admin -d configdb -c \
@@ -564,6 +696,7 @@ Without any REST calls, restarts, or delays:
 
 #### Step 3: Verify Live Price Quotes
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s "http://localhost:8092/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 curl -s "http://localhost:8093/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 ```
@@ -579,7 +712,7 @@ Both instances immediately calculate:
 The manifests in `k8s/` run the same stack on Kubernetes. One script does the whole thing:
 
 ```bash
-cd version-b-jdbc
+# from: version-b-jdbc/
 ./k8s/deploy-minikube.sh
 ```
 
@@ -597,6 +730,7 @@ waits for each rollout, and finally runs `./k8s/verify-in-cluster.sh`.
 The keystore is **not** in any manifest - it is a real secret, created from the local file:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo create secret generic config-encryption-keystore \
   --from-file=config-server.p12=secrets/config-server.p12
 ```
@@ -615,6 +749,7 @@ Two things worth knowing before you run it:
 Change configuration in the cluster - the whole point, with no restart and no redeploy:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo exec statefulset/postgres -- \
   psql -U config_admin -d configdb -c \
   "UPDATE properties SET \"value\"='750' WHERE application='inventory-service' AND \"key\"='inventory.max-order-quantity';"
@@ -623,6 +758,7 @@ kubectl -n config-demo exec statefulset/postgres -- \
 Reach the services from the host, and verify:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo port-forward svc/inventory-service 8081:8081
 kubectl -n config-demo port-forward svc/config-server 9888:9888
 ./k8s/verify-in-cluster.sh    # asserts every pod IP individually, not through the Service
@@ -635,6 +771,7 @@ failure this design must not have.
 ### Tearing down
 
 ```bash
+# from: version-b-jdbc/
 ./k8s/teardown-minikube.sh                   # pg_dump, then delete the namespace; next deploy is fast
 ./k8s/teardown-minikube.sh --keep-data       # free the app pods, KEEP the database (and the config)
 ./k8s/teardown-minikube.sh --no-dump         # skip the automatic dump
@@ -735,6 +872,7 @@ All uncaught exceptions and validation errors are intercepted by `@RestControlle
 Every build is continuously analyzed by enterprise security and code quality gates:
 
 ```bash
+# from: version-b-jdbc/
 # Run complete verification (Checkstyle, Spotless, SpotBugs + FindSecBugs, ArchUnit, JaCoCo)
 mvn clean verify
 
@@ -760,6 +898,7 @@ Each of the three services is a **standalone Maven project** parented directly t
 inherited from it - so a single service builds on its own:
 
 ```bash
+# from: version-b-jdbc/
 cd inventory-service && mvn verify
 ```
 

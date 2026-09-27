@@ -236,14 +236,75 @@ All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refre
 
 ## 5. Quick Start: Build and Run
 
-### Step 1: Ensure Local AWS Emulator (Floci) is Running
+### Where to run these commands
+
+Everything below runs from **`version-c-s3/`**, not from the repository root. Every code block
+starts with a `# from: ...` comment saying which directory it assumes.
+
+```
+springboot-external-properties-demo-II/     <- repository root
+├── version-a-git/
+├── version-b-jdbc/
+└── version-c-s3/                           <- run everything from HERE
+    ├── config-server/  inventory-service/  pricing-service/
+    ├── docker/compose.yaml                 <- referenced as docker/compose.yaml, so cwd matters
+    ├── k8s/                                <- deploy (minikube + EKS) / verify / teardown
+    ├── scripts/                            <- provisioning, keystore, e2e test, docker teardown
+    ├── seed-config/                        <- uploaded to S3 by provision-floci.sh
+    └── secrets/                            <- generated, gitignored, never committed
+```
+
+To get there from a fresh clone:
+
 ```bash
+# from: wherever you keep your projects
+git clone https://github.com/kirankumarhm/springboot-config-server-external-properties-demo.git
+cd springboot-config-server-external-properties-demo/version-c-s3
+```
+
+`seed-config/` is **not** what the Config Server reads - it is only the initial content that
+`provision-floci.sh` uploads. Once the bucket exists, **S3 is the source of truth**: editing a
+file in `seed-config/` changes nothing until you upload it (section 7.C), exactly as editing a
+file locally changes nothing for version A's remote Git backend until you push.
+
+Every `aws` command needs the emulator's endpoint and credentials in the environment. Export them
+once per shell:
+
+```bash
+# from: anywhere - these apply to the whole shell session
+export AWS_ENDPOINT_URL="http://localhost.floci.io:4566"
+export AWS_ACCESS_KEY_ID="test"
+export AWS_SECRET_ACCESS_KEY="test"
+export AWS_DEFAULT_REGION="us-east-1"
+```
+
+*(`scripts/provision-floci.sh`, `scripts/e2e-test.sh` and the k8s scripts set these themselves, so
+the export is only needed when you run `aws` by hand.)*
+
+### Prerequisites
+- **Java 21** and **Maven 3.9+** (`java -version`, `mvn -v`)
+- **Docker & Docker Compose** with Docker Desktop running (`docker ps`)
+- **`keytool`** - ships with the JDK, so Java 21 covers it
+- **Floci** - the local AWS emulator (`floci status`). Used instead of LocalStack here
+- **`aws` CLI v2** - provisioning and the upload examples use the real AWS APIs
+- **`jq`** and **`python3`** - used by the curl examples and by `scripts/e2e-test.sh`
+
+Check all of them in one go:
+
+```bash
+# from: version-c-s3/
+java -version && mvn -v && docker ps >/dev/null && keytool -help >/dev/null 2>&1 && floci status && aws --version && jq --version && python3 -V
+```
+
+### Step 1: Ensure the Local AWS Emulator (Floci) is Running
+```bash
+# from: anywhere
 floci start
 ```
 
 ### Step 2: Provision S3 Bucket, SQS Queues & Notifications
 ```bash
-cd version-c-s3
+# from: version-c-s3/
 ./scripts/provision-floci.sh
 ```
 This is idempotent and does five things:
@@ -255,26 +316,120 @@ This is idempotent and does five things:
 
 > The object keys are byte-identical to version A's filenames (`use-directory-layout: false`), so the same configuration is portable across all three backends.
 
-### Step 3: Generate Encryption Keystore
+### Step 3: Generate the Encryption Keystore
+
 ```bash
+# from: version-c-s3/
 ./scripts/generate-keystore.sh
 ```
+
+**Why this step exists at all**, since nothing in `seed-config/` is currently encrypted: the
+Config Server is configured with `encrypt.key-store.*` in
+`config-server/src/main/resources/application.yml`, and Spring Cloud Config resolves that keystore
+while it is still *preparing the environment* - before the application context is even built. If
+the file is not there, the server does not start degraded, it **does not start at all**:
+
+```
+java.lang.IllegalStateException: Invalid keystore location
+    at org.springframework.cloud.bootstrap.encrypt.TextEncryptorUtils.createTextEncryptor(...)
+```
+
+So this is a hard prerequisite for Steps 5 onward, not an optional security extra. It is also
+early because the keystore is **not in Git** (`secrets/` is gitignored) - a fresh clone has no
+keystore, and that is deliberate: a private key in a repository is a private key you have to
+assume is compromised.
+
+**What the script creates** (it is idempotent - run it twice and the second run prints
+`Keystore already exists` and changes nothing):
+
+| Property | Value | Where it comes from |
+|---|---|---|
+| Path | `version-c-s3/secrets/config-server.p12` | fixed, relative to the script |
+| Format | PKCS12 | `-storetype PKCS12` |
+| Key | RSA 4096-bit, valid 10 years | `-keyalg RSA -keysize 4096 -validity 3650` |
+| Alias | `configkey` | `$ENCRYPT_KEYSTORE_ALIAS`, default `configkey` |
+| Password | `keystore-secret` | `$ENCRYPT_KEYSTORE_PASSWORD`, default `keystore-secret` |
+| Permissions | `600` (owner read/write only) | `chmod 600` |
+
+Those last three must match what the server is told to look for - Compose passes them as
+`ENCRYPT_KEYSTORE_ALIAS` / `ENCRYPT_KEYSTORE_PASSWORD` (section 6), and Kubernetes takes the file
+as a Secret with the password from `config-credentials` (section 8). Inspect what you generated:
+
+```bash
+# from: version-c-s3/
+keytool -list -keystore secrets/config-server.p12 -storepass keystore-secret
+```
+
+**Why a keystore (asymmetric) rather than a plain `encrypt.key` (symmetric).** With an RSA keypair
+the private key never leaves the Config Server, and an operator - or a CI pipeline uploading
+objects to S3, which is the model in this version - can be handed only the public certificate and
+still *encrypt* new values. A shared symmetric secret gives everyone who can encrypt the ability
+to decrypt.
+
+This matters more here than in the other two backends: an S3 bucket is far easier to grant broad
+read access to than a Git repository or a database, so the fact that a `{cipher}` value in an
+object is useless without the Config Server's private key is doing real work.
+
+> **PKCS12 has no separate key password, and that is a real trap.** `keytool` silently ignores
+> `-keypass` for a PKCS12 store, so `encrypt.key-store.secret` **must equal**
+> `encrypt.key-store.password`. Set them differently and startup fails with
+> `UnrecoverableKeyException: Get Key failed: Given final block not properly padded`.
+
+**What you can now do with it.** Once the stack is up (Step 5), encrypt a secret and put the
+ciphertext in the object instead of the plaintext:
+
+```bash
+# from: anywhere (these are just HTTP calls)
+CIPHER=$(curl -s -u config-admin:admin-secret -X POST http://localhost:8908/encrypt \
+  -H "Content-Type: text/plain" --data-binary "s3cr3t-db-password")
+echo "$CIPHER"
+```
+
+```bash
+# from: version-c-s3/ (with the AWS_* exports above in this shell)
+cat <<YAML | aws s3 cp - s3://acme-platform-config/main/inventory-service.yml
+inventory:
+  warehouse-code: "WH-BLR-01"
+  max-order-quantity: 400
+  express-shipping-enabled: true
+  low-stock-threshold: 25
+  api-key: "{cipher}$CIPHER"
+YAML
+```
+
+Clients never see the ciphertext: the Config Server decrypts on the way out with the private key
+and serves the plaintext, so `{cipher}` is transparent to the application. The upload also fires
+the S3 event, so the new value propagates immediately.
+
+> **The failure mode to recognise.** If a `{cipher}` value cannot be decrypted with the current
+> keystore - typically because the keystore was regenerated after the value was encrypted, which
+> produces a *new* keypair - the Config Server does not error. It serves the key renamed to
+> `invalid.<key>` with the value `<n/a>`. The client then fails validation on a missing property
+> and it looks like an application bug. If you see `invalid.` anywhere in an Environment API
+> response, the keystore no longer matches the ciphertext: re-encrypt the value with the current
+> key, or restore the keystore that encrypted it.
+>
+> Note that `seed-config/` contains **no `{cipher}` values**, so nothing in the default setup
+> exercises decryption. The keystore is still mandatory, for the startup reason above.
 
 ### Step 4: Build Application JARs
 The Dockerfiles are **runtime-only** (`eclipse-temurin:21-jre-alpine`, `COPY target/<service>-1.0.0.jar`), so the jars must exist on the host *before* the images are built:
 ```bash
+# from: version-c-s3/
 mvn -Pfast package
 ```
 *(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar.)*
 
 ### Step 5: Run with Docker Compose
 ```bash
+# from: version-c-s3/
 docker compose -f docker/compose.yaml build --no-cache
 docker compose -f docker/compose.yaml up -d
 ```
 
 ### Step 6: Verify Container Status
 ```bash
+# from: version-c-s3/
 docker ps
 ```
 All 5 containers will report `(healthy)`:
@@ -296,6 +451,7 @@ The tags come from `name: config-s3-demo` on line 1 of `docker/compose.yaml` (`<
 `./scripts/teardown-docker.sh` is tiered, prints what it is about to do, and asks first:
 
 ```bash
+# from: version-c-s3/
 ./scripts/teardown-docker.sh                     # remove the containers and network
 ./scripts/teardown-docker.sh --stop              # only stop them; resume with `docker compose start`
 ./scripts/teardown-docker.sh --volumes           # also remove anonymous volumes
@@ -310,6 +466,7 @@ The tags come from `name: config-s3-demo` on line 1 of `docker/compose.yaml` (`<
 can is deliberately separate:
 
 ```bash
+# from: version-c-s3/
 ./scripts/teardown-docker.sh --purge-aws         # empties the bucket and deletes both queues
 ```
 
@@ -361,7 +518,7 @@ one application), AC-19 (duplicate events are idempotent), AC-20 (a poison messa
 without blocking the queue) and AC-21 (rollback via a prior object version, replacing `git revert`).
 
 ```bash
-cd version-c-s3
+# from: version-c-s3/
 ./scripts/e2e-test.sh
 ```
 
@@ -375,6 +532,7 @@ SQS long-polling adds latency that Git webhooks and `LISTEN/NOTIFY` do not have.
 
 #### 1. Query Config Server Environment API
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Pricing Service configuration from AWS S3
 curl -s -u config-client:client-secret http://localhost:8908/pricing-service/default/main | jq .
 
@@ -384,6 +542,7 @@ curl -s -u config-client:client-secret http://localhost:8908/inventory-service/d
 
 #### 2. Query Client Service Snapshots
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Inventory Service Snapshot
 curl -s http://localhost:8101/api/v1/config/snapshot | jq .
 
@@ -398,11 +557,13 @@ curl -s http://localhost:8101/api/v1/config/history | jq .
 The SQS change-detection path has its own health indicator, so a dead poller is visible rather
 than silent:
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s http://localhost:9900/actuator/health | jq '.components.configChange'
 ```
 
 #### 3. Test Business Endpoints
 ```bash
+# from: anywhere (these are just HTTP calls)
 # Test Inventory reservation
 curl -s -X POST http://localhost:8101/api/v1/inventory/reservations \
   -H 'Content-Type: application/json' \
@@ -418,6 +579,7 @@ curl -s "http://localhost:8102/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" 
 
 #### Step 1: Upload an Updated Configuration to S3
 ```bash
+# from: anywhere - this block exports the AWS_* variables itself
 export AWS_ENDPOINT_URL="http://localhost.floci.io:4566"
 export AWS_ACCESS_KEY_ID="test"
 export AWS_SECRET_ACCESS_KEY="test"
@@ -442,6 +604,7 @@ Within ~0.5–1 second:
 
 #### Step 3: Verify Live Price Quotes
 ```bash
+# from: anywhere (these are just HTTP calls)
 curl -s "http://localhost:8102/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 curl -s "http://localhost:8103/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 ```
@@ -455,6 +618,7 @@ Versioning is this backend's `git log`. Listing versions and copying an older on
 current key re-fires the `ObjectCreated` event, so a rollback propagates by the same path as a
 change - this is AC-21:
 ```bash
+# from: version-c-s3/ (with the AWS_* exports from section 5 in this shell)
 aws s3api list-object-versions --bucket acme-platform-config \
   --prefix main/pricing-service.yml --query 'Versions[].[VersionId,LastModified]' --output table
 
@@ -472,7 +636,7 @@ its own script.
 ### A. Local minikube
 
 ```bash
-cd version-c-s3
+# from: version-c-s3/
 ./k8s/deploy-minikube.sh
 ```
 
@@ -489,6 +653,7 @@ applies the manifests in order, waits for each rollout, and runs `./k8s/verify-i
 The keystore is **not** in any manifest - it is a real secret, created from the local file:
 
 ```bash
+# from: anywhere (these are just HTTP calls)
 kubectl -n config-demo create secret generic config-encryption-keystore \
   --from-file=config-server.p12=secrets/config-server.p12
 ```
@@ -513,6 +678,7 @@ Three constraints are specific to this backend and each one blocks the deploymen
 ### B. Floci's EKS (a real k3s control plane)
 
 ```bash
+# from: version-c-s3/
 ./k8s/deploy-floci-eks.sh
 ```
 
@@ -540,6 +706,7 @@ Two traps the script exists to handle:
 ### Verifying, either way
 
 ```bash
+# from: version-c-s3/
 ./k8s/verify-in-cluster.sh
 ```
 
@@ -553,6 +720,7 @@ failure this design must not have.
 stack behind while reporting success:
 
 ```bash
+# from: version-c-s3/
 ./k8s/teardown.sh                        # minikube (default): namespace only; next deploy is fast
 ./k8s/teardown.sh --eks                  # same, on the Floci EKS cluster
 ./k8s/teardown.sh --eks --images         # also clear the accumulated per-deploy image tags
@@ -656,6 +824,7 @@ All uncaught exceptions and validation errors are intercepted by `@RestControlle
 Every build is continuously analyzed by enterprise security and code quality gates:
 
 ```bash
+# from: version-c-s3/
 # Run complete verification (Checkstyle, Spotless, SpotBugs + FindSecBugs, ArchUnit, JaCoCo)
 mvn clean verify
 
@@ -681,6 +850,7 @@ Each of the three services is a **standalone Maven project** parented directly t
 inherited from it - so a single service builds on its own:
 
 ```bash
+# from: version-c-s3/
 cd inventory-service && mvn verify
 ```
 
