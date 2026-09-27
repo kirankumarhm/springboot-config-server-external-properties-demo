@@ -341,7 +341,7 @@ curl -s localhost:8081/api/v1/config/snapshot | jq .
     "expressShippingEnabled": true,
     "lowStockThreshold": 25,
     "bannerMessage": "Configured centrally via Spring Cloud Config - Git backend",
-    "environmentLabel": "production-kiran"
+    "environmentLabel": "production-config"
   }
 }
 ```

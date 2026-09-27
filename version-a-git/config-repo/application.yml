@@ -3,4 +3,4 @@
 demo:
   shared:
     banner-message: "Configured centrally via Spring Cloud Config - Git backend"
-    environment-label: "production-kiran"
+    environment-label: "production-config"

@@ -820,7 +820,7 @@ curl -s -u config-client:client-secret \
 ```
 
 Look at `settings.environmentLabel`. It reads back whatever `demo.shared.environment-label`
-currently holds in `config-repo/application.yml` **on GitHub** (`production-kiran` at the time of
+currently holds in `config-repo/application.yml` **on GitHub** (`production-config` at the time of
 writing) — so check the file rather than expecting a fixed string.
 
 To see the proof that it came from Git rather than from inside the jar, ask the Config Server
