@@ -3,7 +3,7 @@
 > **Storage Backend:** AWS S3 Bucket (`acme-platform-config`) with object versioning  
 > **Change Detection:** S3 Event Notification (`s3:ObjectCreated:*`) &rarr; SQS Queue (`config-change-queue`) &rarr; SQS Change Detector Thread &rarr; Spring Cloud Bus (RabbitMQ)  
 > **Encryption:** Asymmetric RSA 4096-bit Keystore (PKCS12)  
-> **Default Ports:** Config Server `8908` (Management: `9900`), Floci AWS Emulator `4566`, Inventory Service `8101`, Pricing Service `8102`, Pricing Service 2 `8103`
+> **Default Ports (host):** Config Server `8908` (Actuator `9900`), Floci AWS emulator `4566`, Inventory Service `8101` (Actuator `9101`), Pricing Service `8102` (Actuator `9102`), Pricing Service 2 `8103` (Actuator `9103`), RabbitMQ `5674` / UI `15674`
 
 ---
 
@@ -164,7 +164,8 @@ RabbitMQ comes with an interactive web dashboard running out of the box:
 #### What to observe in the RabbitMQ UI:
 1. **Connections Tab ("The Phone Lines")**:
    - You will see 4 active AMQP connections.
-   - **Service Name Identification**: Thanks to the `ConnectionNameStrategy` bean (`RabbitConfig.java`), connections display human-readable names (`config-server:8908`, `inventory-service:8101`, `pricing-service:8102`, `pricing-service:8103`).
+   - **Service Name Identification**: Thanks to the `ConnectionNameStrategy` bean (`RabbitConfig.java`), connections display human-readable names (`config-server:8908`, `inventory-service:8101`, `pricing-service:8102`, `pricing-service:8083`).
+   - *Why the last one is `8083` and not `8103`*: the name is built from `${APP_INDEX:${SERVER_PORT:...}}`, which is the port **inside** the container. Compose sets `APP_INDEX: 8083` for the second pricing instance, while `8103` is only the host-side published port.
    - *Tip*: Click the `+/-` icon on the top-right of the table to enable the **Client-provided name** column, or click any connection to inspect its details.
 2. **Exchanges Tab ("The Router")**:
    - Click on **`springCloudBus`** (`topic` type) to see the broadcast bindings to each microservice's queue (`#`).
@@ -240,11 +241,19 @@ All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refre
 floci start
 ```
 
-### Step 2: Provision S3 Bucket, SQS Queue & Notifications
+### Step 2: Provision S3 Bucket, SQS Queues & Notifications
 ```bash
 cd version-c-s3
 ./scripts/provision-floci.sh
 ```
+This is idempotent and does five things:
+1. Creates the bucket `acme-platform-config` if missing.
+2. Enables **object versioning** - the audit trail that replaces `git log`, and what makes AC-21 (rollback to a prior version) possible.
+3. Creates `config-change-dlq`, then `config-change-queue` with a redrive policy pointing at it (`maxReceiveCount=3`), so a poison message lands in the DLQ instead of blocking the queue forever.
+4. Wires `s3:ObjectCreated:*` and `s3:ObjectRemoved:*` notifications for the `main/` prefix to the queue.
+5. Uploads `seed-config/*.yml` to `s3://acme-platform-config/main/` - the same configuration content version A keeps in `config-repo/`.
+
+> The object keys are byte-identical to version A's filenames (`use-directory-layout: false`), so the same configuration is portable across all three backends.
 
 ### Step 3: Generate Encryption Keystore
 ```bash
@@ -252,9 +261,11 @@ cd version-c-s3
 ```
 
 ### Step 4: Build Application JARs
+The Dockerfiles are **runtime-only** (`eclipse-temurin:21-jre-alpine`, `COPY target/<service>-1.0.0.jar`), so the jars must exist on the host *before* the images are built:
 ```bash
 mvn -Pfast package
 ```
+*(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar.)*
 
 ### Step 5: Run with Docker Compose
 ```bash
@@ -266,22 +277,68 @@ docker compose -f docker/compose.yaml up -d
 ```bash
 docker ps
 ```
-All containers will report `(healthy)`:
-- `cfg-s3-server` (Config Server on port `8908` / `9900`)
-- `cfg-s3-inventory` (Inventory Service on port `8101`)
-- `cfg-s3-pricing` (Pricing Service 1 on port `8102`)
-- `cfg-s3-pricing-2` (Pricing Service 2 on port `8103`)
-- `cfg-s3-rabbitmq` (RabbitMQ on port `5674`)
+All 5 containers will report `(healthy)`:
+
+| Container | Role | Host ports | Image tag built by Compose |
+|---|---|---|---|
+| `cfg-s3-server` | Config Server | `8908`, `9900` | `config-s3-demo-config-server:latest` |
+| `cfg-s3-inventory` | Inventory Service | `8101`, `9101` | `config-s3-demo-inventory-service:latest` |
+| `cfg-s3-pricing` | Pricing Service 1 | `8102`, `9102` | `config-s3-demo-pricing-service:latest` |
+| `cfg-s3-pricing-2` | Pricing Service 2 | `8103`, `9103` | `config-s3-demo-pricing-service:latest` |
+| `cfg-s3-rabbitmq` | RabbitMQ broker | `5674`, `15674` | `rabbitmq:4-management` (pulled) |
+
+The tags come from `name: config-s3-demo` on line 1 of `docker/compose.yaml` (`<project>-<service>:latest`). The Kubernetes manifests in `k8s/` reference these exact strings.
+
+**Floci runs outside this Compose stack** (`floci start`), so there is no S3/SQS container. Reaching it from inside a container needs the two `extra_hosts` entries at the top of `docker/compose.yaml`: `localhost.floci.io` and `acme-platform-config.localhost.floci.io`, both mapped to `host-gateway`. The bucket-prefixed one is not optional - the AWS SDK uses **virtual-host-style** addressing (`<bucket>.<host>`) against a custom endpoint, and `AwsS3EnvironmentRepositoryFactory` builds its own `S3Client` with no path-style option to turn that off.
 
 ---
 
-## 6. Testing Guide
+## 6. Configuration & Environment Variables
+
+The default compiled into `config-server/src/main/resources/application.yml` and the value
+`docker/compose.yaml` actually sets are **not** always the same:
+
+| Variable | Default in `application.yml` | Set by `docker/compose.yaml` | Description |
+|---|---|---|---|
+| `CONFIG_BUCKET` | `acme-platform-config` | same | S3 bucket holding the configuration objects |
+| `CONFIG_KEY_PREFIX` | `main/` | same | Key prefix. In the S3 backend the prefix **is** the label: `main/` = label `main` |
+| `CONFIG_CHANGE_QUEUE` | `config-change-queue` | same | SQS queue receiving the S3 event notifications |
+| `AWS_REGION` | `us-east-1` | same | AWS region |
+| `AWS_ENDPOINT` | `http://localhost.floci.io:4566` | same | Endpoint override. **Delete it on real AWS** and attach an IAM role via IRSA instead |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `test` / `test` | same | Static credentials for the emulator only. Omit on real AWS so the Default Credential Provider Chain takes over |
+| `MANAGEMENT_PORT` | `9888` | `9888` (published as `9900`) | Actuator port - a separate management child context |
+| `ENCRYPT_KEYSTORE_LOCATION` | `file:./secrets/config-server.p12` | `file:/secrets/config-server.p12` | RSA PKCS12 keystore (mounted read-only) |
+| `ENCRYPT_KEYSTORE_PASSWORD` | `keystore-secret` | same | Keystore password; also the key password - PKCS12 has no separate one |
+| `ENCRYPT_KEYSTORE_ALIAS` | `configkey` | same | Key alias inside the keystore |
+| `CONFIG_ADMIN_USERNAME` / `CONFIG_ADMIN_PASSWORD` | `config-admin` / `{noop}admin-secret` | password only | Admin auth for `/encrypt`, `/decrypt`, `/actuator/busrefresh` |
+| `CONFIG_CLIENT_USERNAME` / `CONFIG_CLIENT_PASSWORD` | `config-client` / `{noop}client-secret` | password only | Client auth for the Environment API |
+| `RABBITMQ_HOST` / `RABBITMQ_PORT` | `localhost` / `5672` | `rabbitmq` / *(default)* | Spring Cloud Bus broker |
+
+Two server-side settings have no environment variable and are set in `application.yml`:
+`spring.profiles.active: awss3` (the profile name Spring Cloud Config keys
+`AwsS3EnvironmentRepository` off - it is load-bearing) and
+`app.known-applications: inventory-service,pricing-service`, which lets
+`S3ObjectKeyApplicationMapper` resolve a profile suffix exactly instead of guessing at dashes.
+
+---
+
+## 7. Testing Guide
 
 ### A. Automated Acceptance Test Suite
+S3 event delivery is **at-least-once and unordered**, so this suite additionally proves the refresh
+path is idempotent and that poison messages are contained. Checks map to acceptance criteria in
+[REQUIREMENTS.md](../REQUIREMENTS.md): AC-01, AC-03, AC-05, AC-18 (an upload propagates, scoped to
+one application), AC-19 (duplicate events are idempotent), AC-20 (a poison message lands in the DLQ
+without blocking the queue) and AC-21 (rollback via a prior object version, replacing `git revert`).
+
 ```bash
 cd version-c-s3
 ./scripts/e2e-test.sh
 ```
+
+It needs Floci running, the stack provisioned and up (section 5), plus `aws` and `python3` on the
+PATH. The propagation SLA it asserts is **10 seconds** - the loosest of the three versions, because
+SQS long-polling adds latency that Git webhooks and `LISTEN/NOTIFY` do not have.
 
 ---
 
@@ -304,6 +361,15 @@ curl -s http://localhost:8101/api/v1/config/snapshot | jq .
 # Pricing Service 1 & 2 Snapshots
 curl -s http://localhost:8102/api/v1/config/snapshot | jq .
 curl -s http://localhost:8103/api/v1/config/snapshot | jq .
+
+# Refresh audit trail (changed keys, never their values)
+curl -s http://localhost:8101/api/v1/config/history | jq .
+```
+
+The SQS change-detection path has its own health indicator, so a dead poller is visible rather
+than silent:
+```bash
+curl -s http://localhost:9900/actuator/health | jq '.components.configChange'
 ```
 
 #### 3. Test Business Endpoints
@@ -355,9 +421,107 @@ Both instances will show:
 - `finalPrice: 650.00`
 - `configVersion: 2`
 
+#### Step 4: Roll Back Using S3 Object Versioning
+Versioning is this backend's `git log`. Listing versions and copying an older one back over the
+current key re-fires the `ObjectCreated` event, so a rollback propagates by the same path as a
+change - this is AC-21:
+```bash
+aws s3api list-object-versions --bucket acme-platform-config \
+  --prefix main/pricing-service.yml --query 'Versions[].[VersionId,LastModified]' --output table
+
+aws s3api copy-object --bucket acme-platform-config --key main/pricing-service.yml \
+  --copy-source "acme-platform-config/main/pricing-service.yml?versionId=<PREVIOUS_VERSION_ID>"
+```
+
 ---
 
-## 8. Interactive OpenAPI 3 / Swagger Documentation
+## 8. Running on Kubernetes
+
+The manifests in `k8s/` run the same stack on Kubernetes. There are two target clusters, each with
+its own script.
+
+### A. Local minikube
+
+```bash
+cd version-c-s3
+./k8s/deploy-minikube.sh
+```
+
+It builds the jars, builds the images on the **host** Docker daemon, `minikube image load`s them,
+applies the manifests in order, waits for each rollout, and runs `./k8s/verify-in-cluster.sh`.
+
+| Manifest | What it creates |
+|---|---|
+| `00-namespace-and-config.yaml` | Namespace `config-demo`, ConfigMaps `config-server-env` and `client-env`, Secret `config-credentials` |
+| `01-dependencies.yaml` | RabbitMQ Deployment (no S3/SQS container - that is Floci or real AWS, outside the cluster) |
+| `02-config-server.yaml` | Config Server (2 replicas) + Service |
+| `03-clients.yaml` | `inventory-service` (1 replica) and `pricing-service` (2 replicas) + Services |
+
+The keystore is **not** in any manifest - it is a real secret, created from the local file:
+
+```bash
+kubectl -n config-demo create secret generic config-encryption-keystore \
+  --from-file=config-server.p12=secrets/config-server.p12
+```
+
+Three constraints are specific to this backend and each one blocks the deployment if missed:
+
+- **`AWS_ENDPOINT` must be an IP address, not a hostname, when pointing at a local emulator.**
+  `AwsS3EnvironmentRepositoryFactory` builds its own `S3Client` with no injection point and no
+  path-style option, so with a hostname the SDK uses virtual-host addressing and needs
+  `<bucket>.<host>` to resolve in cluster DNS. The SDK falls back to **path-style** automatically
+  when the endpoint host is a bare IP - which is why `00-namespace-and-config.yaml` ships
+  `AWS_ENDPOINT: "http://172.17.0.2:4566"` (Floci on the Docker bridge). Check the address matches
+  your machine before deploying. **On real AWS: delete the `AWS_ENDPOINT` line and the static
+  credentials in the Secret, and attach an IAM role via IRSA instead.**
+- **Images are built on the host and loaded in, not pulled.** On this machine the cluster cannot
+  pull from Docker Hub (`x509: certificate signed by unknown authority`, a corporate TLS
+  certificate the host trusts being absent from the VM's trust store).
+- **`enableServiceLinks: false` is set in the pod specs on purpose.** Kubernetes would otherwise
+  inject `RABBITMQ_PORT=tcp://10.x.x.x:5672`, colliding with the property of the same name, and
+  Boot fails with `NumberFormatException`.
+
+### B. Floci's EKS (a real k3s control plane)
+
+```bash
+./k8s/deploy-floci-eks.sh
+```
+
+`floci eks create-cluster` starts a `rancher/k3s` container and publishes its API server, so this
+is a genuine control plane rather than a mock. The script writes a self-contained kubeconfig to
+`k8s/floci-eks.kubeconfig` (API server `https://localhost:6500`) using k3s's own client
+certificate - deliberately **not** what `aws eks update-kubeconfig` produces, which writes an exec
+credential plugin that shells out to `aws eks get-token` and therefore fails in GUI tools like k9s
+with "Unable to locate credentials".
+
+Two traps the script exists to handle:
+
+- **The container runtime cannot pull from Docker Hub.** The first symptom is *not* an error on
+  your own pods - it is every pod stuck in `ContainerCreating`, because k3s cannot pull
+  `rancher/mirrored-pause`, the sandbox image every pod needs. The node still reports `Ready`,
+  which makes the cluster look healthy. The script handles it twice over: a `registries.yaml` that
+  skips verification, plus pre-importing images from the host daemon.
+- **A mutable `:latest` tag silently runs stale code.** With `imagePullPolicy: IfNotPresent` the
+  kubelet resolves `:latest` once and pins that image ID; re-importing a rebuilt image under the
+  same tag updates the tag in containerd while running pods keep the old ID - so a code change
+  appears to deploy and does nothing. Every deploy therefore gets a unique tag
+  (`1.0.0-<timestamp>`), and the script **asserts** the pod's `imageID` equals the image just
+  built rather than trusting the rollout.
+
+### Verifying, either way
+
+```bash
+./k8s/verify-in-cluster.sh
+kubectl delete namespace config-demo   # tear down
+```
+
+`verify-in-cluster.sh` queries **individual pod IPs** rather than the Service, because a Service
+would load-balance and could hide a replica that never received the broadcast - exactly the
+failure this design must not have.
+
+---
+
+## 9. Interactive OpenAPI 3 / Swagger Documentation
 
 Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
 
@@ -374,7 +538,7 @@ Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagg
 
 ---
 
-## 9. Production-Grade Security Hardening
+## 10. Production-Grade Security Hardening
 
 ### Security Filter Chain (`SecurityConfig.java`)
 All microservices implement enterprise-grade HTTP security controls:
@@ -390,7 +554,7 @@ All microservices implement enterprise-grade HTTP security controls:
 
 ---
 
-## 10. RFC 9457 Standardized Exception Handling
+## 11. RFC 9457 Standardized Exception Handling
 
 All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
 
@@ -422,7 +586,7 @@ All uncaught exceptions and validation errors are intercepted by `@RestControlle
 
 ---
 
-## 11. Security Scanning & Quality Gates (SAST / SCA)
+## 12. Security Scanning & Quality Gates (SAST / SCA)
 
 Every build is continuously analyzed by enterprise security and code quality gates:
 
@@ -437,9 +601,21 @@ mvn -Psecurity verify
 | Quality Gate | Tool & Version | Inspection Scope |
 |---|---|---|
 | **SAST (Bytecode Analysis)** | SpotBugs 4.10.4 + `findsecbugs-plugin:1.13.0` | SQL injection, CSRF misconfiguration, insecure cryptography, path traversal, command injection |
-| **SCA (Dependency Vulnerability)** | OWASP `dependency-check-maven:12.1.0` | Known CVEs in third-party libraries against the National Vulnerability Database (NVD) |
+| **SCA (Dependency Vulnerability)** | OWASP `dependency-check-maven:13.0.0` | Known CVEs in third-party libraries against the National Vulnerability Database (NVD) |
 | **Architecture Enforcement** | ArchUnit 1.5.0 | Layer isolation, immutable snapshot boundaries, ban direct properties injection |
 | **Code Formatting** | Spotless + google-java-format 1.36.1 | Deterministic code style formatting |
 | **Static Code Analysis** | Checkstyle 14.1.0 | Coding conventions, naming standards, Javadoc hygiene |
-| **Code Coverage** | JaCoCo 0.8.15 | Enforced line (>70%) and branch (>60%) coverage thresholds |
+| **Code Coverage** | JaCoCo 0.8.15 | Enforced line (>70%) and branch (>60%) thresholds. **`config-server` lowers these to 45% / 35%** on purpose: `SecurityConfig` and the application class need a live S3 endpoint and broker to instantiate, and their behaviour is asserted end to end by `scripts/e2e-test.sh` (401 unauthenticated, 200 authenticated) instead. The override and its rationale are in `config-server/pom.xml` |
+
+`SqsChangeDetectorIT` uses **Testcontainers 1.21.4**, pinned explicitly because - unlike Boot 3 -
+the Spring Boot 4 BOM does not manage it. It needs a running Docker daemon.
+
+Each of the three services is a **standalone Maven project** parented directly to
+`spring-boot-starter-parent` 4.0.8, with its own dependency management, quality gates and
+`config/` directory. The `pom.xml` at `version-c-s3/` is an **aggregator only** - nothing is
+inherited from it - so a single service builds on its own:
+
+```bash
+cd inventory-service && mvn verify
+```
 

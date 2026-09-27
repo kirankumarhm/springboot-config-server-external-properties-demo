@@ -186,7 +186,7 @@ Every version is the same pipeline. Only the two leftmost boxes differ.
 ### 3.3 Version B — PostgreSQL
 
 ```text
-  operator ── psql UPDATE ──▶ PostgreSQL :5433
+  operator ── psql UPDATE ──▶ PostgreSQL :5432
                                  ├ properties            (config, system of record)
                                  ├ properties_history    (replaces `git log`)
                                  ├ config_revision       (drives the reconciler)
@@ -977,7 +977,7 @@ at ERROR with the constraint message. The acceptance suites assert the log conta
 | Telemetry masking | `env.show-values: never`, `configprops.show-values: never` |
 | CSRF | Disabled — stateless REST endpoints with no session fixation risk (OWASP compliant) |
 | Sessions | `SessionCreationPolicy.STATELESS` across all microservices and config servers |
-| SAST / SCA Scanning | SpotBugs + `findsecbugs-plugin:1.13.0` and OWASP `dependency-check-maven:12.1.0` |
+| SAST / SCA Scanning | SpotBugs + `findsecbugs-plugin:1.13.0` and OWASP `dependency-check-maven:13.0.0` |
 | Backend credentials | Read-only intent: no DB write grants needed, no `s3:PutObject`, no git push |
 | Container | Non-root `app` user |
 | Secrets in config | `{cipher}` supported by the server with RSA 4096-bit keystore |
@@ -1005,7 +1005,7 @@ Enforced on every build, failing it on violation:
 | Formatting | Spotless + google-java-format 1.36.1 | single source of truth for layout, so Checkstyle carries no whitespace rules |
 | Static analysis | Checkstyle 14.1.0 (curated ruleset, not `google_checks`) | a null-unsafe `equals` orientation in the S3 key mapper |
 | Bug patterns & SAST | SpotBugs 4.10.4 + FindSecBugs 1.13.0 (`Max` effort, `Medium` threshold) | **`VO_VOLATILE_INCREMENT`**, CSRF/SQL security checks, null pointer invariants |
-| Dependency CVEs | OWASP Dependency-Check 12.1.0 (`mvn -Psecurity verify`) | Third-party dependency vulnerability scanning against NVD |
+| Dependency CVEs | OWASP Dependency-Check 13.0.0 (`mvn -Psecurity verify`) | Third-party dependency vulnerability scanning against NVD |
 | Coverage | JaCoCo 0.8.15, 70%/60% line/branch | two `config-server` modules carry a documented lower gate with the reason in the POM |
 | Dependency hygiene | Maven Enforcer | Testcontainers 1.x dragging in JUnit 4 |
 | **Architecture** | **ArchUnit 1.5.0** | **the service layer depending on `web/dto`** — the DTOs were moved to an `api` package |

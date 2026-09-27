@@ -337,11 +337,11 @@ curl -s localhost:8081/api/v1/config/snapshot | jq .
   "lastChangedKeys": [],
   "settings": {
     "warehouseCode": "WH-BLR-01",
-    "maxOrderQuantity": 500,
+    "maxOrderQuantity": 400,
     "expressShippingEnabled": true,
     "lowStockThreshold": 25,
     "bannerMessage": "Configured centrally via Spring Cloud Config - Git backend",
-    "environmentLabel": "production-like"
+    "environmentLabel": "production-kiran"
   }
 }
 ```
