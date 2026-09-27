@@ -106,6 +106,8 @@ source of truth is the REMOTE, so edit, commit and push, then broadcast one refr
     --header="Authorization: Basic $(printf 'config-admin:admin-secret' | base64)" \
     http://localhost:9888/actuator/busrefresh
 
-Tear down:
-  kubectl delete namespace config-demo
+Tear down (tiered - run with --help to see the options):
+  ./k8s/teardown-minikube.sh                   # namespace only; next deploy is fast
+  ./k8s/teardown-minikube.sh --stop            # also stop the VM
+  ./k8s/teardown-minikube.sh --delete-cluster  # start completely clean next time
 EOF

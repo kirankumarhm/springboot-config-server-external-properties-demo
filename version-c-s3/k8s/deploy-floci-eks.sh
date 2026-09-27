@@ -208,8 +208,14 @@ Change configuration (no restart, no redeploy):
   eval \$(floci env)
   aws s3 cp application.yml s3://acme-platform-config/main/application.yml
 
-Tear down:
-  kubectl --kubeconfig=$KC delete namespace $NS
-  aws eks delete-cluster --name $CLUSTER
-  floci stop
+Tear down (tiered - run with --help to see the options):
+  ./k8s/teardown.sh --eks                      # namespace only; next deploy is fast
+  ./k8s/teardown.sh --eks --images             # also clear the accumulated per-deploy image tags
+  ./k8s/teardown.sh --eks --delete-cluster     # delete the EKS cluster and the stale kubeconfig
+  ./k8s/teardown.sh --eks --stop               # also 'floci stop'
+
+  The equivalent by hand:
+    kubectl --kubeconfig=$KC delete namespace $NS
+    aws eks delete-cluster --name $CLUSTER
+    floci stop
 EOF

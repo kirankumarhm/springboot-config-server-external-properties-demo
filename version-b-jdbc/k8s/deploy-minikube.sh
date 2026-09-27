@@ -81,6 +81,12 @@ Change configuration (this is the whole point - no restart, no redeploy):
     psql -U config_admin -d configdb -c \
     "UPDATE properties SET \"value\"='750' WHERE application='inventory-service' AND \"key\"='inventory.max-order-quantity';"
 
-Tear down:
-  kubectl delete namespace config-demo
+Tear down (tiered - run with --help to see the options):
+  ./k8s/teardown-minikube.sh                   # pg_dump, then delete the namespace
+  ./k8s/teardown-minikube.sh --keep-data       # free the app pods, KEEP the config database
+  ./k8s/teardown-minikube.sh --delete-cluster  # start completely clean next time
+
+  NOTE: the database is the source of truth in this version and its PVC lives inside the
+  namespace, so a plain `kubectl delete namespace` destroys your configuration. The script
+  dumps it to k8s/backups/ first.
 EOF

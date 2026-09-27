@@ -591,7 +591,38 @@ kubectl -n config-demo port-forward svc/config-server 9888:9888
 
 `verify-in-cluster.sh` queries **individual pod IPs** rather than the Service, because a Service
 would load-balance and could hide a replica that never received the broadcast - exactly the
-failure this design must not have. Tear down with `kubectl delete namespace config-demo`.
+failure this design must not have.
+
+### Tearing down
+
+```bash
+./k8s/teardown-minikube.sh                   # pg_dump, then delete the namespace; next deploy is fast
+./k8s/teardown-minikube.sh --keep-data       # free the app pods, KEEP the database (and the config)
+./k8s/teardown-minikube.sh --no-dump         # skip the automatic dump
+./k8s/teardown-minikube.sh --images          # also drop the 5 loaded images (next deploy must rebuild)
+./k8s/teardown-minikube.sh --jars            # also run `mvn clean`
+./k8s/teardown-minikube.sh --stop            # also stop the VM; `minikube start` resumes it
+./k8s/teardown-minikube.sh --delete-cluster  # also DELETE the VM - everything rebuilds from scratch
+./k8s/teardown-minikube.sh --all -y          # --images --jars --stop, no prompt
+```
+
+> **This is the one version where teardown can destroy configuration.** Version A's configuration
+> lives in Git and version C's lives in S3, both outside the cluster. Here the **database is the
+> source of truth**, and its PersistentVolumeClaim (`data-postgres-0`) lives *inside* the
+> namespace - so a plain `kubectl delete namespace config-demo` takes every hand-edited property
+> and the whole `properties_history` audit trail with it.
+>
+> The script therefore runs `pg_dump` into `k8s/backups/configdb-<timestamp>.sql` **before**
+> deleting anything, and stops to ask if the dump fails. Restore into a fresh deploy with:
+> ```bash
+> kubectl -n config-demo exec -i statefulset/postgres -- \
+>   psql -U config_admin -d configdb < k8s/backups/configdb-<timestamp>.sql
+> ```
+> Use `--keep-data` to tear down the applications while leaving postgres and its PVC standing;
+> the next `deploy-minikube.sh` then reuses the same database.
+
+It also closes any `kubectl port-forward` left open for the namespace - they outlive their pods
+and then fail with "address already in use" on the next deploy.
 
 ---
 

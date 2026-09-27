@@ -86,6 +86,10 @@ Change configuration (this is the whole point - no restart, no redeploy):
     psql -U config_admin -d configdb -c \
     "UPDATE properties SET \"value\"='750' WHERE application='inventory-service' AND \"key\"='inventory.max-order-quantity';"
 
-Tear down:
-  kubectl delete namespace config-demo
+Tear down (tiered - run with --help to see the options):
+  ./k8s/teardown.sh                            # namespace only; next deploy is fast
+  ./k8s/teardown.sh --stop                     # also stop the VM
+  ./k8s/teardown.sh --delete-cluster           # start completely clean next time
+
+  Configuration lives in S3, outside the cluster, so none of the above can lose it.
 EOF

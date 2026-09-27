@@ -512,12 +512,48 @@ Two traps the script exists to handle:
 
 ```bash
 ./k8s/verify-in-cluster.sh
-kubectl delete namespace config-demo   # tear down
 ```
 
 `verify-in-cluster.sh` queries **individual pod IPs** rather than the Service, because a Service
 would load-balance and could hide a replica that never received the broadcast - exactly the
 failure this design must not have.
+
+### Tearing down
+
+`teardown.sh` takes the **target explicitly** - deleting from the wrong cluster leaves a live
+stack behind while reporting success:
+
+```bash
+./k8s/teardown.sh                        # minikube (default): namespace only; next deploy is fast
+./k8s/teardown.sh --eks                  # same, on the Floci EKS cluster
+./k8s/teardown.sh --eks --images         # also clear the accumulated per-deploy image tags
+./k8s/teardown.sh --jars                 # also run `mvn clean`
+./k8s/teardown.sh --stop                 # minikube: stop the VM. --eks: `floci stop`
+./k8s/teardown.sh --delete-cluster       # minikube: delete the VM. --eks: `aws eks delete-cluster`
+./k8s/teardown.sh --all -y               # --images --jars --stop, no prompt
+```
+
+Two things specific to this backend:
+
+- **`--eks --images` matters more here than anywhere else.** Every EKS deploy builds a unique
+  immutable tag (`1.0.0-<timestamp>`, see the `:latest` trap above), so tags accumulate one set
+  per deploy in both the k3s containerd namespace and the host daemon. The script removes them by
+  pattern, and `--delete-cluster` also deletes the now-stale `k8s/floci-eks.kubeconfig` so the
+  next run does not fail with a confusing "connection refused".
+- **No teardown above touches your configuration.** It lives in S3, outside the cluster. The one
+  flag that does is deliberately separate:
+
+  ```bash
+  ./k8s/teardown.sh --purge-aws     # empties the bucket (all object versions) and deletes both queues
+  ```
+
+  That removes the source of truth. Recover by re-running `./scripts/provision-floci.sh`, which
+  re-seeds from `seed-config/`. The purge sweeps **object versions and delete markers**
+  explicitly, because with versioning enabled `aws s3 rm --recursive` leaves every non-current
+  version behind and the bucket is not actually empty.
+
+Both paths also close any `kubectl port-forward` left open for the namespace - they outlive their
+pods and then fail with "address already in use" on the next deploy.
 
 ---
 
