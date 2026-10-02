@@ -40,6 +40,8 @@
     <!-- OpenAPI 3 / Swagger Documentation -->
     <springdoc.version>3.1.1</springdoc.version>
     <findsecbugs.version>1.13.0</findsecbugs.version>
+    <jib.version>3.5.2</jib.version>
+    <image.name>config-jdbc-demo-pricing-service</image.name>
 
     <!-- Keystore-based {cipher} support. Not managed by the Spring Cloud BOM. -->
     <spring-security-rsa.version>1.1.5</spring-security-rsa.version>
@@ -414,6 +416,41 @@
       <plugin>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+
+      <!-- ============================================================
+           Google Jib: Daemonless OCI/Docker container image builder.
+           Build to local daemon: mvn compile jib:dockerBuild
+           Build to tarball:     mvn compile jib:buildTar
+           Build to registry:    mvn compile jib:build -Dimage=<registry>/...
+           ============================================================ -->
+      <plugin>
+        <groupId>com.google.cloud.tools</groupId>
+        <artifactId>jib-maven-plugin</artifactId>
+        <version>${jib.version}</version>
+        <configuration>
+          <from>
+            <image>eclipse-temurin:21-jre-alpine</image>
+          </from>
+          <to>
+            <image>${image.name}:${project.version}</image>
+            <tags>
+              <tag>latest</tag>
+            </tags>
+          </to>
+          <container>
+            <user>1000:1000</user>
+            <jvmFlags>
+              <jvmFlag>-XX:MaxRAMPercentage=75</jvmFlag>
+              <jvmFlag>-XX:+UseContainerSupport</jvmFlag>
+            </jvmFlags>
+            <ports>
+              <port>8082</port>
+              <port>9082</port>
+            </ports>
+            <creationTime>USE_CURRENT_TIMESTAMP</creationTime>
+          </container>
+        </configuration>
       </plugin>
     </plugins>
   </build>

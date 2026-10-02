@@ -20,7 +20,10 @@ public class RabbitConfig {
       @Value("${spring.application.name:pricing-service}") String appName,
       @Value("${APP_INDEX:}") String appIndex) {
     return connectionFactory -> {
-      if ("8083".equals(appIndex) || "8093".equals(appIndex) || "8103".equals(appIndex) || "2".equals(appIndex)) {
+      if ("8083".equals(appIndex)
+          || "8093".equals(appIndex)
+          || "8103".equals(appIndex)
+          || "2".equals(appIndex)) {
         return appName + "-2";
       }
       return appName + "-1";

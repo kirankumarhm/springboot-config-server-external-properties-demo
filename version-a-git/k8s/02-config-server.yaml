@@ -46,6 +46,10 @@ spec:
     metadata:
       labels:
         app: config-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9888"
+        prometheus.io/path: "/actuator/prometheus"
     spec:
       serviceAccountName: config-server
       # Long enough for in-flight requests to drain under the graceful shutdown configured in

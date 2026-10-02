@@ -1,0 +1,107 @@
+# Production Zero-Trust Network Policies for Version A (Git Backend).
+# Enforces least-privilege traffic flow between microservices, infrastructure, and management.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: config-demo
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+# RabbitMQ: accept AMQP from config-server, inventory-service, and pricing-service only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-rabbitmq
+  namespace: config-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: rabbitmq
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: config-server
+        - podSelector:
+            matchLabels:
+              app: inventory-service
+        - podSelector:
+            matchLabels:
+              app: pricing-service
+      ports:
+        - protocol: TCP
+          port: 5672
+    # Management UI/API access (e.g. debugging, port-forwards, health checks)
+    - ports:
+        - protocol: TCP
+          port: 15672
+---
+# Config Server: accept HTTP config requests on 8888 from clients; management on 9888.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-config-server
+  namespace: config-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: config-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: inventory-service
+        - podSelector:
+            matchLabels:
+              app: pricing-service
+      ports:
+        - protocol: TCP
+          port: 8888
+    - ports:
+        - protocol: TCP
+          port: 9888
+---
+# Inventory Service: accept HTTP traffic on 8081 and management on 9081.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-inventory-service
+  namespace: config-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: inventory-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8081
+        - protocol: TCP
+          port: 9081
+---
+# Pricing Service: accept HTTP traffic on 8082 and management on 9082.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-pricing-service
+  namespace: config-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: pricing-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8082
+        - protocol: TCP
+          port: 9082

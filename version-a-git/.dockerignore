@@ -1,0 +1,43 @@
+# Build output
+target/
+!target/*.jar
+target/*.jar.original
+target/generated-sources/
+target/generated-test-sources/
+target/maven-status/
+target/surefire-reports/
+target/failsafe-reports/
+target/site/
+target/checkstyle*
+target/spotbugs*
+target/classes/
+target/test-classes/
+
+# Secrets and keys
+secrets/
+*.p12
+*.jks
+*.keystore
+*.pem
+*.key
+
+# Git and OS metadata
+.git
+.gitignore
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Local k8s and scripts
+*.kubeconfig
+kubeconfig
+k8s/
+scripts/
+docker/
+*.md
+logs/
+*.log

@@ -163,3 +163,35 @@ jobs:
       - name: OWASP dependency-check
         working-directory: ${{ matrix.version }}
         run: mvn -B --no-transfer-progress -Psecurity verify -DskipTests
+
+  # Validates Kubernetes manifests for all versions on every PR and push.
+  k8s-validate:
+    name: validate k8s manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+      - name: Dry-run validate manifests against Kubernetes client schema
+        run: |
+          for v in version-a-git version-b-jdbc version-c-s3; do
+            echo "==> Validating $v manifests"
+            kubectl apply --dry-run=client -f "$v/k8s/"
+          done
+
+  # Verifies that no private keys, keystores, or kubeconfigs are ever committed to git.
+  secret-audit:
+    name: secret leak audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check git index for sensitive files
+        run: |
+          if git ls-files | grep -E '\.(p12|jks|keystore|pem|key|kubeconfig)$'; then
+            echo "ERROR: Secret or credentials file found committed in Git index!" >&2
+            exit 1
+          fi
+          echo "Secret audit passed: no private keystores or kubeconfigs in repository index."
+

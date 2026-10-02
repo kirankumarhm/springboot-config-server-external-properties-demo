@@ -1,0 +1,54 @@
+# Build output and dependencies
+**/target/
+!**/target/*.jar
+**/target/*.jar.original
+**/target/generated-sources/
+**/target/generated-test-sources/
+**/target/maven-status/
+**/target/surefire-reports/
+**/target/failsafe-reports/
+**/target/site/
+**/target/checkstyle*
+**/target/spotbugs*
+**/target/classes/
+**/target/test-classes/
+
+# Secrets and keys - NEVER bake into Docker images
+**/secrets/
+**/*.p12
+**/*.jks
+**/*.keystore
+**/*.pem
+**/*.key
+
+# Git and OS metadata
+**/.git
+**/.gitignore
+**/.DS_Store
+Thumbs.db
+
+# IDE and tooling
+**/.idea/
+**/.vscode/
+**/*.iml
+**/.settings/
+**/.project
+**/.classpath
+**/.factorypath
+**/.checkstyle
+**/.spotbugs
+
+# Kubernetes and deployment files
+**/*.kubeconfig
+**/kubeconfig
+**/k8s/
+**/docker/
+**/scripts/
+
+# Documentation and markdown
+**/*.md
+**/LICENSE
+
+# Logs
+**/logs/
+**/*.log

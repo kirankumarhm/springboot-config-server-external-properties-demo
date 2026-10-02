@@ -37,6 +37,10 @@ spec:
     metadata:
       labels:
         app: inventory-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9081"
+        prometheus.io/path: "/actuator/prometheus"
     spec:
       automountServiceAccountToken: false
       # Kubernetes injects legacy Docker-link environment variables for every Service in the
@@ -137,6 +141,10 @@ spec:
     metadata:
       labels:
         app: pricing-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9082"
+        prometheus.io/path: "/actuator/prometheus"
     spec:
       automountServiceAccountToken: false
       # Kubernetes injects legacy Docker-link environment variables for every Service in the

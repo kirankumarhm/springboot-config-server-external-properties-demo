@@ -82,9 +82,7 @@ Reach the services from the host with:
   kubectl -n config-demo port-forward svc/config-server 9888:9888
 
 Change configuration (this is the whole point - no restart, no redeploy):
-  kubectl -n config-demo exec statefulset/postgres -- \
-    psql -U config_admin -d configdb -c \
-    "UPDATE properties SET \"value\"='750' WHERE application='inventory-service' AND \"key\"='inventory.max-order-quantity';"
+  aws s3 cp seed-config/application.yml s3://acme-platform-config/main/application.yml
 
 Tear down (tiered - run with --help to see the options):
   ./k8s/teardown.sh                            # namespace only; next deploy is fast
