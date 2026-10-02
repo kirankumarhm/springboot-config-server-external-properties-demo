@@ -354,11 +354,21 @@ and serves the plaintext, so `{cipher}` is transparent to the application.
 > Note that `config-repo/` currently contains **no `{cipher}` values**, so nothing in the default
 > setup exercises decryption. The keystore is still mandatory, for the startup reason above.
 
-### Step 2: Build Application JARs
-The Dockerfiles are **runtime-only** (`eclipse-temurin:21-jre-alpine`, `COPY target/<service>-1.0.0.jar`), so the jars must exist on the host *before* the images are built:
+### Step 2: Build Application JARs & Container Images
+
+You can build the applications using either standard Maven packaging with Docker Compose, or containerize directly using **Google Jib 3.5.2**:
+
 ```bash
 # from: version-a-git/
+
+# Option A: Build host JARs for Docker Compose
 mvn -Pfast package
+
+# Option B: Build container images directly into local Docker daemon with Google Jib 3.5.2
+mvn compile jib:dockerBuild
+
+# Option C: Build container images as standalone tarballs without a Docker daemon
+mvn compile jib:buildTar
 ```
 *(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar. Add `-o` if Maven stalls checking the network for dependencies it already has.)*
 
@@ -691,8 +701,19 @@ Every build is continuously analyzed by enterprise security and code quality gat
 # Run complete verification (Checkstyle, Spotless, SpotBugs + FindSecBugs, ArchUnit, JaCoCo)
 mvn clean verify
 
+# Fast build (skips QA gates to quickly create JARs)
+mvn -Pfast package
+
 # Run dedicated OWASP dependency vulnerability check (SCA)
 mvn -Psecurity verify
+
+# Format all Java files with google-java-format
+mvn spotless:apply
+
+# Build container images via Google Jib 3.5.2
+mvn compile jib:dockerBuild                              # Build to local Docker daemon
+mvn compile jib:buildTar                                 # Build standalone tarball
+mvn compile jib:build -Dimage=<registry>/<image>:<tag>   # Push directly to container registry
 ```
 
 | Quality Gate | Tool & Version | Inspection Scope |
@@ -985,6 +1006,14 @@ kubectl -n config-demo rollout status deployment/config-server --timeout=300s
 kubectl apply -f k8s/03-clients.yaml
 kubectl -n config-demo rollout status deployment/inventory-service --timeout=300s
 kubectl -n config-demo rollout status deployment/pricing-service  --timeout=300s
+```
+
+**Apply Zero-Trust Network Policies and Autoscaling (HPA):**
+
+```bash
+# from: version-a-git/
+kubectl apply -f k8s/04-network-policies.yaml
+kubectl apply -f k8s/05-hpa.yaml
 ```
 
 Now look at everything:

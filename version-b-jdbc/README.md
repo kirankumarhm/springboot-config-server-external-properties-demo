@@ -377,11 +377,21 @@ the notification trigger, so the new value propagates immediately (section 7).
 > Note that the seeded configuration contains **no `{cipher}` values**, so nothing in the default
 > setup exercises decryption. The keystore is still mandatory, for the startup reason above.
 
-### Step 2: Build Application JARs
-The Dockerfiles are **runtime-only** (`eclipse-temurin:21-jre-alpine`, `COPY target/<service>-1.0.0.jar`), so the jars must exist on the host *before* the images are built:
+### Step 2: Build Application JARs & Container Images
+
+You can build the applications using either standard Maven packaging with Docker Compose, or containerize directly using **Google Jib 3.5.2**:
+
 ```bash
 # from: version-b-jdbc/
+
+# Option A: Build host JARs for Docker Compose
 mvn -Pfast package
+
+# Option B: Build container images directly into local Docker daemon with Google Jib 3.5.2
+mvn compile jib:dockerBuild
+
+# Option C: Build container images as standalone tarballs without a Docker daemon
+mvn compile jib:buildTar
 ```
 *(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar. Add `-o` if Maven stalls checking the network for dependencies it already has.)*
 
@@ -726,6 +736,8 @@ waits for each rollout, and finally runs `./k8s/verify-in-cluster.sh`.
 | `01-dependencies.yaml` | PostgreSQL **StatefulSet** and RabbitMQ Deployment |
 | `02-config-server.yaml` | Config Server (2 replicas) + Service |
 | `03-clients.yaml` | `inventory-service` and `pricing-service` (2 replicas) + Services |
+| `04-network-policies.yaml` | Zero-Trust default-deny ingress + least-privilege pod-to-pod network policies |
+| `05-hpa.yaml` | Horizontal Pod Autoscalers targeting CPU 75% & Memory 80% (min 2, max 5 replicas) |
 
 The keystore is **not** in any manifest - it is a real secret (and `secrets/` is gitignored), so
 it is created from the local file. **This is mandatory:** `k8s/02-config-server.yaml` mounts a
@@ -890,11 +902,22 @@ Every build is continuously analyzed by enterprise security and code quality gat
 
 ```bash
 # from: version-b-jdbc/
-# Run complete verification (Checkstyle, Spotless, SpotBugs + FindSecBugs, ArchUnit, JaCoCo)
+# Run complete verification (Checkstyle, Spotless, SpotBugs + FindSecBugs, ArchUnit, JaCoCo, Testcontainers ITs)
 mvn clean verify
+
+# Fast build (skips QA gates to quickly create JARs)
+mvn -Pfast package
 
 # Run dedicated OWASP dependency vulnerability check (SCA)
 mvn -Psecurity verify
+
+# Format all Java files with google-java-format
+mvn spotless:apply
+
+# Build container images via Google Jib 3.5.2
+mvn compile jib:dockerBuild                              # Build to local Docker daemon
+mvn compile jib:buildTar                                 # Build standalone tarball
+mvn compile jib:build -Dimage=<registry>/<image>:<tag>   # Push directly to container registry
 ```
 
 | Quality Gate | Tool & Version | Inspection Scope |

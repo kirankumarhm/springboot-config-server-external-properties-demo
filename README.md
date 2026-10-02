@@ -91,19 +91,21 @@ prerequisite outstanding.
 | Concern | Status |
 |---|---|
 | Liveness / readiness / **startup** probes | ✅ All three, on the management port |
-| Manifests | ✅ Namespace, ConfigMap, Secret, Deployments, StatefulSet, Services, NetworkPolicy, PDB, ServiceAccount |
+| Manifests | ✅ Namespace, ConfigMap, Secret, Deployments, StatefulSet, Services, NetworkPolicy, PDB, ServiceAccount, HPA |
 | Secrets | ✅ Kubernetes `Secret`; the encryption keystore is created from file and never committed |
 | Graceful shutdown | ✅ `server.shutdown: graceful` + `terminationGracePeriodSeconds: 45` |
 | Management port separation | ✅ Actuator on 9888; `/actuator/env` returns **401** unauthenticated there |
 | Bus instance id per pod | ✅ `APP_INDEX` from `fieldRef: metadata.name` |
 | Rolling updates | ✅ `maxUnavailable: 0`, PodDisruptionBudget `minAvailable: 1` |
-| Hardened pods | ✅ non-root, `readOnlyRootFilesystem`, all capabilities dropped, seccomp `RuntimeDefault`, no API token |
+| Hardened pods | ✅ non-root (`1000:1000`), `readOnlyRootFilesystem`, all capabilities dropped, seccomp `RuntimeDefault`, no API token |
 | Multi-replica Config Server | ✅ 2 replicas (safe for JDBC: no shared filesystem) |
-| CI | ✅ GitHub Actions: build matrix, E2E matrix, scheduled CVE scan |
+| NetworkPolicy | ✅ Zero-Trust `default-deny-ingress` & least-privilege pod communication (`k8s/04-network-policies.yaml`) |
+| HPA | ✅ Horizontal Pod Autoscalers targeting CPU 75% & Memory 80% (`k8s/05-hpa.yaml`) |
+| Container Image Build | ✅ Google Jib 3.5.2 (`mvn compile jib:dockerBuild` / `jib:buildTar` / `jib:build`) + multi-stage Dockerfiles |
+| CI | ✅ GitHub Actions: build matrix, E2E matrix, k8s-validate, secret-audit, scheduled CVE scan |
 | **Version A on Kubernetes** | ⚠️ Needs a **remote** Git URI — `file://` cannot work in a cluster (§14.2) |
 | **Version C on Kubernetes** | ✅ **Verified on Floci EKS** (real k3s control plane), 12 in-cluster checks |
 | Broker HA / persistence | ⚠️ Single RabbitMQ pod, no persistence. Use a managed broker or the Cluster Operator. |
-| HPA | ❌ Not included; needs metrics-server and a meaningful scaling signal |
 
 Before porting this, §14.5 is still worth reading: on Kubernetes you may not want Config Server
 *plus* a broker at all.
@@ -602,10 +604,14 @@ version-X/
 
 `docker/compose.yaml` stays at the version level deliberately: it wires *several* services plus
 RabbitMQ into one runnable stack, which is orchestration rather than something any single service
-can own. Each service still builds its own image independently:
+can own. Each service can build its container image independently via **Google Jib 3.5.2** (daemonless, fast layer caching) or traditional `docker build`:
 
 ```bash
-cd version-a-git/inventory-service && mvn package && docker build -t inventory-service .
+# Option A: Build image using Google Jib (recommended - daemonless or directly to Docker daemon)
+cd version-a-git/inventory-service && mvn compile jib:dockerBuild
+
+# Option B: Build host JAR then build with Dockerfile
+cd version-a-git/inventory-service && mvn -Pfast package && docker build -t inventory-service .
 ```
 
 Version-specific extras:
@@ -990,7 +996,26 @@ Verified by the suites: the Environment API returns **401** unauthenticated in a
 
 Each version has `scripts/e2e-test.sh`, run against the live Docker stack.
 
-### Automated build (`mvn verify`)
+### Automated build & Maven workflow
+
+```bash
+# Full verification (unit/integration tests, Spotless, Checkstyle, SpotBugs, JaCoCo, ArchUnit)
+mvn clean verify
+
+# Fast developer build (skips slow QA gates to quickly produce runnable JARs)
+mvn -Pfast package
+
+# Security audit (OWASP Dependency-Check against NVD CVEs)
+mvn -Psecurity verify
+
+# Code formatting (auto-formats Java code to Google Java Format standard)
+mvn spotless:apply
+
+# Container builds with Google Jib 3.5.2 (OCI/Docker compliant, non-root 1000:1000)
+mvn compile jib:dockerBuild                              # Build directly into local Docker daemon
+mvn compile jib:buildTar                                 # Build standalone tarball (target/jib-image.tar)
+mvn compile jib:build -Dimage=<registry>/<image>:<tag>   # Daemonless build & push to container registry
+```
 
 | Version | Unit + slice | Integration | Gates |
 |---|---|---|---|
@@ -1112,17 +1137,17 @@ becomes mandatory so pushes are authenticated by signature.
 
 | Concern | State |
 |---|---|
-| Manifests | **Done** — `k8s/` per version: namespace, ConfigMaps, Secret, StatefulSet, Deployments, Services, NetworkPolicy, PDB, ServiceAccount |
+| Manifests | **Done** — `k8s/` per version: namespace, ConfigMaps, Secret, StatefulSet, Deployments, Services, NetworkPolicy, PDB, ServiceAccount, HPA |
 | Secrets | **Done** — a `Secret` for credentials; the keystore Secret is created from the local `.p12` by the deploy script and never committed |
 | Graceful shutdown | **Done** — `server.shutdown: graceful`, `spring.lifecycle.timeout-per-shutdown-phase: 20s`, `terminationGracePeriodSeconds: 45` |
 | Management port split | **Done** — actuator on 9888; verified `401` on `/actuator/env` unauthenticated, health open for probes |
 | Resource requests/limits | **Done** on every pod; `MaxRAMPercentage=75` sizes the heap from the limit |
 | Startup probes | **Done** — a slow start can no longer trip liveness and cause a crash loop |
-| Pod hardening | **Done** — non-root, read-only root filesystem, capabilities dropped, seccomp, no service-account token |
-| NetworkPolicy | **Done** (version B) — only the Config Server may reach PostgreSQL |
-| RabbitMQ HA / persistence | **Still missing** — one pod, no persistent volume. Use a managed broker or the Cluster Operator. |
-| Image build | **Still host-built.** Fine for CI (which publishes the jar) but there is no in-image builder stage, so `docker build` alone is not reproducible. |
-| HPA | **Still missing** — needs metrics-server plus a scaling signal that actually correlates with load. |
+| Pod hardening | **Done** — non-root (`1000:1000`), read-only root filesystem, capabilities dropped, seccomp, no service-account token |
+| NetworkPolicy | **Done** (all versions) — `k8s/04-network-policies.yaml` with Zero-Trust default-deny ingress and least-privilege pod rules |
+| Image build | **Done** — **Google Jib 3.5.2** (`mvn compile jib:dockerBuild` / `jib:buildTar` / `jib:build`) + multi-stage Dockerfiles |
+| HPA | **Done** (all versions) — `k8s/05-hpa.yaml` targeting CPU 75% and Memory 80% with min 2, max 5 replicas |
+| RabbitMQ HA / persistence | **Still missing** — single RabbitMQ broker pod. In production, use a managed broker or the RabbitMQ Cluster Operator. |
 
 Already fine: liveness/readiness probes work, containers run non-root, config is fully
 env-var driven, clients hold no local state.
