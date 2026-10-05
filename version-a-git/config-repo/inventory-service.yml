@@ -5,4 +5,4 @@ inventory:
   # the client keeps its last-known-good snapshot instead of adopting it.
   max-order-quantity: 400
   express-shipping-enabled: true
-  low-stock-threshold: 25
+  low-stock-threshold: 15
