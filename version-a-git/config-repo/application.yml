@@ -3,4 +3,4 @@
 demo:
   shared:
     banner-message: "Configured centrally via Spring Cloud Config - Git backend"
-    environment-label: "k8s-verified-1791205509"
+    environment-label: "hello-from-kubernetes"
