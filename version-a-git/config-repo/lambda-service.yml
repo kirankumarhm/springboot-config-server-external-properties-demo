@@ -1,0 +1,6 @@
+# Read by lambda-service (an AWS Lambda function running in Floci). It calls the Config
+# Server's HTTP API on every invocation.
+lambda:
+  greeting: "Hello from AWS Lambda"
+  feature-enabled: true
+  max-items: 10

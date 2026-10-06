@@ -10,16 +10,18 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.header.writers.ReferrerPolicyHeaderWriter;
 
 /**
- * Production-grade HTTP security configuration for the stateless microservice.
+ * HTTP security for the service.
  *
- * <p>Enforces strict security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options,
- * Permissions-Policy), disables session creation and CSRF (safe for stateless REST APIs), and
- * permits public access to business endpoints, OpenAPI/Swagger docs, and health probes.
+ * <p>Stateless, with strict security headers on every response. CSRF protection is disabled because
+ * the API is read-only, cookie-less and session-less. The only paths reachable are the business
+ * endpoint, the OpenAPI/Swagger documentation and the health checks used by Docker and Kubernetes;
+ * anything else is denied. This chain also guards the separate management port.
  */
 @Configuration
 @EnableWebSecurity
 public class SecurityConfig {
 
+  // Swagger UI needs inline scripts and styles; everything else is same-origin only.
   private static final String CSP_POLICY =
       "default-src 'self'; script-src 'self' 'unsafe-inline'; "
           + "style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none';";
@@ -41,25 +43,19 @@ public class SecurityConfig {
                                 ReferrerPolicyHeaderWriter.ReferrerPolicy
                                     .STRICT_ORIGIN_WHEN_CROSS_ORIGIN))
                     .httpStrictTransportSecurity(
-                        hsts -> hsts.includeSubDomains(true).maxAgeInSeconds(31536000)))
+                        hsts -> hsts.includeSubDomains(true).maxAgeInSeconds(31_536_000)))
         .authorizeHttpRequests(
             auth ->
                 auth.requestMatchers(
-                        "/api/v1/**",
+                        "/api/v1/pricing/**",
                         "/v3/api-docs/**",
                         "/swagger-ui/**",
                         "/swagger-ui.html",
-                        "/actuator/health/**",
-                        "/actuator/info",
-                        "/actuator/prometheus",
-                        "/actuator/metrics/**",
-                        "/actuator/busrefresh",
-                        "/actuator/refresh",
-                        "/actuator/env")
+                        "/actuator/health",
+                        "/actuator/health/**")
                     .permitAll()
                     .anyRequest()
-                    .authenticated());
-
+                    .denyAll());
     return http.build();
   }
 }

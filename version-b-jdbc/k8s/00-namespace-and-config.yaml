@@ -25,7 +25,9 @@ metadata:
   name: client-env
   namespace: config-demo
 data:
+  # Spring Boot clients read CONFIG_SERVER_URI; the Node.js and Go clients read CONFIG_SERVER_URL.
   CONFIG_SERVER_URI: "http://config-server:8888"
+  CONFIG_SERVER_URL: "http://config-server:8888"
   RABBITMQ_HOST: "rabbitmq"
   RABBITMQ_PORT: "5672"
 ---

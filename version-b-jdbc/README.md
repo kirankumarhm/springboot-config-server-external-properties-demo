@@ -3,9 +3,24 @@
 > **Storage Backend:** PostgreSQL 17.6 relational database (`configdb`, tables `properties`, `properties_history`, `config_revision`)  
 > **Change Detection:** statement-level trigger &rarr; `pg_notify('config_changed', ...)` &rarr; `LISTEN` thread &rarr; Spring Cloud Bus (RabbitMQ), with a 15s revision poller as the safety net  
 > **Encryption:** Asymmetric RSA 4096-bit Keystore (PKCS12)  
-> **Default Ports (host):** Config Server `8898` (Actuator `9899`), PostgreSQL `5432`, Inventory Service `8091` (Actuator `9091`), Pricing Service `8092` (Actuator `9092`), Pricing Service 2 `8093` (Actuator `9093`), RabbitMQ `5673` / UI `15673`
+> **Default Ports (host):** Config Server `8898` (Actuator `9899`), PostgreSQL `5433`, inventory-service `8091` (Actuator `9091`), pricing-service `8092` (Actuator `9092`), node-service `8094`, go-service `8095`, RabbitMQ `5673` / UI `15673`, Floci (Lambda) `4566`
 
 ---
+
+## The services in this version
+
+One Config Server, five clients in three languages. Every client has **one API** that returns
+its own configuration, and every client picks up a change **without a restart**.
+
+| Service | Language | Its API | How it hears about a change | README |
+|---|---|---|---|---|
+| inventory-service | Spring Boot | `GET :8091/api/v1/inventory/config` | Spring Cloud Bus (RabbitMQ) | [inventory-service/](inventory-service/README.md) |
+| pricing-service | Spring Boot | `GET :8092/api/v1/pricing/config` | Spring Cloud Bus (RabbitMQ) | [pricing-service/](pricing-service/README.md) |
+| node-service | Node.js 22 | `GET :8094/api/v1/node/config` | Spring Cloud Bus, via its own small RabbitMQ listener | [node-service/](node-service/README.md) |
+| go-service | Go 1.23 | `GET :8095/api/v1/go/config` | Spring Cloud Bus, via its own small RabbitMQ listener | [go-service/](go-service/README.md) |
+| lambda-service | AWS Lambda (Node.js 22) in Floci | `GET /api/v1/lambda/config` through API Gateway | none needed - it reads the Config Server on every call | [lambda-service/](lambda-service/README.md) |
+
+Each lives in its own directory, builds on its own and shares no code with the others.
 
 ## 1. Architectural Overview
 
@@ -17,7 +32,7 @@ The triggers are **statement-level, not row-level** (`REFERENCING NEW TABLE`, Po
 
 ```mermaid
 graph TD
-    subgraph Database["PostgreSQL 17.6 (:5432)"]
+    subgraph Database["PostgreSQL 17.6 (host :5433)"]
         Table["properties table<br/>(application, profile, label, key, value)"]
         Trigger["AFTER INSERT/UPDATE/DELETE<br/>FOR EACH STATEMENT"]
         PGNotify["pg_notify('config_changed', json)"]
@@ -39,20 +54,22 @@ graph TD
         RabbitMQ["RabbitMQ Broker<br/>(:5673)"]
     end
 
-    subgraph Microservices["Client Applications"]
-        Inv["Inventory Service<br/>(:8091)"]
-        Prc1["Pricing Service (Inst 1)<br/>(:8092)"]
-        Prc2["Pricing Service (Inst 2)<br/>(:8093)"]
+    subgraph Clients["Client services"]
+        Inv["inventory-service<br/>Spring Boot (:8091)"]
+        Prc["pricing-service<br/>Spring Boot (:8092)"]
+        Node["node-service<br/>Node.js (:8094)"]
+        Go["go-service<br/>Go (:8095)"]
+    end
+
+    subgraph Floci["Floci (local AWS)"]
+        Lambda["lambda-service<br/>Lambda + API Gateway"]
     end
 
     Detector -- "Broadcasts Event" --> RabbitMQ
     Poller -- "Broadcasts missed Event" --> RabbitMQ
-    RabbitMQ -- "Delivers refresh" --> Inv
-    RabbitMQ -- "Delivers refresh" --> Prc1
-    RabbitMQ -- "Delivers refresh" --> Prc2
-    Inv -- "Fetches new config" --> CS
-    Prc1 -- "Fetches new config" --> CS
-    Prc2 -- "Fetches new config" --> CS
+    RabbitMQ -- "Delivers refresh" --> Inv & Prc & Node & Go
+    Inv & Prc & Node & Go -- "Fetch new config" --> CS
+    Lambda -- "Fetches on every call" --> CS
 ```
 
 ---
@@ -62,7 +79,7 @@ graph TD
 ```mermaid
 graph LR
     subgraph PostgreSQL["PostgreSQL Database"]
-        Flyway["Flyway Migrations (V1, V2)"]
+        Flyway["Flyway Migrations (V1, V2, V3)"]
         PropsTable["properties table"]
         HistTable["properties_history<br/>(audit trail, replaces git log)"]
         RevTable["config_revision<br/>(monotonic revision per app)"]
@@ -79,11 +96,16 @@ graph LR
         EncController["/encrypt & /decrypt"]
     end
 
-    subgraph Clients["Client Microservices"]
+    subgraph Clients["Spring Boot clients"]
         ConfigDataLoader["ConfigDataLoader (Startup)"]
         Rebinder["ConfigurationPropertiesRebinder"]
-        Provider["SettingsProvider (Validation & Snapshot)"]
+        Provider["PropertiesValidator"]
         BusListener["Spring Cloud Bus Listener"]
+    end
+
+    subgraph Polyglot["Node.js / Go clients"]
+        Lib["cloud-config-client / cloudconfigclient"]
+        OwnBus["Bus listener (amqplib / amqp091-go)"]
     end
 
     PropsTable --> NotifyFunc
@@ -96,6 +118,7 @@ graph LR
     RevPoller --> Publisher
     ListenerThread --> Health
     Publisher --> BusListener
+    Publisher --> OwnBus --> Lib --> JdbcRepo
     BusListener --> Rebinder
     Rebinder --> Provider
     ConfigDataLoader --> JdbcRepo
@@ -113,7 +136,7 @@ sequenceDiagram
     participant PG as PostgreSQL Database
     participant CS as Config Server (:8898)
     participant RMQ as RabbitMQ (:5673)
-    participant Client as Pricing Service (:8092 & :8093)
+    participant Client as pricing-service (:8092)
 
     Admin->>PG: UPDATE properties SET "value"='25.0' WHERE "key"='pricing.discount-percentage';
     PG->>PG: Statement trigger fn_notify_config_change() fires, bumps config_revision
@@ -125,9 +148,12 @@ sequenceDiagram
     CS->>PG: SELECT key, value FROM properties WHERE application IN ('application', 'pricing-service')
     PG-->>CS: Return current SQL rows
     CS-->>Client: Return updated property sources
-    Client->>Client: Validate and apply snapshot v1 -> v2
-    Client->>Client: Audit event recorded (Outcome: APPLIED)
+    Client->>Client: Re-bind PricingProperties in place (an invalid value is logged as ERROR)
+    Client->>Client: GET /api/v1/pricing/config now returns the new values
 ```
+
+node-service and go-service follow the same steps with their own bus listener; lambda-service
+reads the Config Server on every call, so it needs no broadcast at all.
 
 ---
 
@@ -140,23 +166,24 @@ Think of **RabbitMQ** as a central **broadcast megaphone**:
 
 ```mermaid
 graph TD
-    DB["PostgreSQL 17.6 (:5432)<br/>(SQL UPDATE & pg_notify)"]
+    DB["PostgreSQL 17.6<br/>(SQL UPDATE & pg_notify)"]
     CS["Config Server (:8898)<br/>(LISTEN thread receives notification)"]
     Ex["RabbitMQ Exchange: springCloudBus<br/>(Topic Exchange, host :5673)"]
     Q1["Queue: inventory-service"]
-    Q2["Queue: pricing-service-1"]
-    Q3["Queue: pricing-service-2"]
-    Inv["Inventory Service (:8091)<br/>(Ignores, not for me)"]
-    Prc1["Pricing Service 1 (:8092)<br/>(Matches! Pulls new config)"]
-    Prc2["Pricing Service 2 (:8093)<br/>(Matches! Pulls new config)"]
+    Q2["Queue: pricing-service"]
+    Q3["Queue: node-service"]
+    Q4["Queue: go-service"]
+    Inv["inventory-service (:8091)<br/>(Ignores, not for me)"]
+    Prc["pricing-service (:8092)<br/>(Matches! Pulls new config)"]
+    Node["node-service (:8094)<br/>(Ignores, not for me)"]
+    Go["go-service (:8095)<br/>(Ignores, not for me)"]
 
-    DB -- "1. pg_notify" --> CS
-    CS -- "2. Publishes 1 message:<br/>'pricing-service:**'" --> Ex
+    CS -- "Publishes 1 message:<br/>'pricing-service:**'" --> Ex
     Ex --> Q1 --> Inv
-    Ex --> Q2 --> Prc1
-    Ex --> Q3 --> Prc2
-    Prc1 -- "3. Pulls updated SQL properties" --> CS
-    Prc2 -- "3. Pulls updated SQL properties" --> CS
+    Ex --> Q2 --> Prc
+    Ex --> Q3 --> Node
+    Ex --> Q4 --> Go
+    Prc -- "Pulls updated config" --> CS
 ```
 
 ### Accessing the RabbitMQ Web Management Dashboard
@@ -169,9 +196,8 @@ RabbitMQ comes with an interactive web dashboard running out of the box:
 
 #### What to observe in the RabbitMQ UI:
 1. **Connections Tab ("The Phone Lines")**:
-   - You will see 4 active AMQP connections.
-   - **Service Name Identification**: Thanks to the `ConnectionNameStrategy` bean (`RabbitConfig.java`), connections display human-readable names (`config-server:8898`, `inventory-service:8091`, `pricing-service:8092`, `pricing-service:8083`).
-   - *Why the last one is `8083` and not `8093`*: the name is built from `${APP_INDEX:${SERVER_PORT:...}}`, which is the port **inside** the container. Compose sets `APP_INDEX: 8083` for the second pricing instance, while `8093` is only the host-side published port.
+   - You will see 5 active AMQP connections: the Config Server and the four clients.
+   - **Service Name Identification**: each connection carries a readable name - the Spring services set it with `spring.cloud.stream.rabbit.binder.connection-name-prefix` (e.g. `inventory-service:8091#0`), and node-service / go-service use their bus id (e.g. `node-service:8094:3f2a...`).
    - *Tip*: Click the `+/-` icon on the top-right of the table to enable the **Client-provided name** column, or click any connection to inspect its details.
 2. **Exchanges Tab ("The Router")**:
    - Click on **`springCloudBus`** (`topic` type) to see the broadcast bindings to each microservice's queue (`#`).
@@ -236,7 +262,9 @@ spring:
     bootstrap-servers: localhost:9092
 ```
 
-All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refresh mechanics remain **100% identical**.
+The Spring Boot code needs no change. **node-service and go-service do**: they talk to RabbitMQ
+directly (`amqplib` / `amqp091-go`), so with Kafka their bus listener would have to be rewritten
+on a Kafka client. lambda-service is unaffected - it never uses the bus.
 
 ---
 
@@ -252,7 +280,8 @@ springboot-external-properties-demo-II/     <- repository root
 ├── version-a-git/
 ├── version-b-jdbc/                         <- run everything from HERE
 │   ├── config-server/                      <- also holds db/migration/*.sql (the schema)
-│   ├── inventory-service/  pricing-service/
+│   ├── inventory-service/  pricing-service/   <- Spring Boot
+│   ├── node-service/   go-service/   lambda-service/   <- Node.js, Go, AWS Lambda
 │   ├── docker/compose.yaml                 <- referenced as docker/compose.yaml, so cwd matters
 │   ├── k8s/                                <- deploy / verify / teardown scripts
 │   ├── scripts/                            <- keystore, e2e test, docker teardown
@@ -280,6 +309,9 @@ and are inserted by Flyway on first startup.
 - **`jq`** and **`python3`** - used by the curl examples and by `scripts/e2e-test.sh`
 - **`psql`** is *not* needed on the host: every SQL example runs it inside the container with
   `docker exec`
+- **Node.js 22** and **npm** - only to test node-service / lambda-service, or run them without Docker
+- **Go 1.23** - only to test go-service or run it without Docker (Docker builds it for you otherwise)
+- **Floci** (`floci start`) and the **AWS CLI** - for lambda-service
 
 Check all of them in one go:
 
@@ -398,27 +430,57 @@ mvn compile jib:buildTar
 ### Step 3: Run with Docker Compose
 ```bash
 # from: version-b-jdbc/
-docker compose -f docker/compose.yaml build --no-cache
-docker compose -f docker/compose.yaml up -d
+docker compose -f docker/compose.yaml up -d --build
+```
+
+> **PostgreSQL is published on host port `5433`, not `5432`.** A PostgreSQL installed directly on
+> your machine (very common) already owns 5432, and Docker would refuse to start the container with
+> `bind: address already in use`. Inside Docker the Config Server still uses `postgres:5432`.
+> Choose another host port with `POSTGRES_HOST_PORT=5434 docker compose ... up -d`.
+
+Compose builds node-service and go-service itself (they download their dependencies while
+building). **Behind a TLS-inspecting corporate proxy** such as Zscaler that fails with
+`x509: certificate signed by unknown authority`; export the proxy's root certificate first:
+`export EXTRA_CA_CERT="$(cat proxy-root.pem)"` (on macOS:
+`security find-certificate -a -c Zscaler -p /Library/Keychains/System.keychain`).
+
+Then deploy lambda-service to Floci (it is not a container in this file):
+
+```bash
+# from: version-b-jdbc/
+floci start                                  # if it is not running yet
+./lambda-service/scripts/deploy-floci.sh     # role, function and API Gateway route
+./lambda-service/scripts/invoke-floci.sh     # -> {"greeting":"Hello from AWS Lambda",...}
 ```
 
 ### Step 4: Verify Container Status
 ```bash
 # from: version-b-jdbc/
-docker ps
+docker compose -f docker/compose.yaml ps
 ```
-All 6 containers will report `(healthy)`:
+All 7 containers will report `(healthy)`:
 
 | Container | Role | Host ports | Image tag built by Compose |
 |---|---|---|---|
-| `cfg-jdbc-postgres` | PostgreSQL 17.6 | `5432` | `postgres:17.6` (pulled) |
+| `cfg-jdbc-postgres` | PostgreSQL 17.6 | `5433` | `postgres:17.6` (pulled) |
 | `cfg-jdbc-server` | Config Server | `8898`, `9899` | `config-jdbc-demo-config-server:latest` |
-| `cfg-jdbc-inventory` | Inventory Service | `8091`, `9091` | `config-jdbc-demo-inventory-service:latest` |
-| `cfg-jdbc-pricing` | Pricing Service 1 | `8092`, `9092` | `config-jdbc-demo-pricing-service:latest` |
-| `cfg-jdbc-pricing-2` | Pricing Service 2 | `8093`, `9093` | `config-jdbc-demo-pricing-service:latest` |
+| `cfg-jdbc-inventory` | inventory-service | `8091`, `9091` | `config-jdbc-demo-inventory-service:latest` |
+| `cfg-jdbc-pricing` | pricing-service | `8092`, `9092` | `config-jdbc-demo-pricing-service:latest` |
+| `cfg-jdbc-node` | node-service | `8094` | `config-jdbc-demo-node-service:latest` |
+| `cfg-jdbc-go` | go-service | `8095` | `config-jdbc-demo-go-service:latest` |
 | `cfg-jdbc-rabbitmq` | RabbitMQ broker | `5673`, `15673` | `rabbitmq:4-management` (pulled) |
 
 The tags come from `name: config-jdbc-demo` on line 1 of `docker/compose.yaml` (`<project>-<service>:latest`). The Kubernetes manifests in `k8s/` reference these exact strings.
+
+Ask each client for its configuration:
+
+```bash
+# from: anywhere (these are just HTTP calls)
+curl -s http://localhost:8091/api/v1/inventory/config
+curl -s http://localhost:8092/api/v1/pricing/config
+curl -s http://localhost:8094/api/v1/node/config
+curl -s http://localhost:8095/api/v1/go/config
+```
 
 ### Step 5: Shut Down
 
@@ -444,7 +506,7 @@ dump fails.
 ./scripts/teardown-docker.sh --stop         # put it away and KEEP the database
 ./scripts/teardown-docker.sh --no-dump      # skip the dump (only sensible with --stop)
 ./scripts/teardown-docker.sh --volumes      # also remove anonymous volumes
-./scripts/teardown-docker.sh --images       # also remove the 3 images built here
+./scripts/teardown-docker.sh --images       # also remove the 5 images built here
 ./scripts/teardown-docker.sh --base-images  # also remove postgres:17.6 and rabbitmq:4-management
 ./scripts/teardown-docker.sh --jars         # also run `mvn clean`
 ./scripts/teardown-docker.sh --all -y       # --volumes --images --jars, no prompt
@@ -470,7 +532,7 @@ The default compiled into `config-server/src/main/resources/application.yml` and
 
 | Variable | Default in `application.yml` | Set by `docker/compose.yaml` | Description |
 |---|---|---|---|
-| `DB_URL` | `jdbc:postgresql://localhost:5432/configdb` | `jdbc:postgresql://postgres:5432/configdb` | JDBC URL of the configuration database |
+| `DB_URL` | `jdbc:postgresql://localhost:5433/configdb` | `jdbc:postgresql://postgres:5432/configdb` | JDBC URL of the configuration database |
 | `DB_USERNAME` / `DB_PASSWORD` | `config_admin` / `config-secret` | same | Database credentials |
 | `CONFIG_LABEL` | `main` | `main` | Default label. **Must be set** - the shipped Spring default is `master`, and a mismatch returns an empty environment, which looks exactly like "this application has no configuration" |
 | `MANAGEMENT_PORT` | `9888` | `9888` (published as `9899`) | Actuator port - a separate management child context |
@@ -602,26 +664,42 @@ Why it is built this way:
 | `config_revision` bumped in the same transaction | `JdbcRevisionPollingDetector` re-checks revisions every 15s, so a change missed while the `LISTEN` connection was down is still picked up (AC-15) |
 | `properties_history` | The audit trail that `git log` provides in version A (AC-17) |
 
+### `V3__seed_polyglot_clients.sql`
+
+Seeds the rows for the three non-Spring clients - `node-service`, `go-service` and
+`lambda-service` (`node.greeting`, `node.feature-enabled`, `node.max-items`, and the same three for
+`go.*` and `lambda.*`) - with the same values as version A's YAML files. It is a **new** migration
+rather than an edit to V1 on purpose: Flyway stores a checksum of every migration it has applied and
+refuses to start if an applied file changes. The V2 trigger fires for this `INSERT` too, so the
+`config_revision` rows for the new applications are created automatically.
+
 ---
 
 ## 8. Testing Guide
 
 ### A. Automated Acceptance Test Suite
-Changes are made with **plain SQL executed directly against the database** with `psql` - no
-application code participates in the write, which is what proves the trigger path catches any
-writer. Checks map to acceptance criteria in [REQUIREMENTS.md](../REQUIREMENTS.md): AC-01, AC-03,
-AC-05, AC-13 (plain SQL propagates), AC-14 (a rolled-back change must not broadcast), AC-15
-(listener connection killed - the reconciler catches the missed change), AC-16 (a bulk `UPDATE`
-produces one broadcast) and AC-17 (`properties_history` replaces `git log`).
+
+Every change is made with **plain SQL executed directly against the database** with `psql` - no
+application code takes part in the write, which proves the trigger path catches any writer. The
+suite checks:
+
+- every client returns only its own properties, and a change reaches **only** the service that owns
+  it, within the 5-second SLA - for Spring Boot, Node.js, Go and Lambda alike;
+- only **committed** changes are served (a rolled-back `UPDATE` never is);
+- a bulk `UPDATE` of many rows produces **one** broadcast (statement-level trigger);
+- `properties_history` records the operation, key, old and new value, and who made the change;
+- if the Config Server's `LISTEN` connection is killed, the lost notification is still delivered
+  (catch-up on reconnect, or the 15-second revision poller) and the drop shows in its health;
+- the security and error-format rules.
 
 ```bash
 # from: version-b-jdbc/
-./scripts/e2e-test.sh
+./scripts/e2e-test.sh                 # 43 checks
+SKIP_LAMBDA=1 ./scripts/e2e-test.sh   # without Floci: skips the lambda-service checks
 ```
 
-It needs the Compose stack up (section 5) and `python3` on the PATH. The propagation SLA it
-asserts is **8 seconds** - looser than version A's 5, because AC-15 deliberately kills the
-`LISTEN` connection and waits for the 15-second revision poller to reconcile.
+It needs the Compose stack up (section 5), lambda-service deployed to Floci, and `python3`. It sets
+a known baseline first and restores it at the end, so it can be run again and again.
 
 ---
 
@@ -637,37 +715,22 @@ curl -s -u config-client:client-secret http://localhost:8898/pricing-service/def
 curl -s -u config-client:client-secret http://localhost:8898/inventory-service/default/main | jq .
 ```
 
-#### 2. Query Client Service Snapshots
+#### 2. Ask each client what it is using
 ```bash
 # from: anywhere (these are just HTTP calls)
-# Inventory Service
-curl -s http://localhost:8091/api/v1/config/snapshot | jq .
-
-# Pricing Service 1 & 2
-curl -s http://localhost:8092/api/v1/config/snapshot | jq .
-curl -s http://localhost:8093/api/v1/config/snapshot | jq .
-
-# Refresh audit trail (changed keys, never their values)
-curl -s http://localhost:8091/api/v1/config/history | jq .
+curl -s http://localhost:8091/api/v1/inventory/config | jq .
+curl -s http://localhost:8092/api/v1/pricing/config | jq .
+curl -s http://localhost:8094/api/v1/node/config | jq .
+curl -s http://localhost:8095/api/v1/go/config | jq .
+./lambda-service/scripts/invoke-floci.sh        # from: version-b-jdbc/
 ```
+Each returns only its own properties.
 
 The change-detection path has its own health indicator, so a dead `LISTEN` thread is visible
 rather than silent:
 ```bash
 # from: anywhere (these are just HTTP calls)
 curl -s http://localhost:9899/actuator/health | jq '.components.configChange'
-```
-
-#### 3. Test Business Logic
-```bash
-# from: anywhere (these are just HTTP calls)
-# Inventory reservation
-curl -s -X POST http://localhost:8091/api/v1/inventory/reservations \
-  -H 'Content-Type: application/json' \
-  -d '{"sku":"SKU-1","quantity":10}' | jq .
-
-# Pricing Quote calculation
-curl -s "http://localhost:8092/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 ```
 
 ---
@@ -699,21 +762,33 @@ docker exec -i cfg-jdbc-postgres psql -U config_admin -d configdb -c \
 
 #### Step 2: Observe Automatic Refresh
 Without any REST calls, restarts, or delays:
-1. PostgreSQL trigger fires `pg_notify`.
-2. Config Server receives notification via `LISTEN`.
-3. Config Server broadcasts event to RabbitMQ.
-4. Both Pricing Service instances rebind and apply `v2`.
+1. The PostgreSQL trigger fires `pg_notify`.
+2. The Config Server receives the notification via `LISTEN`.
+3. The Config Server broadcasts the event to RabbitMQ.
+4. pricing-service re-binds its properties.
 
-#### Step 3: Verify Live Price Quotes
+#### Step 3: Verify the new value
 ```bash
 # from: anywhere (these are just HTTP calls)
-curl -s "http://localhost:8092/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
-curl -s "http://localhost:8093/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
+curl -s http://localhost:8092/api/v1/pricing/config | jq .discountPercentage   # -> 30.0
+curl -s http://localhost:8091/api/v1/inventory/config | jq .                   # unchanged
 ```
-Both instances immediately calculate:
-- `discountPercentage: 30.0`
-- `finalPrice: 700.00`
-- `configVersion: 2`
+The same works for node-service and go-service (`application = 'node-service'`,
+`"key" = 'node.max-items'`, ...), and lambda-service shows a change on its very next call.
+
+### What happens with an invalid value
+
+The Spring services check their values against rules in their `config/*Properties.java`
+(`@Min`, `@Max`, `@DecimalMax`, ...); node-service, go-service and lambda-service check theirs in
+`node-config.js` / `goconfig.go` / `lambda-config.js`.
+
+| When the bad value arrives | Spring Boot services | node-service / go-service | lambda-service |
+|---|---|---|---|
+| At startup | refuse to start: `Invalid pricing configuration: pricing.discountPercentage must be less than or equal to 90.0` | refuse to start, same kind of message | n/a |
+| In a refresh | keep running, log `ERROR Refreshed pricing configuration is invalid: ...` | **keep the values they already had** and log the error | answer `503` problem details until it is fixed |
+
+Try it: set `pricing.discount-percentage` to `95.0`, and watch `docker logs -f cfg-jdbc-pricing`.
+Then set it back.
 
 ---
 
@@ -735,9 +810,9 @@ waits for each rollout, and finally runs `./k8s/verify-in-cluster.sh`.
 | `00-namespace-and-config.yaml` | Namespace `config-demo`, ConfigMaps `config-server-env` and `client-env`, Secret `config-credentials` |
 | `01-dependencies.yaml` | PostgreSQL **StatefulSet** and RabbitMQ Deployment |
 | `02-config-server.yaml` | Config Server (2 replicas) + Service |
-| `03-clients.yaml` | `inventory-service` and `pricing-service` (2 replicas) + Services |
+| `03-clients.yaml` | `inventory-service`, `pricing-service`, `node-service`, `go-service` (1 replica each) + Services |
 | `04-network-policies.yaml` | Zero-Trust default-deny ingress + least-privilege pod-to-pod network policies |
-| `05-hpa.yaml` | Horizontal Pod Autoscalers targeting CPU 75% & Memory 80% (min 2, max 5 replicas) |
+| `05-hpa.yaml` | Horizontal Pod Autoscalers for the four clients: start at 1 pod, add more under CPU load (needs `minikube addons enable metrics-server`) |
 
 The keystore is **not** in any manifest - it is a real secret (and `secrets/` is gitignored), so
 it is created from the local file. **This is mandatory:** `k8s/02-config-server.yaml` mounts a
@@ -790,8 +865,12 @@ Reach the services from the host, and verify:
 # from: version-b-jdbc/   # paths below are relative to it
 kubectl -n config-demo port-forward svc/inventory-service 8081:8081
 kubectl -n config-demo port-forward svc/config-server 9888:9888
-./k8s/verify-in-cluster.sh    # asserts every pod IP individually, not through the Service
+./k8s/verify-in-cluster.sh    # 13 checks; asserts every pod IP individually, not through the Service
 ```
+
+It changes one value for each of the four in-cluster services with SQL, checks that every pod of
+that service serves it with no restart, that an unrelated service is untouched, and that
+`properties_history` recorded the change - then restores the values.
 
 `verify-in-cluster.sh` queries **individual pod IPs** rather than the Service, because a Service
 would load-balance and could hide a replica that never received the broadcast - exactly the
@@ -835,23 +914,32 @@ and then fail with "address already in use" on the next deploy.
 
 Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
 
-| Service | Swagger UI URL | OpenAPI 3 JSON Schema |
+| Service | Swagger UI | OpenAPI 3 document |
 |---|---|---|
-| **Inventory Service** | [http://localhost:8091/swagger-ui.html](http://localhost:8091/swagger-ui.html) | [http://localhost:8091/v3/api-docs](http://localhost:8091/v3/api-docs) |
-| **Pricing Service (Inst 1)** | [http://localhost:8092/swagger-ui.html](http://localhost:8092/swagger-ui.html) | [http://localhost:8092/v3/api-docs](http://localhost:8092/v3/api-docs) |
-| **Pricing Service (Inst 2)** | [http://localhost:8093/swagger-ui.html](http://localhost:8093/swagger-ui.html) | [http://localhost:8093/v3/api-docs](http://localhost:8093/v3/api-docs) |
+| **inventory-service** | [http://localhost:8091/swagger-ui.html](http://localhost:8091/swagger-ui.html) | [http://localhost:8091/v3/api-docs](http://localhost:8091/v3/api-docs) |
+| **pricing-service** | [http://localhost:8092/swagger-ui.html](http://localhost:8092/swagger-ui.html) | [http://localhost:8092/v3/api-docs](http://localhost:8092/v3/api-docs) |
+| **node-service** | - (paste the document into [editor.swagger.io](https://editor.swagger.io)) | [http://localhost:8094/v3/api-docs](http://localhost:8094/v3/api-docs) |
+| **go-service** | - (paste the document into [editor.swagger.io](https://editor.swagger.io)) | [http://localhost:8095/v3/api-docs](http://localhost:8095/v3/api-docs) |
+| **lambda-service** | - | [lambda-service/openapi.json](lambda-service/openapi.json) (the API Gateway route) |
 
 ### Features Included:
-- **Rich DTO Schemas**: `@Schema` metadata including descriptions, example values, min/max constraints, and required fields.
-- **Response Code Mapping**: Explicit `@ApiResponse` annotations documenting `200 OK`, `400 Bad Request` (RFC 9457), `404 Not Found`, and `500 Internal Server Error`.
-- **Try-It-Out**: Directly execute quote calculations, stock reservations, and configuration snapshot inspections from your browser.
+- **Schemas with examples**: every field of every response is described, with an example value.
+- **Documented responses**: `200` with the body, and errors as RFC 9457 problem details.
+- **Try-It-Out** (Spring services): call the API from the browser.
 
 ---
 
 ## 11. Production-Grade Security Hardening
 
 ### Security Filter Chain (`SecurityConfig.java`)
-All microservices implement enterprise-grade HTTP security controls:
+The Spring services implement these HTTP security controls (node-service, go-service and
+lambda-service send the same response headers; see their READMEs):
+- **Deny by default**: only the API, the OpenAPI/Swagger docs and the health checks are reachable;
+  every other path answers `403`. Note that in Spring Boot 4 this chain also guards the separate
+  management port, which is why `/actuator/health/**` is listed explicitly - without it Docker and
+  Kubernetes health probes get `403`.
+- **No open refresh endpoint**: the clients expose only `health` on Actuator. Refreshes arrive over
+  RabbitMQ, so an HTTP `/actuator/refresh` would only let anyone trigger reloads.
 - **Stateless Session Management**: `SessionCreationPolicy.STATELESS` eliminates server-side session fixation vulnerabilities.
 - **REST-Safe CSRF**: CSRF protection is safely disabled on stateless JSON endpoints in accordance with OWASP API Security guidelines.
 - **Strict HTTP Security Response Headers**:
@@ -860,39 +948,36 @@ All microservices implement enterprise-grade HTTP security controls:
   - `X-Frame-Options`: `DENY` (Clickjacking prevention)
   - `X-Content-Type-Options`: `nosniff` (MIME-sniffing prevention)
   - `Referrer-Policy`: `strict-origin-when-cross-origin`
-  - `Permissions-Policy`: `"camera=(), microphone=(), geolocation=()"`
 
 ---
 
 ## 12. RFC 9457 Standardized Exception Handling
 
-All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
+Every error is formatted as RFC 9457 `application/problem+json` - by `GlobalExceptionHandler`
+(`@RestControllerAdvice`) in the Spring services, and by each Node.js / Go service's own handler.
+For example, an unknown path:
 
+```bash
+# from: anywhere (these are just HTTP calls)
+curl -s http://localhost:8091/api/v1/inventory/nope
+```
 ```json
 {
-  "type": "https://api.acme.com/errors/validation-error",
-  "title": "Validation Failed",
-  "status": 400,
-  "detail": "Request payload validation failed for 1 field(s)",
-  "instance": "/api/v1/inventory/reservations",
-  "errorId": "9c1b3f7a-821d-4e90-b1a5-3819441235b1",
-  "timestamp": "2026-09-19T17:30:00Z",
-  "fieldErrors": [
-    {
-      "field": "quantity",
-      "rejectedValue": -5,
-      "message": "Quantity must be greater than zero"
-    }
-  ]
+  "type": "urn:problem:resource-not-found",
+  "title": "Resource not found",
+  "status": 404,
+  "detail": "No endpoint api/v1/inventory/nope",
+  "instance": "/api/v1/inventory/nope",
+  "timestamp": "2026-10-06T16:18:39Z"
 }
 ```
 
 ### Handled Error Scenarios:
-- **`MethodArgumentNotValidException` / `ConstraintViolationException`**: HTTP 400 with detailed `fieldErrors`.
-- **`ConfigurationValidationException` / `IllegalStateException`**: HTTP 400 when business rules reject invalid configuration or payload state.
-- **`NoResourceFoundException`**: HTTP 404 for nonexistent endpoints.
-- **`HttpRequestMethodNotSupportedException`**: HTTP 405 for unsupported HTTP verbs.
-- **`Exception` (Uncaught Fallback)**: HTTP 500 with unique `errorId` for log correlation without leaking internal stack traces.
+- **`NoResourceFoundException`**: HTTP 404 for an endpoint that does not exist.
+- **`HttpRequestMethodNotSupportedException`**: HTTP 405 for anything but `GET` / `HEAD`.
+- **`HttpMediaTypeNotAcceptableException`**: HTTP 406 when the caller does not accept JSON.
+- **`Exception` (fallback)**: HTTP 500 with a unique `errorId` that matches the log line; the
+  cause and stack trace are logged, never returned.
 
 ---
 
@@ -924,15 +1009,15 @@ mvn compile jib:build -Dimage=<registry>/<image>:<tag>   # Push directly to cont
 |---|---|---|
 | **SAST (Bytecode Analysis)** | SpotBugs 4.10.4 + `findsecbugs-plugin:1.13.0` | SQL injection, CSRF misconfiguration, insecure cryptography, path traversal, command injection |
 | **SCA (Dependency Vulnerability)** | OWASP `dependency-check-maven:13.0.0` | Known CVEs in third-party libraries against the National Vulnerability Database (NVD) |
-| **Architecture Enforcement** | ArchUnit 1.5.0 | Layer isolation, immutable snapshot boundaries, ban direct properties injection |
+| **Architecture Enforcement** | ArchUnit 1.5.0 | Refresh safety (`@ConfigurationProperties` with setters, not records; no `@Value`), package layering, no field injection |
 | **Code Formatting** | Spotless + google-java-format 1.36.1 | Deterministic code style formatting |
 | **Static Code Analysis** | Checkstyle 14.1.0 | Coding conventions, naming standards, Javadoc hygiene |
-| **Code Coverage** | JaCoCo 0.8.15 | Enforced line (>70%) and branch (>60%) thresholds. **`config-server` lowers these to 25% / 20%** on purpose: its largest class, `PostgresNotifyChangeDetector`, is a background thread holding a raw socket in a blocking `getNotifications()` loop - unit-testing it would mean testing a mock of the PostgreSQL driver. Its real behaviour is proven by `ConfigChangeTriggerIT` against a real PostgreSQL container plus `scripts/e2e-test.sh` AC-15. The override and its rationale are in `config-server/pom.xml` |
+| **Code Coverage** | JaCoCo 0.8.15 | Enforced line (>70%) and branch (>60%) thresholds. **`config-server` lowers these to 25% / 20%** on purpose: its largest class, `PostgresNotifyChangeDetector`, is a background thread holding a raw socket in a blocking `getNotifications()` loop - unit-testing it would mean testing a mock of the PostgreSQL driver. Its real behaviour is proven by `ConfigChangeTriggerIT` against a real PostgreSQL container plus the "lost notification" check in `scripts/e2e-test.sh`. The override and its rationale are in `config-server/pom.xml` |
 
 `ConfigChangeTriggerIT` uses **Testcontainers 1.21.4**, pinned explicitly because - unlike Boot 3 -
 the Spring Boot 4 BOM does not manage it. It needs a running Docker daemon.
 
-Each of the three services is a **standalone Maven project** parented directly to
+Each of the three Java services is a **standalone Maven project** parented directly to
 `spring-boot-starter-parent` 4.0.8, with its own dependency management, quality gates and
 `config/` directory. The `pom.xml` at `version-b-jdbc/` is an **aggregator only** - nothing is
 inherited from it - so a single service builds on its own:
@@ -942,3 +1027,11 @@ inherited from it - so a single service builds on its own:
 cd inventory-service && mvn verify
 ```
 
+The other three services have their own checks:
+
+```bash
+# from: version-b-jdbc/
+(cd node-service && npm ci && npm test)
+(cd lambda-service && npm ci && npm test)
+(cd go-service && gofmt -l . && go vet ./... && go test -race ./...)
+```

@@ -54,6 +54,12 @@ spec:
         - podSelector:
             matchLabels:
               app: pricing-service
+        - podSelector:
+            matchLabels:
+              app: node-service
+        - podSelector:
+            matchLabels:
+              app: go-service
       ports:
         - protocol: TCP
           port: 5672
@@ -81,6 +87,12 @@ spec:
         - podSelector:
             matchLabels:
               app: pricing-service
+        - podSelector:
+            matchLabels:
+              app: node-service
+        - podSelector:
+            matchLabels:
+              app: go-service
       ports:
         - protocol: TCP
           port: 8888
@@ -125,3 +137,37 @@ spec:
           port: 8082
         - protocol: TCP
           port: 9082
+---
+# node-service's API port is reachable (it is a client-facing service).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-node-service
+  namespace: config-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: node-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8084
+---
+# go-service's API port is reachable (it is a client-facing service).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-go-service
+  namespace: config-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: go-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8085

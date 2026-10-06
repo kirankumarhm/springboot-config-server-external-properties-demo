@@ -1,285 +1,213 @@
 #!/usr/bin/env bash
 # End-to-end acceptance test for version A (Git backend).
 #
-# Proves the core requirement: a property changed in the external config repository reaches every
-# running client within seconds, with no restart. Each check maps to an acceptance criterion in
-# ../../REQUIREMENTS.md.
+#   # from: version-a-git/
+#   ./scripts/e2e-test.sh
+#
+# Proves the point of the project: change a value in the Git config repository, commit, and every
+# client that owns that value serves the new value within seconds - with no restart - while the
+# clients that do not own it are untouched. Covers all five clients:
+#   inventory-service, pricing-service (Spring Boot)  -> refreshed over Spring Cloud Bus
+#   node-service (Node.js), go-service (Go)            -> refreshed over Spring Cloud Bus
+#   lambda-service (AWS Lambda in Floci)               -> reads the latest values on every call
+#
+# Needs: the Compose stack running against the LOCAL repo (see README section "Quick start"):
+#   CONFIG_REPO_URI=file:///config-repo CONFIG_REPO_SEARCH_PATHS= CONFIG_REPO_FORCE_PULL=false \
+#     docker compose -f docker/compose.yaml up -d --build
+# plus lambda-service deployed to Floci (lambda-service/scripts/deploy-floci.sh), python3, curl.
+# Set SKIP_LAMBDA=1 to skip the Lambda checks when Floci is not running.
+#
+# The suite commits to config-repo/. It sets a known baseline first and restores it at the end,
+# so it can be run any number of times.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$HERE/../config-repo"
-
-INV="http://localhost:8081"
-PRC="http://localhost:8082"
-PRC2="http://localhost:8083"
-INV_MGMT="http://localhost:9081"
 SERVER="http://localhost:8888"
-ADMIN="config-admin:admin-secret"
-# The Config Server now exposes actuator on a SEPARATE port (management child context).
 SERVER_MGMT="http://localhost:9898"
-
+CLIENT_AUTH="config-client:client-secret"
+INVENTORY="http://localhost:8081/api/v1/inventory/config"
+PRICING="http://localhost:8082/api/v1/pricing/config"
+NODE="http://localhost:8084/api/v1/node/config"
+GO="http://localhost:8085/api/v1/go/config"
 SLA_SECONDS=5
+SKIP_LAMBDA=${SKIP_LAMBDA:-0}
+LAMBDA_INVOKE="$HERE/../lambda-service/scripts/invoke-floci.sh"
 
-PASS=0
-FAIL=0
+PASS=0; FAIL=0
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
+ok()      { PASS=$((PASS+1)); echo "  ${GREEN}PASS${OFF}  $1"; }
+bad()     { FAIL=$((FAIL+1)); echo "  ${RED}FAIL${OFF}  $1"; }
+section() { echo; echo "${BOLD}$1${OFF}"; }
 
-jget() {
-  python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d = d[int(k)] if k.isdigit() else d[k]
-print(d)' "$1" 2>/dev/null
-}
+# json <field> : reads JSON on stdin and prints one top-level field ("" if absent or not JSON).
+json() { python3 -c 'import sys,json
+try: v=json.load(sys.stdin).get(sys.argv[1], "")
+except Exception: v=""
+print(str(v).lower() if isinstance(v,bool) else v)' "$1" 2>/dev/null; }
 
-snap()    { curl -s -m 5 "$1/api/v1/config/snapshot"; }
-version() { snap "$1" | jget version; }
-field()   { snap "$1" | jget "$2"; }
+get()    { curl -s -m 5 "$1"; }
+lambda() { "$LAMBDA_INVOKE" 2>/dev/null; }
+status() { curl -s -m 5 -o /dev/null -w '%{http_code}' "$@"; }
 
-ok()   { PASS=$((PASS+1)); echo "  ${GREEN}PASS${OFF}  $1"; }
-bad()  { FAIL=$((FAIL+1)); echo "  ${RED}FAIL${OFF}  $1"; }
-head2(){ echo; echo "${BOLD}$1${OFF}"; }
-
-
-# Waits until an application's snapshot version exceeds a baseline. Prints elapsed seconds.
-wait_for_version_above() {
-  local url="$1" baseline="$2" deadline elapsed start now v
-  start=$(python3 -c 'import time;print(time.time())')
-  deadline=$((SECONDS + SLA_SECONDS))
-  while [ $SECONDS -lt $deadline ]; do
-    v=$(version "$url")
-    if [ -n "$v" ] && [ "$v" -gt "$baseline" ] 2>/dev/null; then
-      now=$(python3 -c 'import time;print(time.time())')
-      elapsed=$(python3 -c "print(f'{$now-$start:.2f}')")
-      echo "$elapsed"
-      return 0
-    fi
-    sleep 0.2
-  done
-  echo "TIMEOUT"
-  return 1
-}
-
-# Polls until lastOutcome equals one of the expected values. Fixed sleeps are unreliable here:
-# propagation is normally sub-second but has been observed at ~3.5s when the Config Server has
-# to re-checkout the Git working tree.
-wait_for_outcome() { # url, timeout, expected...
-  local url="$1" timeout="$2"; shift 2
-  local deadline=$((SECONDS + timeout)) o
-  while [ $SECONDS -lt $deadline ]; do
-    o=$(field "$url" lastOutcome)
-    for want in "$@"; do [ "$o" = "$want" ] && { echo "$o"; return 0; }; done
-    sleep 0.3
-  done
-  echo "${o:-unknown}"
-  return 1
-}
-
-commit_config() {
-  git -C "$REPO" add -A
-  if git -C "$REPO" diff --cached --quiet; then
-    echo "  ${YELLOW}note${OFF}  nothing to commit for: $1"
-    return 1
-  fi
-  git -C "$REPO" commit -q -m "$1"
-}
-
-# The suite mutates the config repository, so it must not assume a pristine checkout.
-# Restore a known baseline first, otherwise a second run writes identical values, git has
-# nothing to commit, no hook fires, and the refresh assertions fail for the wrong reason.
-reset_baseline() {
-  set_yaml inventory-service.yml express-shipping-enabled false
-  set_yaml inventory-service.yml max-order-quantity 500
-  set_yaml application.yml environment-label '"local"'
-  if commit_config "Reset configuration to test baseline"; then
-    sleep 3
-    echo "  baseline restored and propagated"
-  else
-    echo "  already at baseline"
-  fi
-}
-
-set_yaml() { # file, key, value
-  local f="$REPO/$1"
-  python3 - "$f" "$2" "$3" <<'PY'
+# set_yaml <file> <key> <value> : replaces the first "key: ..." line in a config-repo file.
+set_yaml() {
+  python3 - "$REPO/$1" "$2" "$3" <<'PY'
 import re, sys
-path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+path, key, value = sys.argv[1:]
 text = open(path).read()
-new, n = re.subn(rf'^(\s*){re.escape(key)}:.*$', lambda m: f"{m.group(1)}{key}: {value}", text,
-                 count=1, flags=re.MULTILINE)
+new, n = re.subn(rf'^(\s*){re.escape(key)}:.*$', lambda m: f"{m.group(1)}{key}: {value}", text, count=1, flags=re.M)
 if n != 1:
-    sys.exit(f"could not find key '{key}' in {path}")
+    sys.exit(f"key '{key}' not found in {path}")
 open(path, 'w').write(new)
 PY
 }
+
+# commit <message> : commits config-repo; the post-commit hook tells the Config Server.
+#
+# Retries because the Config Server runs `git checkout` in this same directory whenever a client
+# fetches configuration, and git refuses to write .git/index while the other process holds it
+# ("fatal: unable to write new index file"). A short retry is the correct fix: the lock is held
+# for milliseconds.
+commit() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if git -C "$REPO" add -A 2>/dev/null; then
+      git -C "$REPO" diff --cached --quiet && return 1
+      git -C "$REPO" commit -q -m "$1" >/dev/null 2>&1 && return 0
+    fi
+    sleep 0.5
+  done
+  bad "could not commit '$1' to config-repo after 5 attempts"
+  return 1
+}
+
+# expect_within <description> <expected> <command...> : polls until the command prints the
+# expected value, for at most SLA_SECONDS. Reports how long it took.
+expect_within() {
+  local description="$1" expected="$2"; shift 2
+  local start=$SECONDS got=""
+  while [ $((SECONDS - start)) -le "$SLA_SECONDS" ]; do
+    got=$("$@")
+    if [ "$got" = "$expected" ]; then
+      ok "$description ($((SECONDS - start))s, SLA ${SLA_SECONDS}s)"
+      return 0
+    fi
+    sleep 0.3
+  done
+  bad "$description: got '$got', expected '$expected' within ${SLA_SECONDS}s"
+}
+
+field_of() { get "$1" | json "$2"; }
+lambda_field() { lambda | json "$1"; }
+
+baseline() {
+  set_yaml inventory-service.yml max-order-quantity 100
+  set_yaml pricing-service.yml surge-pricing-enabled false
+  set_yaml node-service.yml max-items 25
+  set_yaml go-service.yml max-items 50
+  set_yaml lambda-service.yml max-items 10
+  commit "e2e: reset configuration to the test baseline" && sleep 3 || true
+}
+trap 'echo; echo "Restoring the baseline..."; baseline' EXIT
 
 echo "${BOLD}==================================================================${OFF}"
 echo "${BOLD} Version A (Git backend) - end-to-end acceptance${OFF}"
 echo "${BOLD}==================================================================${OFF}"
 
-# ---------------------------------------------------------------- preconditions
-head2 "Preconditions"
-for pair in "config-server:$SERVER_MGMT/actuator/health" \
-            "inventory-service:$INV_MGMT/actuator/health" \
-            "pricing-service:http://localhost:9082/actuator/health" \
-            "pricing-service-2:http://localhost:9083/actuator/health"; do
-  name="${pair%%:*}"; url="${pair#*:}"
-  status=$(curl -s -m 5 "$url" | jget status)
-  if [ "$status" = "UP" ]; then ok "$name is UP"; else bad "$name health = ${status:-unreachable}"; fi
+# ------------------------------------------------------------------------------ preconditions
+section "Preconditions"
+[ "$(get "$SERVER_MGMT/actuator/health" | json status)" = "UP" ] && ok "config-server is UP" || bad "config-server is not UP"
+for name in inventory:9081 pricing:9082; do
+  [ "$(get "http://localhost:${name#*:}/actuator/health" | json status)" = "UP" ] \
+    && ok "${name%%:*}-service is UP" || bad "${name%%:*}-service is not UP"
 done
-
-if [ "$(curl -s -o /dev/null -w '%{http_code}' -u "$ADMIN" "$SERVER/inventory-service/default")" = "200" ]; then
-  ok "Environment API serves inventory-service/default (authenticated)"
-else
-  bad "Environment API not serving inventory-service/default"
-fi
-
-if [ "$(curl -s -o /dev/null -w '%{http_code}' "$SERVER/inventory-service/default")" = "401" ]; then
-  ok "Environment API rejects unauthenticated access (NFR-10)"
-else
-  bad "Environment API is NOT protected"
-fi
-
-head2 "Baseline"
-reset_baseline
-
-# ---------------------------------------------------------------- AC-04 + AC-02
-head2 "AC-02 / AC-04  scoped refresh + feature flag takes effect live"
-inv_before=$(version "$INV"); prc_before=$(version "$PRC")
-echo "  baseline versions: inventory=$inv_before pricing=$prc_before"
-mode_before=$(curl -s -m 5 -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"SKU-1","quantity":10}' | jget shippingMode)
-echo "  shippingMode before: $mode_before"
-
-set_yaml inventory-service.yml express-shipping-enabled true
-commit_config "Enable express shipping for inventory-service"
-
-elapsed=$(wait_for_version_above "$INV" "$inv_before")
-if [ "$elapsed" != "TIMEOUT" ]; then
-  ok "inventory-service refreshed in ${elapsed}s (SLA ${SLA_SECONDS}s)"
-else
-  bad "inventory-service did not refresh within ${SLA_SECONDS}s"
-fi
-
-flag_after=$(field "$INV" settings.expressShippingEnabled)
-[ "$flag_after" = "True" ] && ok "expressShippingEnabled is now true (no restart)" \
-                           || bad "expressShippingEnabled = $flag_after (expected True)"
-
-mode_after=$(curl -s -m 5 -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"SKU-1","quantity":10}' | jget shippingMode)
-[ "$mode_after" = "EXPRESS" ] && ok "business behaviour changed: shippingMode $mode_before -> EXPRESS" \
-                              || bad "shippingMode = $mode_after (expected EXPRESS)"
-
-prc_after=$(version "$PRC")
-[ "$prc_after" = "$prc_before" ] && ok "pricing-service untouched by a scoped change (version $prc_after)" \
-                                 || bad "pricing-service version moved $prc_before -> $prc_after"
-
-# ---------------------------------------------------------------- AC-01 + AC-03
-head2 "AC-01 / AC-03  shared change reaches ALL apps and ALL instances"
-inv_b=$(version "$INV"); prc_b=$(version "$PRC"); prc2_b=$(version "$PRC2")
-echo "  baseline: inventory=$inv_b pricing=$prc_b pricing-2=$prc2_b"
-
-set_yaml application.yml environment-label "\"production-like\""
-commit_config "Change shared environment-label for all services"
-
-e1=$(wait_for_version_above "$INV" "$inv_b")
-e2=$(wait_for_version_above "$PRC" "$prc_b")
-e3=$(wait_for_version_above "$PRC2" "$prc2_b")
-[ "$e1" != "TIMEOUT" ] && ok "inventory-service refreshed in ${e1}s"   || bad "inventory-service timed out"
-[ "$e2" != "TIMEOUT" ] && ok "pricing-service refreshed in ${e2}s"     || bad "pricing-service timed out"
-[ "$e3" != "TIMEOUT" ] && ok "pricing-service-2 refreshed in ${e3}s (one broadcast, every instance)" \
-                       || bad "pricing-service-2 timed out"
-
-for u in "$INV" "$PRC" "$PRC2"; do
-  lbl=$(field "$u" settings.environmentLabel)
-  [ "$lbl" = "production-like" ] && ok "$u sees environmentLabel=production-like" \
-                                 || bad "$u environmentLabel=$lbl"
+for name in node:8084 go:8085; do
+  [ "$(get "http://localhost:${name#*:}/health" | json status)" = "UP" ] \
+    && ok "${name%%:*}-service is UP" || bad "${name%%:*}-service is not UP"
 done
-
-# ---------------------------------------------------------------- AC-05
-head2 "AC-05  invalid configuration is rejected, last-known-good retained"
-good_version=$(version "$INV")
-good_max=$(field "$INV" settings.maxOrderQuantity)
-echo "  known-good: version=$good_version maxOrderQuantity=$good_max"
-
-set_yaml inventory-service.yml max-order-quantity 99999   # violates @Max(10000)
-commit_config "Set an INVALID max-order-quantity to prove rejection"
-wait_for_outcome "$INV" 15 REJECTED >/dev/null
-
-after_version=$(version "$INV")
-after_max=$(field "$INV" settings.maxOrderQuantity)
-outcome=$(field "$INV" lastOutcome)
-rejected=$(field "$INV" rejectedCount)
-
-[ "$after_max" = "$good_max" ] && ok "still serving last-known-good maxOrderQuantity=$after_max" \
-                               || bad "adopted invalid value: $after_max"
-[ "$after_version" = "$good_version" ] && ok "snapshot version unchanged ($after_version)" \
-                                       || bad "version moved to $after_version despite invalid config"
-[ "$outcome" = "REJECTED" ] && ok "lastOutcome=REJECTED is observable" || bad "lastOutcome=$outcome"
-[ "${rejected:-0}" -ge 1 ] 2>/dev/null && ok "rejectedCount=$rejected" || bad "rejectedCount=$rejected"
-
-reason=$(field "$INV" lastFailureReason)
-[ -n "$reason" ] && ok "failure reason surfaced: $reason" || bad "no failure reason recorded"
-
-hstatus=$(curl -s -m 5 "$INV_MGMT/actuator/health" | jget status)
-[ "$hstatus" = "UP" ] && ok "service still UP while serving last-known-good (correct: config is valid)" \
-                      || bad "health=$hstatus"
-
-still_serving=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"SKU-9","quantity":5}')
-[ "$still_serving" = "200" ] && ok "business endpoint still serving traffic (HTTP 200)" \
-                             || bad "business endpoint returned $still_serving"
-
-echo "  restoring a valid value..."
-set_yaml inventory-service.yml max-order-quantity "$good_max"
-commit_config "Restore valid max-order-quantity"
-recovered=$(wait_for_outcome "$INV" 15 NO_CHANGE APPLIED)
-if [ "$recovered" = "NO_CHANGE" ] || [ "$recovered" = "APPLIED" ]; then
-  ok "recovered after fixing the value (lastOutcome=$recovered)"
+sources=$(curl -s -m 5 -u "$CLIENT_AUTH" "$SERVER/inventory-service/default/main")
+if echo "$sources" | grep -q 'file:///config-repo'; then
+  ok "Config Server reads the LOCAL repo (file:///config-repo), so commits here are what it serves"
 else
-  bad "did not recover within 15s, lastOutcome=$recovered"
+  bad "Config Server is NOT reading file:///config-repo - restart the stack with CONFIG_REPO_URI=file:///config-repo CONFIG_REPO_SEARCH_PATHS= CONFIG_REPO_FORCE_PULL=false"
+fi
+if [ "$SKIP_LAMBDA" = "1" ]; then
+  echo "  ${YELLOW}SKIP${OFF}  lambda-service (SKIP_LAMBDA=1)"
+elif [ -n "$(lambda_field greeting)" ]; then
+  ok "lambda-service answers through Floci API Gateway"
+else
+  bad "lambda-service is not reachable - run lambda-service/scripts/deploy-floci.sh (or SKIP_LAMBDA=1)"
 fi
 
-# ---------------------------------------------------------------- FR-15
-head2 "FR-15  a refresh that changes nothing is a no-op"
-v_before=$(version "$INV")
-curl -s -m 10 -X POST "$INV_MGMT/actuator/refresh" >/dev/null
-sleep 2
-v_after=$(version "$INV")
-outcome=$(field "$INV" lastOutcome)
-[ "$v_after" = "$v_before" ] && ok "version stayed $v_after on a no-change refresh" \
-                             || bad "version moved $v_before -> $v_after"
-[ "$outcome" = "NO_CHANGE" ] && ok "lastOutcome=NO_CHANGE" || bad "lastOutcome=$outcome"
+section "Baseline"
+baseline
+echo "  configuration reset to the test baseline"
 
-# ---------------------------------------------------------------- FR-31 / AC-09
-head2 "FR-31 / AC-09  audit records keys but never values"
-hist=$(curl -s -m 5 "$INV/api/v1/config/history")
-n=$(echo "$hist" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))' 2>/dev/null)
-[ "${n:-0}" -ge 2 ] 2>/dev/null && ok "audit history has $n records" || bad "audit history has ${n:-0} records"
-
-if echo "$hist" | grep -q '"changedKeys"'; then ok "audit records changedKeys"; else bad "no changedKeys in audit"; fi
-if echo "$hist" | grep -qE '99999|WH-BLR-01|production-like'; then
-  bad "audit log LEAKS property values"
-else
-  ok "audit contains no property values (key names only)"
+# ------------------------------------------------------------------------------ each client serves its own properties
+section "Each client returns ONLY its own properties"
+inventory_keys=$(get "$INVENTORY" | python3 -c 'import sys,json;print(",".join(sorted(json.load(sys.stdin))))' 2>/dev/null)
+[ "$inventory_keys" = "expressShippingEnabled,lowStockThreshold,maxOrderQuantity,warehouseCode" ] \
+  && ok "inventory-service: $inventory_keys" || bad "inventory-service keys: $inventory_keys"
+pricing_keys=$(get "$PRICING" | python3 -c 'import sys,json;print(",".join(sorted(json.load(sys.stdin))))' 2>/dev/null)
+[ "$pricing_keys" = "currency,discountPercentage,surgeMultiplier,surgePricingEnabled" ] \
+  && ok "pricing-service: $pricing_keys" || bad "pricing-service keys: $pricing_keys"
+[ "$(field_of "$NODE" greeting)" = "Hello from Node.js" ] && ok "node-service greets from Node.js" || bad "node-service greeting"
+[ "$(field_of "$GO" greeting)" = "Hello from Go" ] && ok "go-service greets from Go" || bad "go-service greeting"
+if [ "$SKIP_LAMBDA" != "1" ]; then
+  [ "$(lambda_field greeting)" = "Hello from AWS Lambda" ] && ok "lambda-service greets from AWS Lambda" || bad "lambda-service greeting"
 fi
 
-# ---------------------------------------------------------------- summary
-# ---------------------------------------------------------------- NFR-10
-head2 "NFR-10  the encryption endpoints require authentication"
-# No configuration value is {cipher}-encrypted any more, so there is no decrypted secret to
-# assert on. The endpoints still exist, and their access control is still worth asserting.
-code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: text/plain' --data-binary x "$SERVER/encrypt")
-[ "$code" = "401" ] && ok "/encrypt rejects unauthenticated callers" || bad "/encrypt returned $code"
+# ------------------------------------------------------------------------------ live refresh, scoped
+section "A change reaches only the service that owns it - live, no restart"
+set_yaml inventory-service.yml max-order-quantity 750
+commit "e2e: raise inventory max-order-quantity"
+expect_within "inventory-service maxOrderQuantity 100 -> 750" 750 field_of "$INVENTORY" maxOrderQuantity
+[ "$(field_of "$PRICING" surgePricingEnabled)" = "false" ] && ok "pricing-service untouched" || bad "pricing-service changed"
+[ "$(field_of "$NODE" maxItems)" = "25" ] && ok "node-service untouched" || bad "node-service changed"
 
+set_yaml pricing-service.yml surge-pricing-enabled true
+commit "e2e: switch on surge pricing"
+expect_within "pricing-service surgePricingEnabled false -> true" true field_of "$PRICING" surgePricingEnabled
+[ "$(field_of "$INVENTORY" maxOrderQuantity)" = "750" ] && ok "inventory-service untouched" || bad "inventory-service changed"
+
+set_yaml node-service.yml max-items 30
+commit "e2e: change node-service max-items"
+expect_within "node-service (Node.js, over Spring Cloud Bus) maxItems 25 -> 30" 30 field_of "$NODE" maxItems
+[ "$(field_of "$GO" maxItems)" = "50" ] && ok "go-service untouched" || bad "go-service changed"
+
+set_yaml go-service.yml max-items 55
+commit "e2e: change go-service max-items"
+expect_within "go-service (Go, over Spring Cloud Bus) maxItems 50 -> 55" 55 field_of "$GO" maxItems
+[ "$(field_of "$NODE" maxItems)" = "30" ] && ok "node-service untouched" || bad "node-service changed"
+
+if [ "$SKIP_LAMBDA" != "1" ]; then
+  set_yaml lambda-service.yml max-items 12
+  commit "e2e: change lambda-service max-items"
+  expect_within "lambda-service (reads on every call) maxItems 10 -> 12" 12 lambda_field maxItems
+fi
+
+# ------------------------------------------------------------------------------ security and errors
+section "Security and error format"
+[ "$(status "$SERVER/inventory-service/default")" = "401" ] && ok "Config Server rejects unauthenticated reads" || bad "Config Server readable without credentials"
+[ "$(status -H 'Content-Type: text/plain' --data-binary x "$SERVER/encrypt")" = "401" ] && ok "/encrypt requires authentication" || bad "/encrypt is open"
+[ "$(status http://localhost:8081/swagger-ui/index.html)" = "200" ] && ok "inventory-service Swagger UI is served" || bad "inventory-service Swagger UI"
+[ "$(status http://localhost:8081/internal)" = "403" ] && ok "inventory-service denies paths outside its API" || bad "inventory-service /internal not denied"
+[ "$(status -X POST http://localhost:9081/actuator/refresh)" = "403" ] && ok "client refresh endpoint is not open over HTTP" || bad "client /actuator/refresh is open"
+for url in "http://localhost:8082/api/v1/pricing/nope" "http://localhost:8084/nope" "http://localhost:8085/nope"; do
+  ctype=$(curl -s -m 5 -o /dev/null -w '%{content_type}' "$url")
+  [ "$ctype" = "application/problem+json" ] && ok "$url -> 404 problem+json" || bad "$url content type '$ctype'"
+done
+for url in "$INVENTORY" "$NODE" "$GO"; do
+  frame=$(curl -s -m 5 -D - -o /dev/null "$url" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-frame-options"{print $2}')
+  [ "$frame" = "DENY" ] && ok "$url sends security headers" || bad "$url X-Frame-Options='$frame'"
+done
+for url in "http://localhost:8081/v3/api-docs" "http://localhost:8084/v3/api-docs" "http://localhost:8085/v3/api-docs"; do
+  [ -n "$(get "$url" | json openapi)" ] && ok "$url serves an OpenAPI document" || bad "$url has no OpenAPI document"
+done
 
 echo
 echo "${BOLD}==================================================================${OFF}"
-if [ "$FAIL" -eq 0 ]; then
-  echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED${OFF}"
-else
-  echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"
-fi
+if [ "$FAIL" -eq 0 ]; then echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED${OFF}"; else echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"; fi
 echo "${BOLD}==================================================================${OFF}"
 [ "$FAIL" -eq 0 ]

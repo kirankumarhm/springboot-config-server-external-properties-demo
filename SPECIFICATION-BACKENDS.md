@@ -1,5 +1,21 @@
 # Technical Specification — Backend Variants B (PostgreSQL/JDBC) and C (AWS S3)
 
+> **Revision 2026-10-06 - read this first.** The clients were simplified and extended after this
+> document was approved. Where the two disagree, the code and [README.md](README.md) are right.
+>
+> - **Superseded** (removed on purpose, to keep each client a small example): the immutable snapshot
+>   and its provider (`FR-22`, `FR-32`, `NFR-03`, `AC-10`), the snapshot/history endpoints (`FR-23` - each client
+>   now has one endpoint returning only its own configuration), last-known-good retention in the Spring
+>   clients (`FR-30`, `AC-05`, the `FR-30` part of `NFR-32`), and the refresh audit trail and metrics
+>   (`FR-31`, `AC-09`). Invalid configuration still **stops a client at startup**; after a refresh the
+>   Spring clients log an ERROR, while the Node.js and Go clients keep their previous values.
+>   README §4.3 states the trade-off.
+> - **Added:** three non-Spring clients in every version - `node-service` (Node.js), `go-service` (Go,
+>   both joining Spring Cloud Bus through their own RabbitMQ listener) and `lambda-service` (AWS Lambda
+>   behind API Gateway in Floci, reading the Config Server on every call).
+> - **Rules** for all further work: [.claude/rules/](.claude/rules/) (production grade, per-language
+>   standards, documentation, Floci for AWS, four ways to run every service).
+
 Addendum to [SPECIFICATION.md](SPECIFICATION.md) and [REQUIREMENTS.md](REQUIREMENTS.md).
 Version A (Git) is specified in the base documents; this document specifies the two
 additional backends and everything they change.

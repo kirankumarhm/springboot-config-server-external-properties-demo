@@ -21,129 +21,74 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * Executable enforcement of the design constraints this project depends on.
- *
- * <p>Three of these rules exist because the corresponding mistake is silent at compile time, silent
- * at startup, and only shows up as configuration that mysteriously fails to refresh in production.
- * A code review will not reliably catch them; the build will.
+ * Build-time guards. The first group catches mistakes that silently break live refresh: each
+ * compiles, starts and serves the first value correctly - and then never picks up a change. The
+ * second keeps the package layering ({@code controller -> config, dto}) and coding standards.
  */
 @AnalyzeClasses(
     packages = "com.example.config.pricing",
     importOptions = ImportOption.DoNotIncludeTests.class)
 class ArchitectureRulesTest {
 
-  // ===================================================================================
-  // The rules that protect live refresh
-  // ===================================================================================
-
-  /**
-   * Spring Cloud's rebinder refreshes a properties bean by re-initialising the EXISTING instance
-   * through its setters. A record is re-created instead, so every reference injected before the
-   * refresh keeps stale values.
-   */
+  /** A refresh updates the existing object through setters; a record cannot be updated. */
   @ArchTest
-  static final ArchRule refreshable_configuration_properties_must_not_be_records =
+  static final ArchRule configuration_properties_must_not_be_records =
       classes()
           .that()
           .areAnnotatedWith(ConfigurationProperties.class)
           .should(notBeRecords())
-          .because(
-              "the rebinder mutates the existing instance via setters; a record is re-created, "
-                  + "so previously injected references would keep stale values and live refresh "
-                  + "would silently stop working");
+          .because("a refresh updates the existing instance in place, which a record forbids");
 
-  /** Constructor binding has the same problem as a record: nothing to mutate in place. */
   @ArchTest
-  static final ArchRule refreshable_configuration_properties_must_expose_setters =
+  static final ArchRule configuration_properties_must_have_setters =
       classes()
           .that()
           .areAnnotatedWith(ConfigurationProperties.class)
           .should(haveASetterForEveryMutableField())
-          .because(
-              "setter-based JavaBean binding is what allows ConfigurationPropertiesRebinder to "
-                  + "refresh the bean in place");
+          .because("a refresh writes new values through the setters");
 
-  /**
-   * {@code ConfigurationPropertiesRebinder.rebind} rethrows after recording the error, so a
-   * constraint violation during rebind propagates out of {@code ContextRefresher.refresh()} and
-   * {@code RefreshScopeRefreshedEvent} is never published — losing last-known-good entirely.
-   */
-  @ArchTest
-  static final ArchRule refreshable_configuration_properties_must_not_be_validated =
-      classes()
-          .that()
-          .areAnnotatedWith(ConfigurationProperties.class)
-          .should(notBeAnnotatedWithValidated())
-          .because(
-              "the rebinder rethrows on violation, which aborts the refresh chain before "
-                  + "RefreshScopeRefreshedEvent is published; validation belongs in the "
-                  + "snapshot provider so a bad value can be rejected observably");
-
-  /**
-   * A {@code @Value}-injected field in a plain singleton is resolved once at construction and never
-   * updates, which looks exactly like a broken refresh.
-   */
+  /** {@code @Value} is resolved once at startup and never changes afterwards. */
   @ArchTest
   static final ArchRule no_value_annotated_fields =
       noFields()
           .should()
           .beAnnotatedWith(Value.class)
-          .because(
-              "@Value fields never refresh; refreshable configuration must be read through a "
-                  + "ConfigurationSnapshotProvider");
+          .because("@Value fields never refresh; use a @ConfigurationProperties class");
 
-  /**
-   * Business code must read an immutable snapshot, never the mutable properties bean, which the
-   * rebinder mutates field by field while requests are in flight.
-   */
   @ArchTest
-  static final ArchRule services_must_not_read_configuration_properties_directly =
+  static final ArchRule configuration_properties_live_in_config =
+      classes()
+          .that()
+          .areAnnotatedWith(ConfigurationProperties.class)
+          .should()
+          .resideInAPackage("..config..");
+
+  @ArchTest
+  static final ArchRule nothing_depends_on_controllers =
       noClasses()
           .that()
-          .resideInAPackage("..service..")
-          .or()
-          .resideInAPackage("..controller..")
+          .resideOutsideOfPackage("..controller..")
           .should()
           .dependOnClassesThat()
-          .areAnnotatedWith(ConfigurationProperties.class)
-          .because(
-              "a concurrent reader of a properties bean can observe half-applied state; business "
-                  + "code must go through the snapshot provider");
+          .resideInAPackage("..controller..");
 
-  // ===================================================================================
-  // General standards
-  // ===================================================================================
+  /** Response bodies are plain data: no Spring types leak into the API contract. */
+  @ArchTest
+  static final ArchRule dtos_do_not_depend_on_spring =
+      noClasses()
+          .that()
+          .resideInAPackage("..dto..")
+          .should()
+          .dependOnClassesThat()
+          .resideInAPackage("org.springframework..");
 
-  /** Constructor injection only: field injection hides dependencies and breaks plain unit tests. */
   @ArchTest
   static final ArchRule no_field_injection =
-      GeneralCodingRules.NO_CLASSES_SHOULD_USE_FIELD_INJECTION.because(
-          "constructor injection keeps dependencies explicit and testable without a container");
-
-  @ArchTest
-  static final ArchRule domain_must_not_depend_on_spring =
-      noClasses()
-          .that()
-          .resideInAPackage("..domain..")
-          .should()
-          .dependOnClassesThat()
-          .resideInAnyPackage("org.springframework..", "jakarta.persistence..")
-          .because("domain snapshots are plain immutable values with no framework coupling");
-
-  @ArchTest
-  static final ArchRule controllers_must_not_be_called_by_services =
-      noClasses()
-          .that()
-          .resideInAPackage("..service..")
-          .should()
-          .dependOnClassesThat()
-          .resideInAPackage("..controller..")
-          .because("dependencies point controller -> service, never the reverse");
+      GeneralCodingRules.NO_CLASSES_SHOULD_USE_FIELD_INJECTION;
 
   @ArchTest
   static final ArchRule no_standard_streams =
-      GeneralCodingRules.NO_CLASSES_SHOULD_ACCESS_STANDARD_STREAMS.because(
-          "use SLF4J so output is structured and level-controlled");
+      GeneralCodingRules.NO_CLASSES_SHOULD_ACCESS_STANDARD_STREAMS;
 
   @ArchTest
   static final ArchRule no_generic_exceptions =
@@ -152,10 +97,6 @@ class ArchitectureRulesTest {
   @ArchTest
   static final ArchRule no_java_util_logging =
       GeneralCodingRules.NO_CLASSES_SHOULD_USE_JAVA_UTIL_LOGGING;
-
-  // ===================================================================================
-  // Custom conditions
-  // ===================================================================================
 
   private static ArchCondition<JavaClass> notBeRecords() {
     return new ArchCondition<>("not be a record") {
@@ -166,27 +107,7 @@ class ArchitectureRulesTest {
                 .map(superclass -> "java.lang.Record".equals(superclass.getName()))
                 .orElse(false);
         if (isRecord) {
-          events.add(
-              SimpleConditionEvent.violated(
-                  item, item.getName() + " is a record and therefore cannot be rebound in place"));
-        }
-      }
-    };
-  }
-
-  private static ArchCondition<JavaClass> notBeAnnotatedWithValidated() {
-    return new ArchCondition<>("not be annotated with @Validated") {
-      @Override
-      public void check(JavaClass item, ConditionEvents events) {
-        boolean validated =
-            item.getAnnotations().stream()
-                .anyMatch(a -> a.getRawType().getName().endsWith(".Validated"));
-        if (validated) {
-          events.add(
-              SimpleConditionEvent.violated(
-                  item,
-                  item.getName()
-                      + " is @Validated; a violation during rebind aborts the refresh chain"));
+          events.add(SimpleConditionEvent.violated(item, item.getName() + " is a record"));
         }
       }
     };
@@ -210,13 +131,7 @@ class ArchitectureRulesTest {
           if (!hasSetter) {
             events.add(
                 SimpleConditionEvent.violated(
-                    item,
-                    item.getName()
-                        + " has no "
-                        + expected
-                        + "(...) so field '"
-                        + field.getName()
-                        + "' cannot be rebound on refresh"));
+                    item, item.getName() + " has no " + expected + "(...)"));
           }
         }
       }

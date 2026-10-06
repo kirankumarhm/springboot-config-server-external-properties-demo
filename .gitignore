@@ -47,3 +47,6 @@ logs/
 # RUNTIME, but it must not be a nested repo inside this one (git would store a gitlink and anyone
 # cloning would get an empty directory). Run `git init -b main` inside it after cloning - the
 # README quick start and .github/workflows/ci.yml both do exactly that.
+
+# --- Node.js ---
+node_modules/

@@ -56,7 +56,7 @@ k() { kubectl --kubeconfig="$KC" "$@"; }
 # A unique, immutable tag per deploy. See note 4 above for why :latest is unusable here.
 IMAGE_TAG="${IMAGE_TAG:-1.0.0-$(date +%Y%m%d%H%M%S)}"
 RENDERED="${SCRATCHPAD:-${TMPDIR:-/tmp}}/config-s3-k8s-$IMAGE_TAG"
-MODULES="config-server inventory-service pricing-service"
+MODULES="config-server inventory-service pricing-service node-service go-service"
 
 echo "==> Preflight"
 for c in floci aws docker kubectl mvn; do
@@ -106,8 +106,10 @@ k config rename-context default floci-eks >/dev/null 2>&1 || true
 k get nodes --no-headers | sed 's/^/    /'
 
 echo "==> Building jars and images on the host"
-(cd "$ROOT" && mvn -B -q -Pfast clean install -DskipTests)
-(cd "$ROOT" && docker compose -f docker/compose.yaml build config-server inventory-service pricing-service >/dev/null)
+(cd "$ROOT" && mvn ${MVN_FLAGS:--B -q -Pfast} clean install -DskipTests)
+# node-service and go-service download their dependencies while building; behind a TLS-inspecting
+# proxy, export EXTRA_CA_CERT first (see ../node-service/Dockerfile).
+(cd "$ROOT" && docker compose -f docker/compose.yaml build config-server inventory-service pricing-service node-service go-service >/dev/null)
 # Verify the artifacts exist rather than trusting an exit code - a PATH problem once made Maven
 # silently not run at all, and the failure only surfaced later as a missing jar in docker build.
 for m in config-server inventory-service pricing-service; do
@@ -131,6 +133,33 @@ for img in $IMPORTS; do
     && echo ok || { echo FAILED; exit 1; }
 done
 
+echo "==> Importing k3s's own system images (CoreDNS, storage, metrics)"
+# Same TLS problem as note 1, for the images k3s itself runs in kube-system. Without CoreDNS no
+# pod can resolve a Service name, so every client crash-loops with
+#   "getaddrinfo EAI_AGAIN config-server" / "I/O error on GET request for http://config-server:8888"
+# which looks like a Config Server problem but is DNS. The image list is read from the cluster,
+# so it stays right when k3s is upgraded. mirror.gcr.io (Google's Docker Hub mirror) is the
+# fallback when Docker Hub downloads fail on this network.
+for img in $(k -n kube-system get pods -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | sort -u); do
+  printf '    %-52s' "$img"
+  if ! docker image inspect "$img" >/dev/null 2>&1; then
+    docker pull -q "$img" >/dev/null 2>&1 \
+      || { docker pull -q "mirror.gcr.io/$img" >/dev/null 2>&1 && docker tag "mirror.gcr.io/$img" "$img"; } \
+      || { echo "FAILED (could not pull)"; continue; }
+  fi
+  # A multi-architecture image saved from Docker's containerd store can reference platforms that
+  # were never downloaded, and ctr rejects it ("content digest ... not found"). Rebuilding it as a
+  # single-platform image (FROM itself, no changes) gives a tarball ctr accepts.
+  if ! docker save "$img" | docker exec -i "$K3S" ctr -n k8s.io images import - >/dev/null 2>&1; then
+    echo "FROM $img" | docker build -q -t "$img" - >/dev/null 2>&1
+    docker save "$img" | docker exec -i "$K3S" ctr -n k8s.io images import - >/dev/null 2>&1 \
+      || { echo FAILED; continue; }
+  fi
+  echo ok
+done
+# Pods that already failed to pull keep backing off; recreate them so they use the imported images.
+k -n kube-system delete pod --field-selector=status.phase!=Running >/dev/null 2>&1 || true
+
 echo "==> Provisioning S3 + SQS in Floci"
 "$ROOT/scripts/provision-floci.sh" >/dev/null
 
@@ -149,7 +178,7 @@ echo "==> Rendering manifests with tag $IMAGE_TAG"
 # The manifests keep :latest so they stay readable and applyable on their own; the deploy pins an
 # immutable tag into a rendered copy.
 mkdir -p "$RENDERED"
-for f in 00-namespace-and-config.yaml 01-dependencies.yaml 02-config-server.yaml 03-clients.yaml; do
+for f in 00-namespace-and-config.yaml 01-dependencies.yaml 02-config-server.yaml 03-clients.yaml 04-network-policies.yaml 05-hpa.yaml; do
   sed "s|\(image: config-s3-demo-[a-z-]*\):latest|\1:${IMAGE_TAG}|" "$HERE/$f" > "$RENDERED/$f"
 done
 grep -h 'image: config-s3-demo' "$RENDERED"/*.yaml | sed 's/^/    /'
@@ -166,6 +195,10 @@ k -n $NS rollout status deployment/config-server --timeout=300s
 k apply -f "$RENDERED/03-clients.yaml" >/dev/null
 k -n $NS rollout status deployment/inventory-service --timeout=300s
 k -n $NS rollout status deployment/pricing-service --timeout=300s
+k -n $NS rollout status deployment/node-service --timeout=300s
+k -n $NS rollout status deployment/go-service --timeout=300s
+k apply -f "$RENDERED/04-network-policies.yaml" >/dev/null
+k apply -f "$RENDERED/05-hpa.yaml" >/dev/null
 
 echo "==> Asserting pods run the image just built (see note 4 above)"
 # Do NOT compare kubelet's containerStatuses[].imageID against `docker images --format {{.ID}}`.
@@ -179,7 +212,9 @@ fail=0
 for m in $MODULES; do
   host_digest=$(docker images --no-trunc --format '{{.ID}}' "config-s3-demo-${m}:${IMAGE_TAG}")
   ctr_digest=$(docker exec "$K3S" ctr -n k8s.io images ls 2>/dev/null \
-    | awk -v t="config-s3-demo-${m}:${IMAGE_TAG}" '$1 ~ t {print $3; exit}')
+    | awk -v t="config-s3-demo-${m}:${IMAGE_TAG}" '$1 ~ t && !found {print $3; found=1}')
+  # No early `exit` in awk: under `set -o pipefail` it closes the pipe while ctr is still
+  # writing, ctr dies of SIGPIPE, and the whole script exits with status 141 mid-check.
   pod_image=$(k -n $NS get pods -l app="$m" -o jsonpath='{.items[0].spec.containers[0].image}')
   if [ "$host_digest" = "$ctr_digest" ] && [ "$pod_image" = "config-s3-demo-${m}:${IMAGE_TAG}" ]; then
     printf '    %-22s OK  tag=%s digest=%s\n' "$m" "$IMAGE_TAG" "${ctr_digest:0:19}"

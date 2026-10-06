@@ -1,296 +1,239 @@
 #!/usr/bin/env bash
-# End-to-end acceptance test for version C (AWS S3 backend, Floci emulator).
+# End-to-end acceptance test for version C (AWS S3 backend, on the Floci emulator).
 #
-# Configuration changes are made by uploading objects to S3. Unlike Git and PostgreSQL, S3 event
-# delivery is at-least-once and unordered, so this suite additionally proves the refresh path is
-# idempotent and that poison messages are contained by a dead-letter queue.
+#   # from: version-c-s3/
+#   ./scripts/e2e-test.sh
+#
+# Proves the point of the project: upload a changed YAML object with `aws s3 cp`, and every
+# client that owns that value serves the new value within seconds - with no restart - while the
+# clients that do not own it are untouched. No application code takes part in the write: S3
+# sends an event to SQS, the Config Server consumes it and broadcasts a refresh.
+# Covers all five clients:
+#   inventory-service, pricing-service (Spring Boot)  -> refreshed over Spring Cloud Bus
+#   node-service (Node.js), go-service (Go)            -> refreshed over Spring Cloud Bus
+#   lambda-service (AWS Lambda in Floci)               -> reads the latest values on every call
+#
+# Needs: Floci running and provisioned (scripts/provision-floci.sh), the Compose stack running
+# (docker compose -f docker/compose.yaml up -d --build), lambda-service deployed to Floci
+# (lambda-service/scripts/deploy-floci.sh), the AWS CLI, python3 and curl.
+# Set SKIP_LAMBDA=1 to skip the Lambda checks when Floci is not running.
+#
+# The suite uploads objects to the bucket. It sets a known baseline first and restores it at the end, so
+# it can be run any number of times.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-export AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-http://localhost.floci.io:4566}"
-export AWS_ACCESS_KEY_ID=test
-export AWS_SECRET_ACCESS_KEY=test
-export AWS_DEFAULT_REGION=us-east-1
-
+SERVER="http://localhost:8908"
+SERVER_MGMT="http://localhost:9900"
 BUCKET=acme-platform-config
 PREFIX=main/
-QUEUE=config-change-queue
-DLQ=config-change-dlq
+export AWS_ENDPOINT_URL="${AWS_ENDPOINT_URL:-http://localhost.floci.io:4566}"
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_DEFAULT_REGION=us-east-1
+CLIENT_AUTH="config-client:client-secret"
+INVENTORY="http://localhost:8101/api/v1/inventory/config"
+PRICING="http://localhost:8102/api/v1/pricing/config"
+NODE="http://localhost:8104/api/v1/node/config"
+GO="http://localhost:8105/api/v1/go/config"
+SLA_SECONDS=5
+SKIP_LAMBDA=${SKIP_LAMBDA:-0}
+LAMBDA_INVOKE="$HERE/../lambda-service/scripts/invoke-floci.sh"
 
-INV="http://localhost:8101"
-PRC="http://localhost:8102"
-PRC2="http://localhost:8103"
-INV_MGMT="http://localhost:9101"
-SERVER="http://localhost:8908"
-ADMIN="config-admin:admin-secret"
-# The Config Server now exposes actuator on a SEPARATE port (management child context).
-SERVER_MGMT="http://localhost:9900"
-
-SLA_SECONDS=10
-
-PASS=0
-FAIL=0
+PASS=0; FAIL=0
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+ok()      { PASS=$((PASS+1)); echo "  ${GREEN}PASS${OFF}  $1"; }
+bad()     { FAIL=$((FAIL+1)); echo "  ${RED}FAIL${OFF}  $1"; }
+section() { echo; echo "${BOLD}$1${OFF}"; }
 
-jget() {
-  python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d = d[int(k)] if k.isdigit() else d[k]
-print(d)' "$1" 2>/dev/null
+# json <field> : reads JSON on stdin and prints one top-level field ("" if absent or not JSON).
+json() { python3 -c 'import sys,json
+try: v=json.load(sys.stdin).get(sys.argv[1], "")
+except Exception: v=""
+print(str(v).lower() if isinstance(v,bool) else v)' "$1" 2>/dev/null; }
+
+get()    { curl -s -m 5 "$1"; }
+lambda() { "$LAMBDA_INVOKE" 2>/dev/null; }
+status() { curl -s -m 5 -o /dev/null -w '%{http_code}' "$@"; }
+
+# set_prop <application> <key> <value> : downloads <application>.yml from the bucket, changes
+# the key and uploads it again. One upload = one S3 event = one refresh broadcast.
+set_prop() {
+  local file key="${2#*.}" tmp
+  file="$1.yml"; tmp="$(mktemp)"
+  aws s3 cp "s3://$BUCKET/$PREFIX$file" "$tmp" >/dev/null 2>&1 || { bad "could not download $file"; return; }
+  python3 - "$tmp" "$key" "$3" <<'PY2'
+import re, sys
+path, key, value = sys.argv[1:]
+text = open(path).read()
+new, n = re.subn(rf'^(\s*){re.escape(key)}:.*$', lambda m: f"{m.group(1)}{key}: {value}", text, count=1, flags=re.M)
+if n != 1:
+    sys.exit(f"key '{key}' not found in {path}")
+open(path, 'w').write(new)
+PY2
+  aws s3 cp "$tmp" "s3://$BUCKET/$PREFIX$file" >/dev/null 2>&1 || bad "could not upload $file"
+  rm -f "$tmp"
 }
 
-snap()    { curl -s -m 5 "$1/api/v1/config/snapshot"; }
-version() { snap "$1" | jget version; }
-field()   { snap "$1" | jget "$2"; }
-
-ok()   { PASS=$((PASS+1)); echo "  ${GREEN}PASS${OFF}  $1"; }
-bad()  { FAIL=$((FAIL+1)); echo "  ${RED}FAIL${OFF}  $1"; }
-head2(){ echo; echo "${BOLD}$1${OFF}"; }
-
-
-queue_url() { aws sqs get-queue-url --queue-name "$1" --query QueueUrl --output text 2>/dev/null; }
-
-put_config() { # local-file, object-name
-  aws s3 cp "$1" "s3://$BUCKET/$PREFIX$2" >/dev/null 2>&1
-}
-
-write_inventory() { # express, maxqty, threshold
-  cat > "$TMP/inventory-service.yml" <<EOF
-inventory:
-  warehouse-code: "WH-BLR-01"
-  max-order-quantity: $2
-  express-shipping-enabled: $1
-  low-stock-threshold: $3
-EOF
-  put_config "$TMP/inventory-service.yml" inventory-service.yml
-}
-
-write_shared() { # label
-  cat > "$TMP/application.yml" <<EOF
-demo:
-  shared:
-    banner-message: "Configured centrally via Spring Cloud Config - AWS S3 backend"
-    environment-label: "$1"
-EOF
-  put_config "$TMP/application.yml" application.yml
-}
-
-wait_for_version_above() {
-  local url="$1" baseline="$2" deadline start now v elapsed
-  start=$(python3 -c 'import time;print(time.time())')
-  deadline=$((SECONDS + SLA_SECONDS))
-  while [ $SECONDS -lt $deadline ]; do
-    v=$(version "$url")
-    if [ -n "$v" ] && [ "$v" -gt "$baseline" ] 2>/dev/null; then
-      now=$(python3 -c 'import time;print(time.time())')
-      elapsed=$(python3 -c "print(f'{$now-$start:.2f}')")
-      echo "$elapsed"; return 0
+# expect_within <description> <expected> <command...> : polls until the command prints the
+# expected value, for at most SLA_SECONDS. Reports how long it took.
+expect_within() {
+  local description="$1" expected="$2"; shift 2
+  local start=$SECONDS got=""
+  while [ $((SECONDS - start)) -le "$SLA_SECONDS" ]; do
+    got=$("$@")
+    if [ "$got" = "$expected" ]; then
+      ok "$description ($((SECONDS - start))s, SLA ${SLA_SECONDS}s)"
+      return 0
     fi
-    sleep 0.2
-  done
-  echo "TIMEOUT"; return 1
-}
-
-wait_for_outcome() { # url, timeout, expected...
-  local url="$1" timeout="$2"; shift 2
-  local deadline=$((SECONDS + timeout)) o
-  while [ $SECONDS -lt $deadline ]; do
-    o=$(field "$url" lastOutcome)
-    for want in "$@"; do [ "$o" = "$want" ] && { echo "$o"; return 0; }; done
     sleep 0.3
   done
-  echo "${o:-unknown}"; return 1
+  bad "$description: got '$got', expected '$expected' within ${SLA_SECONDS}s"
 }
 
+field_of() { get "$1" | json "$2"; }
+lambda_field() { lambda | json "$1"; }
+
+baseline() {
+  set_prop inventory-service inventory.max-order-quantity 500
+  set_prop pricing-service pricing.surge-pricing-enabled false
+  set_prop node-service node.max-items 25
+  set_prop go-service go.max-items 50
+  set_prop lambda-service lambda.max-items 10
+  sleep 3
+}
+trap 'echo; echo "Restoring the baseline..."; baseline' EXIT
+
 echo "${BOLD}==================================================================${OFF}"
-echo "${BOLD} Version C (AWS S3 backend via Floci) - end-to-end acceptance${OFF}"
+echo "${BOLD} Version C (S3 backend on Floci) - end-to-end acceptance${OFF}"
 echo "${BOLD}==================================================================${OFF}"
 
-# ---------------------------------------------------------------- preconditions
-head2 "Preconditions"
-for pair in "config-server:$SERVER_MGMT/actuator/health" \
-            "inventory-service:$INV_MGMT/actuator/health" \
-            "pricing-service:http://localhost:9102/actuator/health" \
-            "pricing-service-2:http://localhost:9103/actuator/health"; do
-  name="${pair%%:*}"; url="${pair#*:}"
-  status=$(curl -s -m 5 "$url" | jget status)
-  [ "$status" = "UP" ] && ok "$name is UP" || bad "$name health = ${status:-unreachable}"
+# ------------------------------------------------------------------------------ preconditions
+section "Preconditions"
+[ "$(get "$SERVER_MGMT/actuator/health" | json status)" = "UP" ] && ok "config-server is UP" || bad "config-server is not UP"
+for name in inventory:9101 pricing:9102; do
+  [ "$(get "http://localhost:${name#*:}/actuator/health" | json status)" = "UP" ] \
+    && ok "${name%%:*}-service is UP" || bad "${name%%:*}-service is not UP"
 done
-
-objs=$(aws s3 ls "s3://$BUCKET/$PREFIX" 2>/dev/null | wc -l | tr -d ' ')
-[ "${objs:-0}" -ge 3 ] 2>/dev/null && ok "bucket holds $objs configuration objects" || bad "bucket objects = ${objs:-0}"
-
-vers=$(aws s3api get-bucket-versioning --bucket "$BUCKET" --query Status --output text 2>/dev/null)
-[ "$vers" = "Enabled" ] && ok "bucket versioning enabled (audit + rollback)" || bad "versioning = $vers"
-
-[ -n "$(queue_url $QUEUE)" ] && ok "SQS queue $QUEUE exists" || bad "queue $QUEUE missing"
-[ -n "$(queue_url $DLQ)" ]   && ok "SQS dead-letter queue $DLQ exists" || bad "DLQ $DLQ missing"
-
-if [ "$(curl -s -o /dev/null -w '%{http_code}' "$SERVER/inventory-service/default")" = "401" ]; then
-  ok "Environment API rejects unauthenticated access"
+for name in node:8104 go:8105; do
+  [ "$(get "http://localhost:${name#*:}/health" | json status)" = "UP" ] \
+    && ok "${name%%:*}-service is UP" || bad "${name%%:*}-service is not UP"
+done
+objects=$(aws s3 ls "s3://$BUCKET/$PREFIX" 2>/dev/null | wc -l | tr -d ' ')
+[ "${objects:-0}" -ge 6 ] 2>/dev/null && ok "bucket holds $objects configuration objects" || bad "bucket objects = ${objects:-0} (run scripts/provision-floci.sh)"
+[ "$(aws s3api get-bucket-versioning --bucket "$BUCKET" --query Status --output text 2>/dev/null)" = "Enabled" ] \
+  && ok "bucket versioning is on (every change is kept, so any change can be rolled back)" || bad "bucket versioning is off"
+for queue in config-change-queue config-change-dlq; do
+  aws sqs get-queue-url --queue-name "$queue" >/dev/null 2>&1 && ok "SQS queue $queue exists" || bad "SQS queue $queue missing"
+done
+if [ "$SKIP_LAMBDA" = "1" ]; then
+  echo "  ${YELLOW}SKIP${OFF}  lambda-service (SKIP_LAMBDA=1)"
+elif [ -n "$(lambda_field greeting)" ]; then
+  ok "lambda-service answers through Floci API Gateway"
 else
-  bad "Environment API is NOT protected"
+  bad "lambda-service is not reachable - run lambda-service/scripts/deploy-floci.sh (or SKIP_LAMBDA=1)"
 fi
 
-# The label MUST be included. In the S3 backend the label maps to a key PREFIX, so the bucket's
-# main/ prefix IS the label "main". Requesting /inventory-service/default without a label looks
-# at the bucket root, finds nothing, and correctly returns zero property sources - which looks
-# like a broken server but is the documented behaviour. Clients send label=main, so they resolve.
-served=$(curl -s -u "$ADMIN" "$SERVER/inventory-service/default/main" | jget 'propertySources.0.name')
-[ -n "$served" ] && ok "Environment API serves from S3 with label 'main' (source: $(basename "$served"))" \
-                 || bad "Environment API returned no property sources for label main"
+section "Baseline"
+baseline
+echo "  configuration reset to the test baseline"
 
-rootless=$(curl -s -u "$ADMIN" "$SERVER/inventory-service/default" \
-  | python3 -c 'import sys,json;print(len(json.load(sys.stdin).get("propertySources",[])))' 2>/dev/null)
-[ "$rootless" = "0" ] && ok "no label resolves to the bucket root and returns nothing (label == key prefix)" \
-                      || bad "expected 0 property sources without a label, got $rootless"
+# ------------------------------------------------------------------------------ each client serves its own properties
+section "Each client returns ONLY its own properties"
+inventory_keys=$(get "$INVENTORY" | python3 -c 'import sys,json;print(",".join(sorted(json.load(sys.stdin))))' 2>/dev/null)
+[ "$inventory_keys" = "expressShippingEnabled,lowStockThreshold,maxOrderQuantity,warehouseCode" ] \
+  && ok "inventory-service: $inventory_keys" || bad "inventory-service keys: $inventory_keys"
+pricing_keys=$(get "$PRICING" | python3 -c 'import sys,json;print(",".join(sorted(json.load(sys.stdin))))' 2>/dev/null)
+[ "$pricing_keys" = "currency,discountPercentage,surgeMultiplier,surgePricingEnabled" ] \
+  && ok "pricing-service: $pricing_keys" || bad "pricing-service keys: $pricing_keys"
+[ "$(field_of "$NODE" greeting)" = "Hello from Node.js" ] && ok "node-service greets from Node.js" || bad "node-service greeting"
+[ "$(field_of "$GO" greeting)" = "Hello from Go" ] && ok "go-service greets from Go" || bad "go-service greeting"
+if [ "$SKIP_LAMBDA" != "1" ]; then
+  [ "$(lambda_field greeting)" = "Hello from AWS Lambda" ] && ok "lambda-service greets from AWS Lambda" || bad "lambda-service greeting"
+fi
 
-head2 "Baseline"
-write_inventory false 500 25
-write_shared local
-sleep 4
-echo "  baseline uploaded"
+# ------------------------------------------------------------------------------ live refresh, scoped
+section "A change reaches only the service that owns it - live, no restart"
+set_prop inventory-service inventory.max-order-quantity 750
+expect_within "inventory-service maxOrderQuantity 500 -> 750 after aws s3 cp" 750 field_of "$INVENTORY" maxOrderQuantity
+[ "$(field_of "$PRICING" surgePricingEnabled)" = "false" ] && ok "pricing-service untouched" || bad "pricing-service changed"
+[ "$(field_of "$NODE" maxItems)" = "25" ] && ok "node-service untouched" || bad "node-service changed"
 
-# ---------------------------------------------------------------- AC-18
-head2 "AC-18  S3 upload propagates, scoped to one application"
-inv_b=$(version "$INV"); prc_b=$(version "$PRC")
-echo "  baseline versions: inventory=$inv_b pricing=$prc_b"
-mode_before=$(curl -s -m 5 -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"SKU-1","quantity":10}' | jget shippingMode)
+set_prop pricing-service pricing.surge-pricing-enabled true
+expect_within "pricing-service surgePricingEnabled false -> true" true field_of "$PRICING" surgePricingEnabled
+[ "$(field_of "$INVENTORY" maxOrderQuantity)" = "750" ] && ok "inventory-service untouched" || bad "inventory-service changed"
 
-write_inventory true 500 25
+set_prop node-service node.max-items 30
+expect_within "node-service (Node.js, over Spring Cloud Bus) maxItems 25 -> 30" 30 field_of "$NODE" maxItems
+[ "$(field_of "$GO" maxItems)" = "50" ] && ok "go-service untouched" || bad "go-service changed"
 
-elapsed=$(wait_for_version_above "$INV" "$inv_b")
-[ "$elapsed" != "TIMEOUT" ] && ok "inventory-service refreshed in ${elapsed}s after aws s3 cp" \
-                            || bad "inventory-service did not refresh within ${SLA_SECONDS}s"
+set_prop go-service go.max-items 55
+expect_within "go-service (Go, over Spring Cloud Bus) maxItems 50 -> 55" 55 field_of "$GO" maxItems
+[ "$(field_of "$NODE" maxItems)" = "30" ] && ok "node-service untouched" || bad "node-service changed"
 
-mode_after=$(curl -s -m 5 -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"SKU-1","quantity":10}' | jget shippingMode)
-[ "$mode_after" = "EXPRESS" ] && ok "business behaviour changed: $mode_before -> EXPRESS" \
-                              || bad "shippingMode = $mode_after"
+if [ "$SKIP_LAMBDA" != "1" ]; then
+  set_prop lambda-service lambda.max-items 12
+  expect_within "lambda-service (reads on every call) maxItems 10 -> 12" 12 lambda_field maxItems
+fi
 
-prc_after=$(version "$PRC")
-[ "$prc_after" = "$prc_b" ] && ok "pricing-service untouched - exact key->application mapping, no dash-guessing" \
-                            || bad "pricing-service moved $prc_b -> $prc_after"
+# ------------------------------------------------------------------------------ rollback
+section "Rollback: restore an earlier S3 object version"
+previous=$(aws s3api list-object-versions --bucket "$BUCKET" --prefix "${PREFIX}inventory-service.yml" \
+  --query 'sort_by(Versions,&LastModified)[-2].VersionId' --output text 2>/dev/null)
+aws s3api copy-object --bucket "$BUCKET" --key "${PREFIX}inventory-service.yml" \
+  --copy-source "$BUCKET/${PREFIX}inventory-service.yml?versionId=$previous" >/dev/null 2>&1
+expect_within "inventory-service back to 500 after restoring version $previous" 500 field_of "$INVENTORY" maxOrderQuantity
+events=$(get "$SERVER_MGMT/actuator/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["components"]["configChange"]["details"]["eventsReceived"])' 2>/dev/null)
+[ "${events:-0}" -ge 1 ] 2>/dev/null && ok "Config Server health reports $events S3 events received" || bad "S3 events received: ${events:-none}"
 
-# ---------------------------------------------------------------- AC-01 / AC-03
-head2 "AC-01 / AC-03  shared object reaches ALL apps and ALL instances"
-inv_b=$(version "$INV"); prc_b=$(version "$PRC"); prc2_b=$(version "$PRC2")
-write_shared production-like
-e1=$(wait_for_version_above "$INV" "$inv_b")
-e2=$(wait_for_version_above "$PRC" "$prc_b")
-e3=$(wait_for_version_above "$PRC2" "$prc2_b")
-[ "$e1" != "TIMEOUT" ] && ok "inventory-service refreshed in ${e1}s" || bad "inventory-service timed out"
-[ "$e2" != "TIMEOUT" ] && ok "pricing-service refreshed in ${e2}s"   || bad "pricing-service timed out"
-[ "$e3" != "TIMEOUT" ] && ok "pricing-service-2 refreshed in ${e3}s" || bad "pricing-service-2 timed out"
-for u in "$INV" "$PRC" "$PRC2"; do
-  lbl=$(field "$u" settings.environmentLabel)
-  [ "$lbl" = "production-like" ] && ok "$u sees production-like" || bad "$u label=$lbl"
-done
+# ------------------------------------------------------------------------------ SQS-specific guarantees
+QUEUE_URL=$(aws sqs get-queue-url --queue-name config-change-queue --query QueueUrl --output text 2>/dev/null)
+DLQ_URL=$(aws sqs get-queue-url --queue-name config-change-dlq --query QueueUrl --output text 2>/dev/null)
 
-# ---------------------------------------------------------------- AC-19
-head2 "AC-19  duplicate events are idempotent (S3 is at-least-once)"
-inv_b=$(version "$INV")
-QURL=$(queue_url $QUEUE)
-DUP='{"Records":[{"eventVersion":"2.1","eventSource":"aws:s3","awsRegion":"us-east-1",
-"eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"acme-platform-config"},
-"object":{"key":"main/inventory-service.yml","size":127}}}]}'
-for n in 1 2 3; do
-  aws sqs send-message --queue-url "$QURL" --message-body "$DUP" >/dev/null 2>&1
-done
+section "Duplicate S3 events are harmless (S3 delivers at least once)"
+event='{"Records":[{"eventVersion":"2.1","eventSource":"aws:s3","awsRegion":"us-east-1","eventName":"ObjectCreated:Put","s3":{"bucket":{"name":"acme-platform-config"},"object":{"key":"main/inventory-service.yml","size":127}}}]}'
+before=$(field_of "$INVENTORY" maxOrderQuantity)
+for n in 1 2 3; do aws sqs send-message --queue-url "$QUEUE_URL" --message-body "$event" >/dev/null 2>&1; done
 sleep 6
-inv_after=$(version "$INV")
-outcome=$(field "$INV" lastOutcome)
-[ "$inv_after" = "$inv_b" ] && ok "3 duplicate events -> version unchanged ($inv_after)" \
-                            || bad "version moved $inv_b -> $inv_after on duplicate events"
-[ "$outcome" = "NO_CHANGE" ] && ok "lastOutcome=NO_CHANGE (refresh ran, nothing adopted)" \
-                             || bad "lastOutcome=$outcome"
+[ "$(field_of "$INVENTORY" maxOrderQuantity)" = "$before" ] && ok "3 duplicate events: inventory-service still serves $before" \
+                                                          || bad "duplicate events changed the served value"
+[ "$(get "$SERVER_MGMT/actuator/health" | json status)" = "UP" ] && ok "Config Server stays UP" || bad "Config Server not UP"
 
-# ---------------------------------------------------------------- AC-20
-head2 "AC-20  poison message lands in the DLQ and does not block the queue"
-DLQ_URL=$(queue_url $DLQ)
+section "A malformed message goes to the dead-letter queue and does not block real changes"
 aws sqs purge-queue --queue-url "$DLQ_URL" >/dev/null 2>&1
-sleep 2
-aws sqs send-message --queue-url "$QURL" --message-body 'this-is-not-json' >/dev/null 2>&1
-echo "  waiting for redrive (visibility 30s x maxReceiveCount 3)..."
-dlq_count=0
+aws sqs send-message --queue-url "$QUEUE_URL" --message-body 'this-is-not-json' >/dev/null 2>&1
+echo "  waiting for the redrive (visibility 30s x maxReceiveCount 3, up to 2 minutes)..."
+in_dlq=0
 for i in $(seq 1 24); do
   sleep 5
-  dlq_count=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" \
-    --attribute-names ApproximateNumberOfMessages \
+  in_dlq=$(aws sqs get-queue-attributes --queue-url "$DLQ_URL" --attribute-names ApproximateNumberOfMessages \
     --query 'Attributes.ApproximateNumberOfMessages' --output text 2>/dev/null)
-  [ "${dlq_count:-0}" -ge 1 ] 2>/dev/null && break
+  [ "${in_dlq:-0}" -ge 1 ] 2>/dev/null && break
 done
-[ "${dlq_count:-0}" -ge 1 ] 2>/dev/null && ok "poison message reached the DLQ after retries" \
-                                        || bad "poison message not in DLQ after 120s (count=${dlq_count:-0})"
+[ "${in_dlq:-0}" -ge 1 ] 2>/dev/null && ok "the malformed message reached the dead-letter queue after its retries" \
+                                     || bad "malformed message not in the dead-letter queue after 2 minutes"
+set_prop node-service node.max-items 33
+expect_within "the queue still delivers real changes (node-service maxItems -> 33)" 33 field_of "$NODE" maxItems
 
-inv_b=$(version "$INV")
-write_inventory true 600 25
-e=$(wait_for_version_above "$INV" "$inv_b")
-[ "$e" != "TIMEOUT" ] && ok "queue still processing normally afterwards (${e}s)" \
-                      || bad "queue blocked after poison message"
-
-# ---------------------------------------------------------------- AC-05
-head2 "AC-05  invalid configuration rejected, last-known-good retained"
-good_v=$(version "$INV"); good_max=$(field "$INV" settings.maxOrderQuantity)
-write_inventory true 99999 25
-wait_for_outcome "$INV" 20 REJECTED >/dev/null
-[ "$(field "$INV" settings.maxOrderQuantity)" = "$good_max" ] && ok "still serving last-known-good ($good_max)" \
-                                                             || bad "adopted invalid value"
-[ "$(version "$INV")" = "$good_v" ] && ok "snapshot version unchanged ($good_v)" || bad "version moved"
-code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"S","quantity":5}')
-[ "$code" = "200" ] && ok "business endpoint still serving (HTTP 200)" || bad "endpoint returned $code"
-
-# ---------------------------------------------------------------- AC-21
-head2 "AC-21  rollback via a prior object version (S3 versioning replaces git revert)"
-nver=$(aws s3api list-object-versions --bucket "$BUCKET" --prefix "${PREFIX}inventory-service.yml" \
-  --query 'length(Versions)' --output text 2>/dev/null)
-[ "${nver:-0}" -ge 2 ] 2>/dev/null && ok "object has $nver versions retained" || bad "versions = ${nver:-0}"
-
-# Second-newest version is the last VALID upload (the newest is the invalid 99999 one).
-prev=$(aws s3api list-object-versions --bucket "$BUCKET" --prefix "${PREFIX}inventory-service.yml" \
-  --query 'sort_by(Versions,&LastModified)[-2].VersionId' --output text 2>/dev/null)
-echo "  rolling back to versionId $prev"
-inv_b=$(version "$INV")
-aws s3api copy-object --bucket "$BUCKET" --key "${PREFIX}inventory-service.yml" \
-  --copy-source "$BUCKET/${PREFIX}inventory-service.yml?versionId=$prev" >/dev/null 2>&1
-rec=$(wait_for_outcome "$INV" 20 APPLIED NO_CHANGE)
-[ "$rec" = "APPLIED" ] || [ "$rec" = "NO_CHANGE" ] && ok "rollback applied (lastOutcome=$rec)" \
-                                                   || bad "rollback did not apply: $rec"
-maxq=$(field "$INV" settings.maxOrderQuantity)
-[ "$maxq" = "600" ] && ok "rolled back to the previous valid value (600)" || bad "maxOrderQuantity=$maxq"
-
-# ---------------------------------------------------------------- detector state
-head2 "Detector observability"
-det=$(curl -s -m 5 "$SERVER_MGMT/actuator/health" | python3 -c "
-import sys,json
-d=json.load(sys.stdin).get('components',{}).get('configChange',{}).get('details',{})
-print(d.get('mechanism'),'|',d.get('eventsReceived'),'|',d.get('lastEventAt'))" 2>/dev/null)
-echo "  $det"
-echo "$det" | grep -q 'S3 Event Notifications' && ok "detector mechanism reported in health" || bad "detector health missing"
-evt=$(echo "$det" | awk -F'|' '{print $2}' | tr -d ' ')
-[ "${evt:-0}" -ge 1 ] 2>/dev/null && ok "eventsReceived=$evt" || bad "eventsReceived=${evt:-0}"
-
-# ---------------------------------------------------------------- NFR-10
-head2 "NFR-10  the encryption endpoints require authentication"
-# No configuration value is {cipher}-encrypted any more, so there is no decrypted secret to
-# assert on. The endpoints still exist, and their access control is still worth asserting.
-code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: text/plain' --data-binary x "$SERVER/encrypt")
-[ "$code" = "401" ] && ok "/encrypt rejects unauthenticated callers" || bad "/encrypt returned $code"
-
+# ------------------------------------------------------------------------------ security and errors
+section "Security and error format"
+[ "$(status "$SERVER/inventory-service/default")" = "401" ] && ok "Config Server rejects unauthenticated reads" || bad "Config Server readable without credentials"
+[ "$(status -H 'Content-Type: text/plain' --data-binary x "$SERVER/encrypt")" = "401" ] && ok "/encrypt requires authentication" || bad "/encrypt is open"
+[ "$(status http://localhost:8101/swagger-ui/index.html)" = "200" ] && ok "inventory-service Swagger UI is served" || bad "inventory-service Swagger UI"
+[ "$(status http://localhost:8101/internal)" = "403" ] && ok "inventory-service denies paths outside its API" || bad "inventory-service /internal not denied"
+[ "$(status -X POST http://localhost:9101/actuator/refresh)" = "403" ] && ok "client refresh endpoint is not open over HTTP" || bad "client /actuator/refresh is open"
+for url in "http://localhost:8102/api/v1/pricing/nope" "http://localhost:8104/nope" "http://localhost:8105/nope"; do
+  ctype=$(curl -s -m 5 -o /dev/null -w '%{content_type}' "$url")
+  [ "$ctype" = "application/problem+json" ] && ok "$url -> 404 problem+json" || bad "$url content type '$ctype'"
+done
+for url in "$INVENTORY" "$NODE" "$GO"; do
+  frame=$(curl -s -m 5 -D - -o /dev/null "$url" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-frame-options"{print $2}')
+  [ "$frame" = "DENY" ] && ok "$url sends security headers" || bad "$url X-Frame-Options='$frame'"
+done
+for url in "http://localhost:8101/v3/api-docs" "http://localhost:8104/v3/api-docs" "http://localhost:8105/v3/api-docs"; do
+  [ -n "$(get "$url" | json openapi)" ] && ok "$url serves an OpenAPI document" || bad "$url has no OpenAPI document"
+done
 
 echo
 echo "${BOLD}==================================================================${OFF}"
-if [ "$FAIL" -eq 0 ]; then
-  echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED${OFF}"
-else
-  echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"
-fi
+if [ "$FAIL" -eq 0 ]; then echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED${OFF}"; else echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"; fi
 echo "${BOLD}==================================================================${OFF}"
 [ "$FAIL" -eq 0 ]

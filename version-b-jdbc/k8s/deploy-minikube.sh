@@ -28,12 +28,14 @@ echo "==> Building jars"
 (cd "$ROOT" && mvn -B -q -Pfast clean install -DskipTests)
 
 echo "==> Building images on the host daemon"
-(cd "$ROOT" && docker compose -f docker/compose.yaml build config-server inventory-service pricing-service >/dev/null)
+(cd "$ROOT" && docker compose -f docker/compose.yaml build config-server inventory-service pricing-service node-service go-service >/dev/null)
 
 echo "==> Loading images into minikube"
 for img in config-jdbc-demo-config-server:latest \
            config-jdbc-demo-inventory-service:latest \
            config-jdbc-demo-pricing-service:latest \
+           config-jdbc-demo-node-service:latest \
+           config-jdbc-demo-go-service:latest \
            postgres:17.6 \
            rabbitmq:4-management; do
   printf '    %-45s' "$img"
@@ -63,6 +65,15 @@ kubectl apply -f "$HERE/03-clients.yaml"
 echo "==> Waiting for clients"
 kubectl -n $NS rollout status deployment/inventory-service --timeout=300s
 kubectl -n $NS rollout status deployment/pricing-service --timeout=300s
+kubectl -n $NS rollout status deployment/node-service --timeout=300s
+kubectl -n $NS rollout status deployment/go-service --timeout=300s
+
+echo "==> Applying network policies and autoscalers"
+# Policies are only ENFORCED by a CNI that supports them (minikube: --cni=calico); the default
+# CNI accepts and ignores them, so they are applied either way. The autoscalers need the
+# metrics-server addon (minikube addons enable metrics-server) to act.
+kubectl apply -f "$HERE/04-network-policies.yaml"
+kubectl apply -f "$HERE/05-hpa.yaml"
 
 echo
 kubectl -n $NS get pods -o wide

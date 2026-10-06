@@ -8,7 +8,11 @@ services:
     image: postgres:17.6
     container_name: cfg-jdbc-postgres
     ports:
-      - "5432:5432"
+      # Host port 5433, not 5432: a PostgreSQL installed directly on the machine (very common on
+      # developer laptops) already owns 5432, and Docker then refuses to start this container
+      # with "bind: address already in use". Inside Docker, the Config Server still uses
+      # postgres:5432. Override with POSTGRES_HOST_PORT if 5433 is taken too.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
     environment:
       POSTGRES_DB: configdb
       POSTGRES_USER: config_admin
@@ -81,14 +85,17 @@ services:
       config-server:
         condition: service_healthy
     ports:
-      - "8091:8081"
-      - "9091:9081"
+      - "8091:8091"
+      - "9091:9091"
     environment:
+      SERVER_PORT: 8091
+      MANAGEMENT_PORT: 9091
       CONFIG_SERVER_URI: http://config-server:8888
       CONFIG_CLIENT_PASSWORD: client-secret
       RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9081/actuator/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/actuator/health"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -105,42 +112,73 @@ services:
       config-server:
         condition: service_healthy
     ports:
-      - "8092:8082"
-      - "9092:9082"
+      - "8092:8092"
+      - "9092:9092"
     environment:
+      SERVER_PORT: 8092
+      MANAGEMENT_PORT: 9092
       CONFIG_SERVER_URI: http://config-server:8888
       CONFIG_CLIENT_PASSWORD: client-secret
       RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9082/actuator/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9092/actuator/health"]
       interval: 5s
       timeout: 5s
       retries: 30
       start_period: 20s
 
-  pricing-service-2:
+  # Node.js: reads the Config Server with the cloud-config-client library and joins Spring Cloud
+  # Bus through RabbitMQ, so the same broadcast that refreshes the Spring services refreshes it.
+  node-service:
     build:
-      # Each service owns its Dockerfile and is built from its own directory - no shared
-      # build context, and no MODULE argument selecting between siblings.
-      context: ../pricing-service
-      dockerfile: Dockerfile
-    container_name: cfg-jdbc-pricing-2
+      context: ../node-service
+      args:
+        # Empty unless you are behind a TLS-inspecting proxy; see ../node-service/Dockerfile.
+        EXTRA_CA_CERT: ${EXTRA_CA_CERT:-}
+    container_name: cfg-jdbc-node
     depends_on:
       config-server:
         condition: service_healthy
     ports:
-      - "8093:8083"
-      - "9093:9083"
+      - "8094:8094"
     environment:
-      SERVER_PORT: 8083
-      MANAGEMENT_PORT: 9083
-      APP_INDEX: 8083
-      CONFIG_SERVER_URI: http://config-server:8888
+      PORT: 8094
+      CONFIG_SERVER_URL: http://config-server:8888
       CONFIG_CLIENT_PASSWORD: client-secret
       RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9083/actuator/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8094/health"]
       interval: 5s
       timeout: 5s
       retries: 30
-      start_period: 20s
+
+  # Go: reads the Config Server with the cloudconfigclient library and joins Spring Cloud Bus
+  # through RabbitMQ, exactly like node-service.
+  go-service:
+    build:
+      context: ../go-service
+      args:
+        # Empty unless you are behind a TLS-inspecting proxy; see ../go-service/Dockerfile.
+        EXTRA_CA_CERT: ${EXTRA_CA_CERT:-}
+    container_name: cfg-jdbc-go
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8095:8095"
+    environment:
+      PORT: 8095
+      CONFIG_SERVER_URL: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8095/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # lambda-service is NOT in this file: it runs in Floci's Lambda emulator.
+  # See ../lambda-service/scripts/deploy-floci.sh.

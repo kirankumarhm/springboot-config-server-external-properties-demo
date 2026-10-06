@@ -15,7 +15,7 @@ spring:
   profiles:
     active: jdbc
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/configdb}
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/configdb}
     username: ${DB_USERNAME:config_admin}
     password: ${DB_PASSWORD:config-secret}
     hikari:

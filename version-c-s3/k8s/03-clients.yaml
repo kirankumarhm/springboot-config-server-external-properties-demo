@@ -1,5 +1,7 @@
-# The two client services. pricing-service runs 2 replicas specifically to prove that ONE
-# broadcast reaches EVERY instance - the property that a poll-based design cannot give you.
+# The four in-cluster client services: inventory-service and pricing-service (Spring Boot),
+# node-service (Node.js) and go-service (Go). All four join Spring Cloud Bus through RabbitMQ, so
+# one broadcast from the Config Server refreshes every one of them. (lambda-service runs in Floci's
+# Lambda emulator, not in the cluster.)
 apiVersion: v1
 kind: Service
 metadata:
@@ -37,10 +39,6 @@ spec:
     metadata:
       labels:
         app: inventory-service
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9081"
-        prometheus.io/path: "/actuator/prometheus"
     spec:
       automountServiceAccountToken: false
       # Kubernetes injects legacy Docker-link environment variables for every Service in the
@@ -68,6 +66,11 @@ spec:
           envFrom:
             - configMapRef: { name: client-env }
           env:
+            # Explicit, so the probes below always match the ports the app listens on.
+            - name: SERVER_PORT
+              value: "8081"
+            - name: MANAGEMENT_PORT
+              value: "9081"
             - name: CONFIG_CLIENT_PASSWORD
               valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_CLIENT_PASSWORD } }
             - name: RABBITMQ_USERNAME
@@ -128,7 +131,7 @@ metadata:
   labels:
     app: pricing-service
 spec:
-  replicas: 2
+  replicas: 1
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -141,10 +144,6 @@ spec:
     metadata:
       labels:
         app: pricing-service
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9082"
-        prometheus.io/path: "/actuator/prometheus"
     spec:
       automountServiceAccountToken: false
       # Kubernetes injects legacy Docker-link environment variables for every Service in the
@@ -160,15 +159,6 @@ spec:
         runAsUser: 1000
         seccompProfile:
           type: RuntimeDefault
-      # Spread replicas so a single node loss cannot take every instance. On a one-node minikube
-      # this is unsatisfiable, hence ScheduleAnyway rather than DoNotSchedule.
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app: pricing-service
       containers:
         - name: pricing-service
           image: config-s3-demo-pricing-service:latest
@@ -181,6 +171,11 @@ spec:
           envFrom:
             - configMapRef: { name: client-env }
           env:
+            # Explicit, so the probes below always match the ports the app listens on.
+            - name: SERVER_PORT
+              value: "8082"
+            - name: MANAGEMENT_PORT
+              value: "9082"
             - name: CONFIG_CLIENT_PASSWORD
               valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_CLIENT_PASSWORD } }
             - name: RABBITMQ_USERNAME
@@ -213,4 +208,174 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-service
+  namespace: config-demo
+spec:
+  selector:
+    app: node-service
+  ports:
+    - name: http
+      port: 8084
+      targetPort: 8084
+---
+# Node.js client. Reads the Config Server over HTTP and joins Spring Cloud Bus through RabbitMQ.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-service
+  namespace: config-demo
+  labels:
+    app: node-service
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: node-service
+  template:
+    metadata:
+      labels:
+        app: node-service
+    spec:
+      automountServiceAccountToken: false
+      # Same reason as the Spring clients: a Service named "rabbitmq" would otherwise inject
+      # RABBITMQ_PORT=tcp://10.x.x.x:5672, which is not a port number.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: node-service
+          image: config-s3-demo-node-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8084
+          envFrom:
+            - configMapRef: { name: client-env }
+          env:
+            - name: PORT
+              value: "8084"
+            - name: CONFIG_CLIENT_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_CLIENT_PASSWORD } }
+            - name: RABBITMQ_USERNAME
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_USERNAME } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_PASSWORD } }
+          # The service exits if the Config Server is unreachable at startup; give a cold start
+          # room to retry while the server is still coming up.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "50m", memory: "96Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-service
+  namespace: config-demo
+spec:
+  selector:
+    app: go-service
+  ports:
+    - name: http
+      port: 8085
+      targetPort: 8085
+---
+# Go client. Reads the Config Server over HTTP and joins Spring Cloud Bus through RabbitMQ.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-service
+  namespace: config-demo
+  labels:
+    app: go-service
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: go-service
+  template:
+    metadata:
+      labels:
+        app: go-service
+    spec:
+      automountServiceAccountToken: false
+      # Same reason as the Spring clients: a Service named "rabbitmq" would otherwise inject
+      # RABBITMQ_PORT=tcp://10.x.x.x:5672, which is not a port number.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: go-service
+          image: config-s3-demo-go-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8085
+          envFrom:
+            - configMapRef: { name: client-env }
+          env:
+            - name: PORT
+              value: "8085"
+            - name: CONFIG_CLIENT_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: CONFIG_CLIENT_PASSWORD } }
+            - name: RABBITMQ_USERNAME
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_USERNAME } }
+            - name: RABBITMQ_PASSWORD
+              valueFrom: { secretKeyRef: { name: config-credentials, key: RABBITMQ_PASSWORD } }
+          # The service exits if the Config Server is unreachable at startup; give a cold start
+          # room to retry while the server is still coming up.
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "25m", memory: "32Mi" }
+            limits: { cpu: "250m", memory: "128Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
 ---

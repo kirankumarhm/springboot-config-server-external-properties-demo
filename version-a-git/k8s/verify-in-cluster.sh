@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # In-cluster acceptance check for version A (Git backend) on Kubernetes.
 #
+#   # from: version-a-git/   (deploy-minikube.sh runs this for you at the end)
+#   ./k8s/verify-in-cluster.sh
+#
 # Proves the core requirement inside a real cluster: a configuration change committed and PUSHED
-# to the Git remote reaches EVERY pod - including both pricing-service replicas - with no restart.
+# to the Git remote reaches EVERY client pod - Spring Boot, Node.js and Go - with no restart.
+#
+# WARNING: this pushes two commits to the remote (the change, then its revert). It stages only
+# the four config-repo files it edits; nothing else in your working tree is committed.
 #
 # Why a real push rather than a local commit: in a cluster the Config Server cannot use the
 # file:// backend (it treats the repo directory as its working tree and performs a real
@@ -19,19 +25,18 @@
 # could hide a replica that never received the broadcast. That is exactly the failure this design
 # must not have.
 #
-# The label change is reverted with a second commit in a trap, so the remote is left as it was
-# even if the script fails or is interrupted.
+# The change is reverted with a second commit in a trap, so the remote is left as it was even if
+# the script fails or is interrupted.
 set -uo pipefail
 
 NS=config-demo
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$HERE/.."
-SHARED_YML="$ROOT/config-repo/application.yml"
-# Path relative to the repository root, which is what `git` needs and what the Config Server's
-# search-paths point inside.
+CONFIG_DIR="$ROOT/config-repo"
 REPO_ROOT="$(cd "$ROOT" && git rev-parse --show-toplevel)"
-SHARED_REL="$(cd "$REPO_ROOT" && realpath --relative-to=. "$SHARED_YML" 2>/dev/null \
-              || python3 -c "import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$SHARED_YML" "$REPO_ROOT")"
+# Paths relative to the repository root: what `git add` needs, and what the Config Server's
+# search-paths point inside on the remote.
+rel() { python3 -c "import os,sys;print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$CONFIG_DIR/$1" "$REPO_ROOT"; }
 
 ADMIN_USER="${CONFIG_ADMIN_USERNAME:-config-admin}"
 # The Secret stores the {noop}-prefixed encoded form; HTTP Basic needs the plaintext.
@@ -75,26 +80,48 @@ busrefresh() {
     | grep -oE "HTTP/1\.1 [0-9]+" | head -1
 }
 
-pod_ips() { kubectl -n $NS get pods -l app="$1" -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'; }
+pod_ips() { kubectl -n $NS get pods -l app="$1" --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.status.podIP}{" "}{end}'; }
+field()   { probe "$1" | python3 -c 'import sys,json;v=json.load(sys.stdin)[sys.argv[1]];print(str(v).lower() if isinstance(v,bool) else v)' "$2" 2>/dev/null; }
 
-snap_version() { probe "http://$1:$2/api/v1/config/snapshot" | python3 -c 'import sys,json;print(json.load(sys.stdin)["version"])' 2>/dev/null; }
-snap_field()   { probe "http://$1:$2/api/v1/config/snapshot" | python3 -c "import sys,json;print(json.load(sys.stdin)$3)" 2>/dev/null; }
+# yaml_get / yaml_set <file> <key> [value] : read or replace the first "key: ..." line.
+yaml_get() { python3 -c 'import re,sys
+m=re.search(rf"^\s*{re.escape(sys.argv[2])}:\s*(.+)$", open(sys.argv[1]).read(), re.M); print(m.group(1).strip() if m else "")' "$CONFIG_DIR/$1" "$2"; }
+yaml_set() { python3 - "$CONFIG_DIR/$1" "$2" "$3" <<'PY2'
+import re, sys
+path, key, value = sys.argv[1:]
+text = open(path).read()
+new, n = re.subn(rf'^(\s*){re.escape(key)}:.*$', lambda m: f"{m.group(1)}{key}: {value}", text, count=1, flags=re.M)
+if n != 1:
+    sys.exit(f"key '{key}' not found in {path}")
+open(path, 'w').write(new)
+PY2
+}
+
+# file | key | service | port | path | JSON field | changed value
+CHANGES="inventory-service.yml|max-order-quantity|inventory-service|8081|/api/v1/inventory/config|maxOrderQuantity|750
+pricing-service.yml|surge-pricing-enabled|pricing-service|8082|/api/v1/pricing/config|surgePricingEnabled|true
+node-service.yml|max-items|node-service|8084|/api/v1/node/config|maxItems|30
+go-service.yml|max-items|go-service|8085|/api/v1/go/config|maxItems|55"
+FILES="inventory-service.yml pricing-service.yml node-service.yml go-service.yml"
+
+# push <message> : commits ONLY the four config files and pushes. Unrelated work in the working
+# tree is never staged.
+push() {
+  local paths="" f
+  for f in $FILES; do paths="$paths $(rel "$f")"; done
+  (cd "$REPO_ROOT" && git add -- $paths && git commit -q -m "$1" -- $paths && git push -q origin HEAD)
+}
 
 echo "${BOLD}==================================================================${OFF}"
 echo "${BOLD} Version A (Git backend) on Kubernetes - in-cluster acceptance${OFF}"
 echo "${BOLD}==================================================================${OFF}"
 
 head2 "Topology"
-kubectl -n $NS get pods -o wide --no-headers | awk '{printf "  %-38s %-8s %s\n", $1, $3, $6}'
-
-INV_IPS=($(pod_ips inventory-service))
-PRC_IPS=($(pod_ips pricing-service))
-CFG_IPS=($(pod_ips config-server))
-echo "  config-server replicas: ${#CFG_IPS[@]}   pricing replicas: ${#PRC_IPS[@]}"
-[ "${#CFG_IPS[@]}" -ge 2 ] && ok "config-server is running more than one replica" \
-                           || bad "expected 2+ config-server replicas"
-[ "${#PRC_IPS[@]}" -ge 2 ] && ok "pricing-service is running more than one replica" \
-                           || bad "expected 2+ pricing-service replicas"
+kubectl -n $NS get pods -o wide --no-headers | awk '{printf "  %-40s %-8s %s\n", $1, $3, $6}'
+for svc in config-server inventory-service pricing-service node-service go-service; do
+  ready=$(kubectl -n $NS get deploy "$svc" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+  [ "${ready:-0}" -ge 1 ] 2>/dev/null && ok "$svc: $ready pod(s) ready" || bad "$svc has no ready pod"
+done
 
 head2 "The Git backend is the remote, not a working tree"
 uri=$(kubectl -n $NS get configmap config-server-env -o jsonpath='{.data.CONFIG_REPO_URI}')
@@ -102,152 +129,55 @@ case "$uri" in
   file:*|"") bad "CONFIG_REPO_URI is '$uri' - file:// cannot run in a cluster" ;;
   *)         ok "CONFIG_REPO_URI is a remote ($uri)" ;;
 esac
-# Each pod must hold its OWN clone. If they shared one, a checkout in one would be visible in the
-# other, which is the corruption the remote-URI decision exists to prevent.
-basedirs=$(for ip in "${CFG_IPS[@]}"; do :; done; \
-  kubectl -n $NS get pods -l app=config-server -o jsonpath='{range .items[*]}{.spec.volumes[?(@.name=="tmp")].emptyDir}{"\n"}{end}' | sort -u | wc -l | tr -d ' ')
-[ "${basedirs:-0}" -ge 1 ] && ok "each config-server pod clones into its own ephemeral volume" \
-                           || bad "config-server pods do not have a private clone volume"
-
-head2 "Pod identity is unique per pod"
-names=$(kubectl -n $NS get pods -l app=pricing-service -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-uniq_count=$(echo "$names" | sort -u | wc -l | tr -d ' ')
-[ "$uniq_count" -eq "${#PRC_IPS[@]}" ] && ok "APP_INDEX comes from metadata.name, so ids differ per pod" \
-                                       || bad "pod names not unique?"
+remote_has=$(probe_auth "http://localhost:8888/node-service/default/main" | grep -c 'node-service.yml')
+[ "${remote_has:-0}" -ge 1 ] && ok "the remote holds node-service.yml (pushed)" \
+  || bad "the remote has no node-service.yml - commit and push version-a-git/config-repo first"
 
 head2 "Management port is separate and protected"
 code=$(kubectl -n $NS exec deploy/config-server -c config-server -- \
   sh -c 'wget -qS -O /dev/null http://localhost:9888/actuator/env 2>&1 | grep -c "401" || true' 2>/dev/null)
-[ "${code:-0}" -ge 1 ] && ok "/actuator/env on the management port requires authentication" \
-                       || bad "/actuator/env unauthenticated response was not 401"
-h=$(probe "http://localhost:9888/actuator/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["status"])' 2>/dev/null)
-[ "$h" = "UP" ] && ok "probes reachable unauthenticated on the management port" || bad "health=$h"
+[ "${code:-0}" -ge 1 ] && ok "/actuator/env on the management port requires authentication" || bad "/actuator/env was not 401"
 
-head2 "THE REQUIREMENT: a pushed Git change reaches every pod with no restart"
+head2 "THE REQUIREMENT: a pushed Git change reaches every pod of its service, with no restart"
+ORIGINAL=""
+while IFS='|' read -r file key _; do ORIGINAL="$ORIGINAL$file|$key|$(yaml_get "$file" "$key")
+"; done <<< "$CHANGES"
 
-ORIGINAL_LABEL=$(python3 -c "
-import re,sys
-t=open('$SHARED_YML').read()
-m=re.search(r'environment-label:\s*\"?([^\"\n]+)\"?', t)
-print(m.group(1).strip() if m else '')
-")
-if [ -z "$ORIGINAL_LABEL" ]; then
-  bad "could not read demo.shared.environment-label from $SHARED_REL - skipping"
-else
-
-# Restore the remote to its original state no matter how this script exits. Only the one config
-# file is ever staged, so unrelated dirty files in the working tree are left untouched.
+# Restore the remote however this script exits, then broadcast so the pods match it again.
 restore() {
-  echo
-  echo "  restoring demo.shared.environment-label -> $ORIGINAL_LABEL"
-  python3 -c "
-import re
-p='$SHARED_YML'
-t=open(p).read()
-t=re.sub(r'(environment-label:\s*).*', r'\g<1>\"$ORIGINAL_LABEL\"', t, count=1)
-open(p,'w').write(t)
-"
-  if (cd "$REPO_ROOT" && git add -- "$SHARED_REL" \
-        && git commit -q -m "test: restore environment-label after k8s in-cluster verification" \
-        && git push -q origin HEAD); then
-    # Pushing the revert is not enough: the running pods keep serving the test value until a
-    # broadcast tells them to re-fetch. Without this the cluster is left in a state that
-    # contradicts the repository.
-    busrefresh >/dev/null 2>&1
-    echo "  remote restored and pods refreshed"
+  echo; echo "  restoring the original values on the remote"
+  while IFS='|' read -r file key value; do [ -n "$file" ] && yaml_set "$file" "$key" "$value"; done <<< "$ORIGINAL"
+  if push "test: restore values after k8s in-cluster verification"; then
+    busrefresh >/dev/null 2>&1; echo "  remote restored and pods refreshed"
   else
-    echo "  ${RED}WARNING${OFF} could not restore the remote - check $SHARED_REL manually"
+    echo "  ${RED}WARNING${OFF} could not restore the remote - check version-a-git/config-repo manually"
   fi
 }
 trap restore EXIT
 
-INV_BEFORE=(); PRC_BEFORE=()
-for ip in "${INV_IPS[@]}"; do INV_BEFORE+=("$(snap_version "$ip" 8081)"); done
-for ip in "${PRC_IPS[@]}"; do PRC_BEFORE+=("$(snap_version "$ip" 8082)"); done
-echo "  baseline versions: inventory=${INV_BEFORE[*]}  pricing=${PRC_BEFORE[*]}"
-
 restarts_before=$(kubectl -n $NS get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{" "}{end}')
-
-NEW_LABEL="k8s-verified-$(date +%s)"
-python3 -c "
-import re
-p='$SHARED_YML'
-t=open(p).read()
-t=re.sub(r'(environment-label:\s*).*', r'\g<1>\"$NEW_LABEL\"', t, count=1)
-open(p,'w').write(t)
-"
-if ! (cd "$REPO_ROOT" && git add -- "$SHARED_REL" \
-        && git commit -q -m "test: set environment-label to $NEW_LABEL for k8s verification" \
-        && git push -q origin HEAD); then
-  bad "could not push the config change to the remote - the Git backend has nothing new to serve"
-else
-  sha=$(cd "$REPO_ROOT" && git rev-parse --short HEAD)
-  echo "  pushed $sha: demo.shared.environment-label -> $NEW_LABEL"
-
-  # force-pull: true means the next fetch re-pulls the remote, so the broadcast is all that is
-  # needed. No pod restart, no redeploy - that is the whole point.
-  echo "  broadcasting: POST /actuator/busrefresh"
-  status=$(busrefresh)
-  case "$status" in
-    *20[0-9]) ok "busrefresh accepted ($status)" ;;
-    *)        bad "busrefresh was rejected ($status) - no broadcast was sent" ;;
-  esac
-
-  deadline=$((SECONDS + 60))
-  while [ $SECONDS -lt $deadline ]; do
-    done_all=1
-    for i in "${!INV_IPS[@]}"; do
-      v=$(snap_version "${INV_IPS[$i]}" 8081)
-      [ -n "$v" ] && [ "$v" -gt "${INV_BEFORE[$i]}" ] 2>/dev/null || done_all=0
-    done
-    for i in "${!PRC_IPS[@]}"; do
-      v=$(snap_version "${PRC_IPS[$i]}" 8082)
-      [ -n "$v" ] && [ "$v" -gt "${PRC_BEFORE[$i]}" ] 2>/dev/null || done_all=0
-    done
-    [ "$done_all" -eq 1 ] && break
-    sleep 2
-  done
-
-  for ip in "${INV_IPS[@]}"; do
-    lbl=$(snap_field "$ip" 8081 "['settings']['environmentLabel']")
-    [ "$lbl" = "$NEW_LABEL" ] && ok "inventory-service pod $ip refreshed" || bad "inventory pod $ip label=$lbl"
-  done
-  for ip in "${PRC_IPS[@]}"; do
-    lbl=$(snap_field "$ip" 8082 "['settings']['environmentLabel']")
-    [ "$lbl" = "$NEW_LABEL" ] && ok "pricing-service pod $ip refreshed (one broadcast, every replica)" \
-                              || bad "pricing pod $ip label=$lbl"
-  done
-
-  restarts_after=$(kubectl -n $NS get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{" "}{end}')
-  [ "$restarts_before" = "$restarts_after" ] && ok "no pod restarted (restart counts unchanged)" \
-                                             || bad "a pod restarted: '$restarts_before' -> '$restarts_after'"
-
-  head2 "Every config-server replica serves the new commit"
-  # Both replicas must converge on the pushed commit; one stale clone would serve old values to
-  # whichever client the Service happened to route there.
-  for ip in "${CFG_IPS[@]}"; do
-    served=$(probe_auth "http://$ip:8888/application/default" \
-      | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d.get("version","")[:7])' 2>/dev/null)
-    [ -n "$served" ] && ok "config-server pod $ip serves commit ${served}" \
-                     || bad "config-server pod $ip did not report a commit version"
-  done
-
-  head2 "Refresh audit trail is recorded in each client"
-  # Count ONLY bus-triggered events. Every client records a trigger="startup" entry as it boots,
-  # so counting all entries made this check pass even when no broadcast ever arrived.
-  n=$(probe "http://${INV_IPS[0]}:8081/api/v1/config/history" \
-       | python3 -c 'import sys,json;print(sum(1 for e in json.load(sys.stdin) if e.get("trigger")!="startup"))' 2>/dev/null)
-  [ "${n:-0}" -ge 1 ] 2>/dev/null && ok "inventory-service recorded $n bus-triggered refresh event(s)" \
-                                  || bad "no bus-triggered refresh recorded (startup events do not count)"
+while IFS='|' read -r file key _ _ _ _ value; do yaml_set "$file" "$key" "$value"; done <<< "$CHANGES"
+if ! push "test: change one value per service for k8s in-cluster verification"; then
+  bad "could not commit and push the test change"; exit 1
 fi
-fi
+status=$(busrefresh)
+[ "$status" = "HTTP/1.1 200" ] && ok "POST /actuator/busrefresh accepted ($status)" || bad "busrefresh returned '${status:-nothing}'"
+
+while IFS='|' read -r _ _ svc port path json value; do
+  for ip in $(pod_ips "$svc"); do
+    got=""; deadline=$((SECONDS + 40))
+    while [ $SECONDS -lt $deadline ]; do
+      got=$(field "http://$ip:$port$path" "$json"); [ "$got" = "$value" ] && break; sleep 1
+    done
+    [ "$got" = "$value" ] && ok "$svc pod $ip: $json -> $value" || bad "$svc pod $ip: $json=$got, expected $value"
+  done
+done <<< "$CHANGES"
+restarts_after=$(kubectl -n $NS get pods -o jsonpath='{range .items[*]}{.status.containerStatuses[0].restartCount}{" "}{end}')
+[ "$restarts_before" = "$restarts_after" ] && ok "no pod restarted (restart counts unchanged)" \
+                                           || bad "a pod restarted: '$restarts_before' -> '$restarts_after'"
 
 echo
 echo "${BOLD}==================================================================${OFF}"
-if [ "$FAIL" -eq 0 ]; then
-  echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED (in-cluster)${OFF}"
-else
-  echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"
-fi
+if [ "$FAIL" -eq 0 ]; then echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED (in-cluster)${OFF}"; else echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"; fi
 echo "${BOLD}==================================================================${OFF}"
 [ "$FAIL" -eq 0 ]

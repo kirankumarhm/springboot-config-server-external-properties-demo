@@ -3,9 +3,24 @@
 > **Storage Backend:** AWS S3 Bucket (`acme-platform-config`) with object versioning  
 > **Change Detection:** S3 Event Notification (`s3:ObjectCreated:*`) &rarr; SQS Queue (`config-change-queue`) &rarr; SQS Change Detector Thread &rarr; Spring Cloud Bus (RabbitMQ)  
 > **Encryption:** Asymmetric RSA 4096-bit Keystore (PKCS12)  
-> **Default Ports (host):** Config Server `8908` (Actuator `9900`), Floci AWS emulator `4566`, Inventory Service `8101` (Actuator `9101`), Pricing Service `8102` (Actuator `9102`), Pricing Service 2 `8103` (Actuator `9103`), RabbitMQ `5674` / UI `15674`
+> **Default Ports (host):** Config Server `8908` (Actuator `9900`), Floci AWS emulator `4566`, inventory-service `8101` (Actuator `9101`), pricing-service `8102` (Actuator `9102`), node-service `8104`, go-service `8105`, RabbitMQ `5674` / UI `15674`
 
 ---
+
+## The services in this version
+
+One Config Server, five clients in three languages. Every client has **one API** that returns
+its own configuration, and every client picks up a change **without a restart**.
+
+| Service | Language | Its API | How it hears about a change | README |
+|---|---|---|---|---|
+| inventory-service | Spring Boot | `GET :8101/api/v1/inventory/config` | Spring Cloud Bus (RabbitMQ) | [inventory-service/](inventory-service/README.md) |
+| pricing-service | Spring Boot | `GET :8102/api/v1/pricing/config` | Spring Cloud Bus (RabbitMQ) | [pricing-service/](pricing-service/README.md) |
+| node-service | Node.js 22 | `GET :8104/api/v1/node/config` | Spring Cloud Bus, via its own small RabbitMQ listener | [node-service/](node-service/README.md) |
+| go-service | Go 1.23 | `GET :8105/api/v1/go/config` | Spring Cloud Bus, via its own small RabbitMQ listener | [go-service/](go-service/README.md) |
+| lambda-service | AWS Lambda (Node.js 22) in Floci | `GET /api/v1/lambda/config` through API Gateway | none needed - it reads the Config Server on every call | [lambda-service/](lambda-service/README.md) |
+
+Each lives in its own directory, builds on its own and shares no code with the others.
 
 ## 1. Architectural Overview
 
@@ -41,19 +56,19 @@ graph TD
         RabbitMQ["RabbitMQ Broker<br/>(:5674)"]
     end
 
-    subgraph Microservices["Client Applications"]
-        Inv["Inventory Service<br/>(:8101)"]
-        Prc1["Pricing Service (Inst 1)<br/>(:8102)"]
-        Prc2["Pricing Service (Inst 2)<br/>(:8103)"]
+    subgraph Clients["Client services"]
+        Inv["inventory-service<br/>Spring Boot (:8101)"]
+        Prc["pricing-service<br/>Spring Boot (:8102)"]
+        Node["node-service<br/>Node.js (:8104)"]
+        Go["go-service<br/>Go (:8105)"]
     end
 
+    Lambda["lambda-service<br/>Lambda + API Gateway (in Floci)"]
+
     Detector -- "Broadcasts Event" --> RabbitMQ
-    RabbitMQ -- "Delivers refresh" --> Inv
-    RabbitMQ -- "Delivers refresh" --> Prc1
-    RabbitMQ -- "Delivers refresh" --> Prc2
-    Inv -- "Fetches new config" --> CS
-    Prc1 -- "Fetches new config" --> CS
-    Prc2 -- "Fetches new config" --> CS
+    RabbitMQ -- "Delivers refresh" --> Inv & Prc & Node & Go
+    Inv & Prc & Node & Go -- "Fetch new config" --> CS
+    Lambda -- "Fetches on every call" --> CS
 ```
 
 ---
@@ -75,17 +90,23 @@ graph LR
         EncController["/encrypt & /decrypt"]
     end
 
-    subgraph Clients["Client Microservices"]
+    subgraph Clients["Spring Boot clients"]
         ConfigDataLoader["ConfigDataLoader (Startup)"]
         Rebinder["ConfigurationPropertiesRebinder"]
-        Provider["SettingsProvider (Validation & Snapshot)"]
+        Provider["PropertiesValidator"]
         BusListener["Spring Cloud Bus Listener"]
+    end
+
+    subgraph Polyglot["Node.js / Go clients"]
+        Lib["cloud-config-client / cloudconfigclient"]
+        OwnBus["Bus listener (amqplib / amqp091-go)"]
     end
 
     S3 --> SQS
     SQS --> SqsDetector
     SqsDetector --> AppMapper
     AppMapper --> Publisher
+    Publisher --> OwnBus --> Lib
     Publisher --> BusListener
     BusListener --> Rebinder
     Rebinder --> Provider
@@ -105,7 +126,7 @@ sequenceDiagram
     participant SQS as AWS SQS Queue
     participant CS as Config Server (:8908)
     participant RMQ as RabbitMQ (:5674)
-    participant Client as Pricing Service (:8102 & :8103)
+    participant Client as pricing-service (:8102)
 
     Admin->>S3: aws s3 cp pricing-service.yml s3://acme-platform-config/main/pricing-service.yml
     S3->>SQS: S3 Event Notification: ObjectCreated:Put
@@ -117,9 +138,12 @@ sequenceDiagram
     CS->>S3: Download s3://acme-platform-config/main/pricing-service.yml
     S3-->>CS: Return YAML stream
     CS-->>Client: Return updated property sources
-    Client->>Client: Validate and apply snapshot v1 -> v2
-    Client->>Client: Audit event recorded (Outcome: APPLIED)
+    Client->>Client: Re-bind PricingProperties in place (an invalid value is logged as ERROR)
+    Client->>Client: GET /api/v1/pricing/config now returns the new values
 ```
+
+node-service and go-service follow the same steps with their own bus listener; lambda-service
+reads the Config Server on every call, so it needs no broadcast at all.
 
 ---
 
@@ -137,20 +161,22 @@ graph TD
     CS["Config Server (:8908)<br/>(SQS listener receives message)"]
     Ex["RabbitMQ Exchange: springCloudBus<br/>(Topic Exchange :5674)"]
     Q1["Queue: inventory-service"]
-    Q2["Queue: pricing-service-1"]
-    Q3["Queue: pricing-service-2"]
-    Inv["Inventory Service (:8101)<br/>(Ignores, not for me)"]
-    Prc1["Pricing Service 1 (:8102)<br/>(Matches! Pulls new config)"]
-    Prc2["Pricing Service 2 (:8103)<br/>(Matches! Pulls new config)"]
+    Q2["Queue: pricing-service"]
+    Q3["Queue: node-service"]
+    Q4["Queue: go-service"]
+    Inv["inventory-service (:8101)<br/>(Ignores, not for me)"]
+    Prc["pricing-service (:8102)<br/>(Matches! Pulls new config)"]
+    Node["node-service (:8104)<br/>(Ignores, not for me)"]
+    Go["go-service (:8105)<br/>(Ignores, not for me)"]
 
     S3 -- "1. S3 Event" --> SQS
     SQS -- "2. Read SQS" --> CS
     CS -- "3. Publishes 1 message:<br/>'pricing-service:**'" --> Ex
     Ex --> Q1 --> Inv
-    Ex --> Q2 --> Prc1
-    Ex --> Q3 --> Prc2
-    Prc1 -- "4. Pulls updated S3 YAML" --> CS
-    Prc2 -- "4. Pulls updated S3 YAML" --> CS
+    Ex --> Q2 --> Prc
+    Ex --> Q3 --> Node
+    Ex --> Q4 --> Go
+    Prc -- "4. Pulls updated S3 YAML" --> CS
 ```
 
 ### Accessing the RabbitMQ Web Management Dashboard
@@ -163,9 +189,8 @@ RabbitMQ comes with an interactive web dashboard running out of the box:
 
 #### What to observe in the RabbitMQ UI:
 1. **Connections Tab ("The Phone Lines")**:
-   - You will see 4 active AMQP connections.
-   - **Service Name Identification**: Thanks to the `ConnectionNameStrategy` bean (`RabbitConfig.java`), connections display human-readable names (`config-server:8908`, `inventory-service:8101`, `pricing-service:8102`, `pricing-service:8083`).
-   - *Why the last one is `8083` and not `8103`*: the name is built from `${APP_INDEX:${SERVER_PORT:...}}`, which is the port **inside** the container. Compose sets `APP_INDEX: 8083` for the second pricing instance, while `8103` is only the host-side published port.
+   - You will see 5 active AMQP connections: the Config Server and the four clients.
+   - **Service Name Identification**: each connection carries a readable name - the Spring services set it with `spring.cloud.stream.rabbit.binder.connection-name-prefix` (e.g. `inventory-service:8101#0`), and node-service / go-service use their bus id (e.g. `node-service:8104:3f2a...`).
    - *Tip*: Click the `+/-` icon on the top-right of the table to enable the **Client-provided name** column, or click any connection to inspect its details.
 2. **Exchanges Tab ("The Router")**:
    - Click on **`springCloudBus`** (`topic` type) to see the broadcast bindings to each microservice's queue (`#`).
@@ -230,7 +255,9 @@ spring:
     bootstrap-servers: localhost:9092
 ```
 
-All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refresh mechanics remain **100% identical**.
+The Spring Boot code needs no change. **node-service and go-service do**: they talk to RabbitMQ
+directly (`amqplib` / `amqp091-go`), so with Kafka their bus listener would have to be rewritten
+on a Kafka client. lambda-service is unaffected - it never uses the bus.
 
 ---
 
@@ -246,7 +273,8 @@ springboot-external-properties-demo-II/     <- repository root
 ├── version-a-git/
 ├── version-b-jdbc/
 └── version-c-s3/                           <- run everything from HERE
-    ├── config-server/  inventory-service/  pricing-service/
+    ├── config-server/  inventory-service/  pricing-service/   <- Spring Boot
+    ├── node-service/   go-service/   lambda-service/        <- Node.js, Go, AWS Lambda
     ├── docker/compose.yaml                 <- referenced as docker/compose.yaml, so cwd matters
     ├── k8s/                                <- deploy (minikube + EKS) / verify / teardown
     ├── scripts/                            <- provisioning, keystore, e2e test, docker teardown
@@ -288,6 +316,8 @@ the export is only needed when you run `aws` by hand.)*
 - **Floci** - the local AWS emulator (`floci status`). Used instead of LocalStack here
 - **`aws` CLI v2** - provisioning and the upload examples use the real AWS APIs
 - **`jq`** and **`python3`** - used by the curl examples and by `scripts/e2e-test.sh`
+- **Node.js 22** and **npm** - only to test node-service / lambda-service, or run them without Docker
+- **Go 1.23** - only to test go-service or run it without Docker (Docker builds it for you otherwise)
 
 Check all of them in one go:
 
@@ -433,26 +463,51 @@ mvn compile jib:buildTar
 ### Step 5: Run with Docker Compose
 ```bash
 # from: version-c-s3/
-docker compose -f docker/compose.yaml build --no-cache
-docker compose -f docker/compose.yaml up -d
+docker compose -f docker/compose.yaml up -d --build
+```
+
+Compose builds node-service and go-service itself (they download their dependencies while
+building). **Behind a TLS-inspecting corporate proxy** such as Zscaler that fails with
+`x509: certificate signed by unknown authority`; export the proxy's root certificate first:
+`export EXTRA_CA_CERT="$(cat proxy-root.pem)"` (on macOS:
+`security find-certificate -a -c Zscaler -p /Library/Keychains/System.keychain`).
+
+Then deploy lambda-service to Floci (it is not a container in this file):
+
+```bash
+# from: version-c-s3/
+floci start                                  # if it is not running yet
+./lambda-service/scripts/deploy-floci.sh     # role, function and API Gateway route
+./lambda-service/scripts/invoke-floci.sh     # -> {"greeting":"Hello from AWS Lambda",...}
 ```
 
 ### Step 6: Verify Container Status
 ```bash
 # from: version-c-s3/
-docker ps
+docker compose -f docker/compose.yaml ps
 ```
-All 5 containers will report `(healthy)`:
+All 6 containers will report `(healthy)`:
 
 | Container | Role | Host ports | Image tag built by Compose |
 |---|---|---|---|
 | `cfg-s3-server` | Config Server | `8908`, `9900` | `config-s3-demo-config-server:latest` |
-| `cfg-s3-inventory` | Inventory Service | `8101`, `9101` | `config-s3-demo-inventory-service:latest` |
-| `cfg-s3-pricing` | Pricing Service 1 | `8102`, `9102` | `config-s3-demo-pricing-service:latest` |
-| `cfg-s3-pricing-2` | Pricing Service 2 | `8103`, `9103` | `config-s3-demo-pricing-service:latest` |
+| `cfg-s3-inventory` | inventory-service | `8101`, `9101` | `config-s3-demo-inventory-service:latest` |
+| `cfg-s3-pricing` | pricing-service | `8102`, `9102` | `config-s3-demo-pricing-service:latest` |
+| `cfg-s3-node` | node-service | `8104` | `config-s3-demo-node-service:latest` |
+| `cfg-s3-go` | go-service | `8105` | `config-s3-demo-go-service:latest` |
 | `cfg-s3-rabbitmq` | RabbitMQ broker | `5674`, `15674` | `rabbitmq:4-management` (pulled) |
 
 The tags come from `name: config-s3-demo` on line 1 of `docker/compose.yaml` (`<project>-<service>:latest`). The Kubernetes manifests in `k8s/` reference these exact strings.
+
+Ask each client for its configuration:
+
+```bash
+# from: anywhere (these are just HTTP calls)
+curl -s http://localhost:8101/api/v1/inventory/config
+curl -s http://localhost:8102/api/v1/pricing/config
+curl -s http://localhost:8104/api/v1/node/config
+curl -s http://localhost:8105/api/v1/go/config
+```
 
 **Floci runs outside this Compose stack** (`floci start`), so there is no S3/SQS container. Reaching it from inside a container needs the two `extra_hosts` entries at the top of `docker/compose.yaml`: `localhost.floci.io` and `acme-platform-config.localhost.floci.io`, both mapped to `host-gateway`. The bucket-prefixed one is not optional - the AWS SDK uses **virtual-host-style** addressing (`<bucket>.<host>`) against a custom endpoint, and `AwsS3EnvironmentRepositoryFactory` builds its own `S3Client` with no path-style option to turn that off.
 
@@ -521,20 +576,27 @@ Two server-side settings have no environment variable and are set in `applicatio
 ## 7. Testing Guide
 
 ### A. Automated Acceptance Test Suite
-S3 event delivery is **at-least-once and unordered**, so this suite additionally proves the refresh
-path is idempotent and that poison messages are contained. Checks map to acceptance criteria in
-[REQUIREMENTS.md](../REQUIREMENTS.md): AC-01, AC-03, AC-05, AC-18 (an upload propagates, scoped to
-one application), AC-19 (duplicate events are idempotent), AC-20 (a poison message lands in the DLQ
-without blocking the queue) and AC-21 (rollback via a prior object version, replacing `git revert`).
+
+Every change is an upload with `aws s3 cp` - the real operator path. S3 event delivery is
+**at-least-once and unordered**, so besides the common checks this suite proves the refresh path
+is idempotent and that bad messages are contained:
+
+- every client returns only its own properties, and an upload reaches **only** the service that
+  owns it, within the 5-second SLA - for Spring Boot, Node.js, Go and Lambda alike;
+- restoring an earlier **object version** rolls a change back by the same path (S3 versioning is
+  this backend's `git revert`);
+- three **duplicate** S3 events change nothing;
+- a **malformed message** ends up in the dead-letter queue and does not block real changes;
+- the security and error-format rules.
 
 ```bash
 # from: version-c-s3/
-./scripts/e2e-test.sh
+./scripts/e2e-test.sh                 # 45 checks (about 3 minutes: the dead-letter check waits for retries)
+SKIP_LAMBDA=1 ./scripts/e2e-test.sh   # skips the lambda-service checks
 ```
 
-It needs Floci running, the stack provisioned and up (section 5), plus `aws` and `python3` on the
-PATH. The propagation SLA it asserts is **10 seconds** - the loosest of the three versions, because
-SQS long-polling adds latency that Git webhooks and `LISTEN/NOTIFY` do not have.
+It needs Floci running, the stack provisioned and up (section 5), lambda-service deployed, plus
+`aws` and `python3` on the PATH. It restores its baseline at the end, so it can be run again.
 
 ---
 
@@ -550,37 +612,22 @@ curl -s -u config-client:client-secret http://localhost:8908/pricing-service/def
 curl -s -u config-client:client-secret http://localhost:8908/inventory-service/default/main | jq .
 ```
 
-#### 2. Query Client Service Snapshots
+#### 2. Ask each client what it is using
 ```bash
 # from: anywhere (these are just HTTP calls)
-# Inventory Service Snapshot
-curl -s http://localhost:8101/api/v1/config/snapshot | jq .
-
-# Pricing Service 1 & 2 Snapshots
-curl -s http://localhost:8102/api/v1/config/snapshot | jq .
-curl -s http://localhost:8103/api/v1/config/snapshot | jq .
-
-# Refresh audit trail (changed keys, never their values)
-curl -s http://localhost:8101/api/v1/config/history | jq .
+curl -s http://localhost:8101/api/v1/inventory/config | jq .
+curl -s http://localhost:8102/api/v1/pricing/config | jq .
+curl -s http://localhost:8104/api/v1/node/config | jq .
+curl -s http://localhost:8105/api/v1/go/config | jq .
+./lambda-service/scripts/invoke-floci.sh        # from: version-c-s3/
 ```
+Each returns only its own properties.
 
 The SQS change-detection path has its own health indicator, so a dead poller is visible rather
 than silent:
 ```bash
 # from: anywhere (these are just HTTP calls)
 curl -s http://localhost:9900/actuator/health | jq '.components.configChange'
-```
-
-#### 3. Test Business Endpoints
-```bash
-# from: anywhere (these are just HTTP calls)
-# Test Inventory reservation
-curl -s -X POST http://localhost:8101/api/v1/inventory/reservations \
-  -H 'Content-Type: application/json' \
-  -d '{"sku":"SKU-1","quantity":10}' | jq .
-
-# Test Price Quote calculation
-curl -s "http://localhost:8102/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
 ```
 
 ---
@@ -603,6 +650,7 @@ pricing:
   surge-pricing-enabled: false
   surge-multiplier: 1.5
 YAML
+# (cat <<'YAML' replaces the whole object: keep every key of the file, not only the one you change)
 ```
 
 #### Step 2: Observe Automatic Propagation
@@ -610,18 +658,16 @@ Within ~0.5–1 second:
 1. S3 fires an `ObjectCreated` event to SQS queue `config-change-queue`.
 2. Config Server long-polls SQS, extracts application name `pricing-service`.
 3. Config Server broadcasts event to RabbitMQ.
-4. Both Pricing Service instances rebind and apply `v2`.
+4. pricing-service re-binds its properties.
 
-#### Step 3: Verify Live Price Quotes
+#### Step 3: Verify the new value
 ```bash
 # from: anywhere (these are just HTTP calls)
-curl -s "http://localhost:8102/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
-curl -s "http://localhost:8103/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
+curl -s http://localhost:8102/api/v1/pricing/config | jq .discountPercentage   # -> 35.0
+curl -s http://localhost:8101/api/v1/inventory/config | jq .                   # unchanged
 ```
-Both instances will show:
-- `discountPercentage: 35.0`
-- `finalPrice: 650.00`
-- `configVersion: 2`
+The same works for node-service and go-service (upload `node-service.yml` / `go-service.yml`),
+and lambda-service shows a change on its very next call.
 
 #### Step 4: Roll Back Using S3 Object Versioning
 Versioning is this backend's `git log`. Listing versions and copying an older one back over the
@@ -635,6 +681,21 @@ aws s3api list-object-versions --bucket acme-platform-config \
 aws s3api copy-object --bucket acme-platform-config --key main/pricing-service.yml \
   --copy-source "acme-platform-config/main/pricing-service.yml?versionId=<PREVIOUS_VERSION_ID>"
 ```
+
+### What happens with an invalid value
+
+The Spring services check their values against rules in their `config/*Properties.java`
+(`@Min`, `@Max`, `@DecimalMax`, ...); node-service, go-service and lambda-service check theirs in
+`node-config.js` / `goconfig.go` / `lambda-config.js`.
+
+| When the bad value arrives | Spring Boot services | node-service / go-service | lambda-service |
+|---|---|---|---|
+| At startup | refuse to start: `Invalid pricing configuration: pricing.discountPercentage must be less than or equal to 90.0` | refuse to start, same kind of message | n/a |
+| In a refresh | keep running, log `ERROR Refreshed pricing configuration is invalid: ...` | **keep the values they already had** and log the error | answer `503` problem details until it is fixed |
+
+Try it: upload `pricing-service.yml` with `discount-percentage: 95.0`, and watch `docker logs -f cfg-s3-pricing`.
+Then set it back.
+
 
 ---
 
@@ -658,7 +719,7 @@ applies the manifests in order, waits for each rollout, and runs `./k8s/verify-i
 | `00-namespace-and-config.yaml` | Namespace `config-demo`, ConfigMaps `config-server-env` and `client-env`, Secret `config-credentials` |
 | `01-dependencies.yaml` | RabbitMQ Deployment (no S3/SQS container - that is Floci or real AWS, outside the cluster) |
 | `02-config-server.yaml` | Config Server (2 replicas) + Service |
-| `03-clients.yaml` | `inventory-service` (1 replica) and `pricing-service` (2 replicas) + Services |
+| `03-clients.yaml` | `inventory-service`, `pricing-service`, `node-service`, `go-service` (1 replica each) + Services |
 
 The keystore is **not** in any manifest - it is a real secret (and `secrets/` is gitignored), so
 it is created from the local file. **This is mandatory:** `k8s/02-config-server.yaml` mounts a
@@ -716,13 +777,21 @@ certificate - deliberately **not** what `aws eks update-kubeconfig` produces, wh
 credential plugin that shells out to `aws eks get-token` and therefore fails in GUI tools like k9s
 with "Unable to locate credentials".
 
-Two traps the script exists to handle:
+Three traps the script exists to handle:
 
 - **The container runtime cannot pull from Docker Hub.** The first symptom is *not* an error on
   your own pods - it is every pod stuck in `ContainerCreating`, because k3s cannot pull
   `rancher/mirrored-pause`, the sandbox image every pod needs. The node still reports `Ready`,
   which makes the cluster look healthy. The script handles it twice over: a `registries.yaml` that
   skips verification, plus pre-importing images from the host daemon.
+- **No DNS, so every client crash-loops - and it looks like a Config Server problem.** k3s runs
+  its own system pods (CoreDNS, the storage provisioner, metrics-server) and pulls their images
+  on first start; behind the same TLS proxy those pulls fail too. Without CoreDNS no pod can
+  resolve a Service name, so node-service logs `getaddrinfo EAI_AGAIN config-server` and the Spring
+  services `I/O error on GET request for "http://config-server:8888/..."`. The script reads the
+  list of system images from the cluster, pulls each on the host (falling back to Google's Docker
+  Hub mirror `mirror.gcr.io`), and imports them. A multi-platform image that containerd rejects
+  (`content digest ... not found`) is rebuilt as a single-platform image first.
 - **A mutable `:latest` tag silently runs stale code.** With `imagePullPolicy: IfNotPresent` the
   kubelet resolves `:latest` once and pins that image ID; re-importing a rebuilt image under the
   same tag updates the tag in containerd while running pods keep the old ID - so a code change
@@ -736,6 +805,12 @@ Two traps the script exists to handle:
 # from: version-c-s3/
 ./k8s/verify-in-cluster.sh
 ```
+
+It finishes with `ALL 13 CHECKS PASSED (in-cluster)`: one `aws s3 cp` per service changes a value
+for inventory-service, pricing-service, node-service and go-service, and every pod of that service
+must serve it with no restart; an unrelated service must stay untouched; and the object's version
+history must be kept. On minikube, point it at minikube's cluster:
+`KUBECONFIG_OVERRIDE=~/.kube/config ./k8s/verify-in-cluster.sh` (`deploy-minikube.sh` does this).
 
 `verify-in-cluster.sh` queries **individual pod IPs** rather than the Service, because a Service
 would load-balance and could hide a replica that never received the broadcast - exactly the
@@ -785,23 +860,32 @@ pods and then fail with "address already in use" on the next deploy.
 
 Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
 
-| Service | Swagger UI URL | OpenAPI 3 JSON Schema |
+| Service | Swagger UI | OpenAPI 3 document |
 |---|---|---|
-| **Inventory Service** | [http://localhost:8101/swagger-ui.html](http://localhost:8101/swagger-ui.html) | [http://localhost:8101/v3/api-docs](http://localhost:8101/v3/api-docs) |
-| **Pricing Service (Inst 1)** | [http://localhost:8102/swagger-ui.html](http://localhost:8102/swagger-ui.html) | [http://localhost:8102/v3/api-docs](http://localhost:8102/v3/api-docs) |
-| **Pricing Service (Inst 2)** | [http://localhost:8103/swagger-ui.html](http://localhost:8103/swagger-ui.html) | [http://localhost:8103/v3/api-docs](http://localhost:8103/v3/api-docs) |
+| **inventory-service** | [http://localhost:8101/swagger-ui.html](http://localhost:8101/swagger-ui.html) | [http://localhost:8101/v3/api-docs](http://localhost:8101/v3/api-docs) |
+| **pricing-service** | [http://localhost:8102/swagger-ui.html](http://localhost:8102/swagger-ui.html) | [http://localhost:8102/v3/api-docs](http://localhost:8102/v3/api-docs) |
+| **node-service** | - (paste the document into [editor.swagger.io](https://editor.swagger.io)) | [http://localhost:8104/v3/api-docs](http://localhost:8104/v3/api-docs) |
+| **go-service** | - (paste the document into [editor.swagger.io](https://editor.swagger.io)) | [http://localhost:8105/v3/api-docs](http://localhost:8105/v3/api-docs) |
+| **lambda-service** | - | [lambda-service/openapi.json](lambda-service/openapi.json) (the API Gateway route) |
 
 ### Features Included:
-- **Rich DTO Schemas**: `@Schema` metadata including descriptions, example values, min/max constraints, and required fields.
-- **Response Code Mapping**: Explicit `@ApiResponse` annotations documenting `200 OK`, `400 Bad Request` (RFC 9457), `404 Not Found`, and `500 Internal Server Error`.
-- **Try-It-Out**: Directly execute quote calculations, stock reservations, and configuration snapshot inspections from your browser.
+- **Schemas with examples**: every field of every response is described, with an example value.
+- **Documented responses**: `200` with the body, and errors as RFC 9457 problem details.
+- **Try-It-Out** (Spring services): call the API from the browser.
 
 ---
 
 ## 10. Production-Grade Security Hardening
 
 ### Security Filter Chain (`SecurityConfig.java`)
-All microservices implement enterprise-grade HTTP security controls:
+The Spring services implement these HTTP security controls (node-service, go-service and
+lambda-service send the same response headers; see their READMEs):
+- **Deny by default**: only the API, the OpenAPI/Swagger docs and the health checks are reachable;
+  every other path answers `403`. Note that in Spring Boot 4 this chain also guards the separate
+  management port, which is why `/actuator/health/**` is listed explicitly - without it Docker and
+  Kubernetes health probes get `403`.
+- **No open refresh endpoint**: the clients expose only `health` on Actuator. Refreshes arrive over
+  RabbitMQ, so an HTTP `/actuator/refresh` would only let anyone trigger reloads.
 - **Stateless Session Management**: `SessionCreationPolicy.STATELESS` eliminates server-side session fixation vulnerabilities.
 - **REST-Safe CSRF**: CSRF protection is safely disabled on stateless JSON endpoints in accordance with OWASP API Security guidelines.
 - **Strict HTTP Security Response Headers**:
@@ -810,39 +894,36 @@ All microservices implement enterprise-grade HTTP security controls:
   - `X-Frame-Options`: `DENY` (Clickjacking prevention)
   - `X-Content-Type-Options`: `nosniff` (MIME-sniffing prevention)
   - `Referrer-Policy`: `strict-origin-when-cross-origin`
-  - `Permissions-Policy`: `"camera=(), microphone=(), geolocation=()"`
 
 ---
 
 ## 11. RFC 9457 Standardized Exception Handling
 
-All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
+Every error is formatted as RFC 9457 `application/problem+json` - by `GlobalExceptionHandler`
+(`@RestControllerAdvice`) in the Spring services, and by each Node.js / Go service's own handler.
+For example, an unknown path:
 
+```bash
+# from: anywhere (these are just HTTP calls)
+curl -s http://localhost:8101/api/v1/inventory/nope
+```
 ```json
 {
-  "type": "https://api.acme.com/errors/validation-error",
-  "title": "Validation Failed",
-  "status": 400,
-  "detail": "Request payload validation failed for 1 field(s)",
-  "instance": "/api/v1/inventory/reservations",
-  "errorId": "3b2e1f4a-718c-4a50-9d8a-1294875623c1",
-  "timestamp": "2026-09-19T17:30:00Z",
-  "fieldErrors": [
-    {
-      "field": "quantity",
-      "rejectedValue": -5,
-      "message": "Quantity must be greater than zero"
-    }
-  ]
+  "type": "urn:problem:resource-not-found",
+  "title": "Resource not found",
+  "status": 404,
+  "detail": "No endpoint api/v1/inventory/nope",
+  "instance": "/api/v1/inventory/nope",
+  "timestamp": "2026-10-06T16:18:39Z"
 }
 ```
 
 ### Handled Error Scenarios:
-- **`MethodArgumentNotValidException` / `ConstraintViolationException`**: HTTP 400 with detailed `fieldErrors`.
-- **`ConfigurationValidationException` / `IllegalStateException`**: HTTP 400 when business rules reject invalid configuration or payload state.
-- **`NoResourceFoundException`**: HTTP 404 for nonexistent endpoints.
-- **`HttpRequestMethodNotSupportedException`**: HTTP 405 for unsupported HTTP verbs.
-- **`Exception` (Uncaught Fallback)**: HTTP 500 with unique `errorId` for log correlation without leaking internal stack traces.
+- **`NoResourceFoundException`**: HTTP 404 for an endpoint that does not exist.
+- **`HttpRequestMethodNotSupportedException`**: HTTP 405 for anything but `GET` / `HEAD`.
+- **`HttpMediaTypeNotAcceptableException`**: HTTP 406 when the caller does not accept JSON.
+- **`Exception` (fallback)**: HTTP 500 with a unique `errorId` that matches the log line; the
+  cause and stack trace are logged, never returned.
 
 ---
 
@@ -874,7 +955,7 @@ mvn compile jib:build -Dimage=<registry>/<image>:<tag>   # Push directly to cont
 |---|---|---|
 | **SAST (Bytecode Analysis)** | SpotBugs 4.10.4 + `findsecbugs-plugin:1.13.0` | SQL injection, CSRF misconfiguration, insecure cryptography, path traversal, command injection |
 | **SCA (Dependency Vulnerability)** | OWASP `dependency-check-maven:13.0.0` | Known CVEs in third-party libraries against the National Vulnerability Database (NVD) |
-| **Architecture Enforcement** | ArchUnit 1.5.0 | Layer isolation, immutable snapshot boundaries, ban direct properties injection |
+| **Architecture Enforcement** | ArchUnit 1.5.0 | Refresh safety (`@ConfigurationProperties` with setters, not records; no `@Value`), package layering, no field injection |
 | **Code Formatting** | Spotless + google-java-format 1.36.1 | Deterministic code style formatting |
 | **Static Code Analysis** | Checkstyle 14.1.0 | Coding conventions, naming standards, Javadoc hygiene |
 | **Code Coverage** | JaCoCo 0.8.15 | Enforced line (>70%) and branch (>60%) thresholds. **`config-server` lowers these to 45% / 35%** on purpose: `SecurityConfig` and the application class need a live S3 endpoint and broker to instantiate, and their behaviour is asserted end to end by `scripts/e2e-test.sh` (401 unauthenticated, 200 authenticated) instead. The override and its rationale are in `config-server/pom.xml` |
@@ -882,7 +963,7 @@ mvn compile jib:build -Dimage=<registry>/<image>:<tag>   # Push directly to cont
 `SqsChangeDetectorIT` uses **Testcontainers 1.21.4**, pinned explicitly because - unlike Boot 3 -
 the Spring Boot 4 BOM does not manage it. It needs a running Docker daemon.
 
-Each of the three services is a **standalone Maven project** parented directly to
+Each of the three Java services is a **standalone Maven project** parented directly to
 `spring-boot-starter-parent` 4.0.8, with its own dependency management, quality gates and
 `config/` directory. The `pom.xml` at `version-c-s3/` is an **aggregator only** - nothing is
 inherited from it - so a single service builds on its own:
@@ -892,3 +973,11 @@ inherited from it - so a single service builds on its own:
 cd inventory-service && mvn verify
 ```
 
+The other three services have their own checks:
+
+```bash
+# from: version-c-s3/
+(cd node-service && npm ci && npm test)
+(cd lambda-service && npm ci && npm test)
+(cd go-service && gofmt -l . && go vet ./... && go test -race ./...)
+```

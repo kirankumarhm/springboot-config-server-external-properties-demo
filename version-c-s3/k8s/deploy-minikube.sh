@@ -35,12 +35,14 @@ echo "==> Building jars"
 (cd "$ROOT" && mvn -B -q -Pfast clean install -DskipTests)
 
 echo "==> Building images on the host daemon"
-(cd "$ROOT" && docker compose -f docker/compose.yaml build config-server inventory-service pricing-service >/dev/null)
+(cd "$ROOT" && docker compose -f docker/compose.yaml build config-server inventory-service pricing-service node-service go-service >/dev/null)
 
 echo "==> Loading images into minikube"
 for img in config-s3-demo-config-server:latest \
            config-s3-demo-inventory-service:latest \
            config-s3-demo-pricing-service:latest \
+           config-s3-demo-node-service:latest \
+           config-s3-demo-go-service:latest \
            rabbitmq:4-management; do
   printf '    %-45s' "$img"
   minikube image load "$img" >/dev/null 2>&1 && echo "ok" || echo "FAILED"
@@ -68,12 +70,21 @@ kubectl apply -f "$HERE/03-clients.yaml"
 echo "==> Waiting for clients"
 kubectl -n $NS rollout status deployment/inventory-service --timeout=300s
 kubectl -n $NS rollout status deployment/pricing-service --timeout=300s
+kubectl -n $NS rollout status deployment/node-service --timeout=300s
+kubectl -n $NS rollout status deployment/go-service --timeout=300s
+
+echo "==> Applying network policies and autoscalers"
+# Policies are only ENFORCED by a CNI that supports them (minikube: --cni=calico); the default
+# CNI accepts and ignores them, so they are applied either way. The autoscalers need the
+# metrics-server addon (minikube addons enable metrics-server) to act.
+kubectl apply -f "$HERE/04-network-policies.yaml"
+kubectl apply -f "$HERE/05-hpa.yaml"
 
 echo
 kubectl -n $NS get pods -o wide
 echo
 echo "==> Verifying in-cluster"
-"$HERE/verify-in-cluster.sh"
+KUBECONFIG_OVERRIDE="${KUBECONFIG:-$HOME/.kube/config}" "$HERE/verify-in-cluster.sh"
 
 cat <<'EOF'
 

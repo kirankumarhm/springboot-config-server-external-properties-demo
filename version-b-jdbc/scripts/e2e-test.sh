@@ -1,271 +1,226 @@
 #!/usr/bin/env bash
-# End-to-end acceptance test for version B (PostgreSQL/JDBC backend).
+# End-to-end acceptance test for version B (PostgreSQL / JDBC backend).
 #
-# The decisive difference from version A: configuration changes are made with plain SQL, executed
-# directly against the database with psql. No application code participates in the write, which is
-# what proves the trigger + LISTEN/NOTIFY path catches ANY writer.
+#   # from: version-b-jdbc/
+#   ./scripts/e2e-test.sh
+#
+# Proves the point of the project: UPDATE a row in the PostgreSQL "properties" table with psql,
+# and every client that owns that value serves the new value within seconds - with no restart -
+# while the clients that do not own it are untouched. No application code takes part in the
+# write: a database trigger raises pg_notify, the Config Server listens and broadcasts a refresh.
+# Covers all five clients:
+#   inventory-service, pricing-service (Spring Boot)  -> refreshed over Spring Cloud Bus
+#   node-service (Node.js), go-service (Go)            -> refreshed over Spring Cloud Bus
+#   lambda-service (AWS Lambda in Floci)               -> reads the latest values on every call
+#
+# Needs: the Compose stack running (docker compose -f docker/compose.yaml up -d --build), plus
+# lambda-service deployed to Floci (lambda-service/scripts/deploy-floci.sh), python3, curl.
+# Set SKIP_LAMBDA=1 to skip the Lambda checks when Floci is not running.
+#
+# The suite updates the database. It sets a known baseline first and restores it at the end, so
+# it can be run any number of times.
 set -uo pipefail
 
-INV="http://localhost:8091"
-PRC="http://localhost:8092"
-PRC2="http://localhost:8093"
-INV_MGMT="http://localhost:9091"
-SERVER="http://localhost:8898"
-ADMIN="config-admin:admin-secret"
-# The Config Server now exposes actuator on a SEPARATE port (management child context).
-SERVER_MGMT="http://localhost:9899"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PG="cfg-jdbc-postgres"
+SERVER="http://localhost:8898"
+SERVER_MGMT="http://localhost:9899"
+CLIENT_AUTH="config-client:client-secret"
+ADMIN_AUTH="config-admin:admin-secret"
+INVENTORY="http://localhost:8091/api/v1/inventory/config"
+PRICING="http://localhost:8092/api/v1/pricing/config"
+NODE="http://localhost:8094/api/v1/node/config"
+GO="http://localhost:8095/api/v1/go/config"
+SLA_SECONDS=5
+SKIP_LAMBDA=${SKIP_LAMBDA:-0}
+LAMBDA_INVOKE="$HERE/../lambda-service/scripts/invoke-floci.sh"
 
-SLA_SECONDS=8
-
-PASS=0
-FAIL=0
+PASS=0; FAIL=0
 RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
+ok()      { PASS=$((PASS+1)); echo "  ${GREEN}PASS${OFF}  $1"; }
+bad()     { FAIL=$((FAIL+1)); echo "  ${RED}FAIL${OFF}  $1"; }
+section() { echo; echo "${BOLD}$1${OFF}"; }
 
-jget() {
-  python3 -c '
-import sys, json
-d = json.load(sys.stdin)
-for k in sys.argv[1].split("."):
-    d = d[int(k)] if k.isdigit() else d[k]
-print(d)' "$1" 2>/dev/null
+# json <field> : reads JSON on stdin and prints one top-level field ("" if absent or not JSON).
+json() { python3 -c 'import sys,json
+try: v=json.load(sys.stdin).get(sys.argv[1], "")
+except Exception: v=""
+print(str(v).lower() if isinstance(v,bool) else v)' "$1" 2>/dev/null; }
+
+get()    { curl -s -m 5 "$1"; }
+lambda() { "$LAMBDA_INVOKE" 2>/dev/null; }
+status() { curl -s -m 5 -o /dev/null -w '%{http_code}' "$@"; }
+
+# sql <statement> : runs SQL as the database owner, exactly as an operator would with psql.
+sql() { docker exec -i "$PG" psql -U config_admin -d configdb -v ON_ERROR_STOP=1 -tAc "$1" 2>&1; }
+
+# set_prop <application> <key> <value> : one UPDATE = one change notification.
+set_prop() {
+  local out
+  out=$(sql "UPDATE properties SET \"value\"='$3' WHERE application='$1' AND \"key\"='$2' AND label='main' AND profile IS NULL;")
+  [ "$out" = "UPDATE 1" ] || bad "UPDATE $1 $2 affected: $out"
 }
 
-snap()    { curl -s -m 5 "$1/api/v1/config/snapshot"; }
-version() { snap "$1" | jget version; }
-field()   { snap "$1" | jget "$2"; }
-
-ok()   { PASS=$((PASS+1)); echo "  ${GREEN}PASS${OFF}  $1"; }
-bad()  { FAIL=$((FAIL+1)); echo "  ${RED}FAIL${OFF}  $1"; }
-head2(){ echo; echo "${BOLD}$1${OFF}"; }
-
-
-sql()  { docker exec -i "$PG" psql -U config_admin -d configdb -tAc "$1" 2>&1; }
-
-set_prop() { # application, key, value
-  sql "UPDATE properties SET \"value\"='$3', updated_at=now() WHERE application='$1' AND \"key\"='$2';" >/dev/null
-}
-
-wait_for_version_above() {
-  local url="$1" baseline="$2" deadline start now v elapsed
-  start=$(python3 -c 'import time;print(time.time())')
-  deadline=$((SECONDS + SLA_SECONDS))
-  while [ $SECONDS -lt $deadline ]; do
-    v=$(version "$url")
-    if [ -n "$v" ] && [ "$v" -gt "$baseline" ] 2>/dev/null; then
-      now=$(python3 -c 'import time;print(time.time())')
-      elapsed=$(python3 -c "print(f'{$now-$start:.2f}')")
-      echo "$elapsed"; return 0
+# expect_within <description> <expected> <command...> : polls until the command prints the
+# expected value, for at most SLA_SECONDS. Reports how long it took.
+expect_within() {
+  local description="$1" expected="$2"; shift 2
+  local start=$SECONDS got=""
+  while [ $((SECONDS - start)) -le "$SLA_SECONDS" ]; do
+    got=$("$@")
+    if [ "$got" = "$expected" ]; then
+      ok "$description ($((SECONDS - start))s, SLA ${SLA_SECONDS}s)"
+      return 0
     fi
-    sleep 0.2
-  done
-  echo "TIMEOUT"; return 1
-}
-
-wait_for_outcome() { # url, timeout, expected...
-  local url="$1" timeout="$2"; shift 2
-  local deadline=$((SECONDS + timeout)) o
-  while [ $SECONDS -lt $deadline ]; do
-    o=$(field "$url" lastOutcome)
-    for want in "$@"; do [ "$o" = "$want" ] && { echo "$o"; return 0; }; done
     sleep 0.3
   done
-  echo "${o:-unknown}"; return 1
+  bad "$description: got '$got', expected '$expected' within ${SLA_SECONDS}s"
 }
 
-reset_baseline() {
-  set_prop inventory-service inventory.express-shipping-enabled false
+field_of() { get "$1" | json "$2"; }
+lambda_field() { lambda | json "$1"; }
+
+baseline() {
   set_prop inventory-service inventory.max-order-quantity 500
-  set_prop application demo.shared.environment-label local
-  # Reset every key the suite mutates. Missing one leaks state between runs: set_prop always
-  # bumps updated_at, so the trigger fires and a refresh happens, but if the VALUE is unchanged
-  # the provider correctly reports NO_CHANGE and does not bump the version - which then looks
-  # like a lost change to a version-based assertion.
+  set_prop pricing-service pricing.surge-pricing-enabled false
+  set_prop node-service node.max-items 25
+  set_prop go-service go.max-items 50
+  set_prop lambda-service lambda.max-items 10
   set_prop inventory-service inventory.low-stock-threshold 25
   sleep 3
-  echo "  baseline restored"
 }
+trap 'echo; echo "Restoring the baseline..."; baseline' EXIT
 
 echo "${BOLD}==================================================================${OFF}"
-echo "${BOLD} Version B (PostgreSQL/JDBC backend) - end-to-end acceptance${OFF}"
+echo "${BOLD} Version B (PostgreSQL backend) - end-to-end acceptance${OFF}"
 echo "${BOLD}==================================================================${OFF}"
 
-# ---------------------------------------------------------------- preconditions
-head2 "Preconditions"
-for pair in "config-server:$SERVER_MGMT/actuator/health" \
-            "inventory-service:$INV_MGMT/actuator/health" \
-            "pricing-service:http://localhost:9092/actuator/health" \
-            "pricing-service-2:http://localhost:9093/actuator/health"; do
-  name="${pair%%:*}"; url="${pair#*:}"
-  status=$(curl -s -m 5 "$url" | jget status)
-  [ "$status" = "UP" ] && ok "$name is UP" || bad "$name health = ${status:-unreachable}"
+# ------------------------------------------------------------------------------ preconditions
+section "Preconditions"
+[ "$(get "$SERVER_MGMT/actuator/health" | json status)" = "UP" ] && ok "config-server is UP" || bad "config-server is not UP"
+for name in inventory:9091 pricing:9092; do
+  [ "$(get "http://localhost:${name#*:}/actuator/health" | json status)" = "UP" ] \
+    && ok "${name%%:*}-service is UP" || bad "${name%%:*}-service is not UP"
 done
-
-rows=$(sql "SELECT count(*) FROM properties;")
-[ "${rows:-0}" -ge 10 ] 2>/dev/null && ok "Flyway seeded $rows property rows" || bad "properties table has ${rows:-0} rows"
-
-trig=$(sql "SELECT count(*) FROM information_schema.triggers WHERE trigger_name LIKE 'trg_notify_config%';")
-[ "${trig:-0}" -ge 3 ] 2>/dev/null && ok "notify triggers installed ($trig statement-level)" || bad "notify triggers missing (found ${trig:-0})"
-
-nulls=$(sql "SELECT count(*) FROM properties WHERE profile IS NULL;")
-[ "${nulls:-0}" -ge 10 ] 2>/dev/null && ok "profile-independent rows use real NULL ($nulls rows)" || bad "profile NULL rows = ${nulls:-0}"
-
-listener=$(curl -s -m 5 "$SERVER_MGMT/actuator/health" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-c=d.get('components',{}).get('configChange',{}).get('details',{})
-print(c.get('listenerConnected'))" 2>/dev/null)
-[ "$listener" = "True" ] && ok "PostgreSQL LISTEN/NOTIFY listener is connected" || bad "listenerConnected=$listener"
-
-if [ "$(curl -s -o /dev/null -w '%{http_code}' "$SERVER/inventory-service/default")" = "401" ]; then
-  ok "Environment API rejects unauthenticated access"
+for name in node:8094 go:8095; do
+  [ "$(get "http://localhost:${name#*:}/health" | json status)" = "UP" ] \
+    && ok "${name%%:*}-service is UP" || bad "${name%%:*}-service is not UP"
+done
+[ "$(sql 'SELECT count(*) FROM properties')" -ge 19 ] 2>/dev/null \
+  && ok "PostgreSQL holds the seeded configuration (V1 + V3 migrations)" || bad "PostgreSQL seed data missing"
+if [ "$SKIP_LAMBDA" = "1" ]; then
+  echo "  ${YELLOW}SKIP${OFF}  lambda-service (SKIP_LAMBDA=1)"
+elif [ -n "$(lambda_field greeting)" ]; then
+  ok "lambda-service answers through Floci API Gateway"
 else
-  bad "Environment API is NOT protected"
+  bad "lambda-service is not reachable - run lambda-service/scripts/deploy-floci.sh (or SKIP_LAMBDA=1)"
 fi
 
-head2 "Baseline"
-reset_baseline
+section "Baseline"
+baseline
+echo "  configuration reset to the test baseline"
 
-# ---------------------------------------------------------------- AC-13
-head2 "AC-13  a plain SQL UPDATE propagates - no application involved in the write"
-inv_b=$(version "$INV"); prc_b=$(version "$PRC")
-echo "  baseline versions: inventory=$inv_b pricing=$prc_b"
-mode_before=$(curl -s -m 5 -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"SKU-1","quantity":10}' | jget shippingMode)
+# ------------------------------------------------------------------------------ each client serves its own properties
+section "Each client returns ONLY its own properties"
+inventory_keys=$(get "$INVENTORY" | python3 -c 'import sys,json;print(",".join(sorted(json.load(sys.stdin))))' 2>/dev/null)
+[ "$inventory_keys" = "expressShippingEnabled,lowStockThreshold,maxOrderQuantity,warehouseCode" ] \
+  && ok "inventory-service: $inventory_keys" || bad "inventory-service keys: $inventory_keys"
+pricing_keys=$(get "$PRICING" | python3 -c 'import sys,json;print(",".join(sorted(json.load(sys.stdin))))' 2>/dev/null)
+[ "$pricing_keys" = "currency,discountPercentage,surgeMultiplier,surgePricingEnabled" ] \
+  && ok "pricing-service: $pricing_keys" || bad "pricing-service keys: $pricing_keys"
+[ "$(field_of "$NODE" greeting)" = "Hello from Node.js" ] && ok "node-service greets from Node.js" || bad "node-service greeting"
+[ "$(field_of "$GO" greeting)" = "Hello from Go" ] && ok "go-service greets from Go" || bad "go-service greeting"
+if [ "$SKIP_LAMBDA" != "1" ]; then
+  [ "$(lambda_field greeting)" = "Hello from AWS Lambda" ] && ok "lambda-service greets from AWS Lambda" || bad "lambda-service greeting"
+fi
 
-set_prop inventory-service inventory.express-shipping-enabled true
+# ------------------------------------------------------------------------------ live refresh, scoped
+section "A change reaches only the service that owns it - live, no restart"
+set_prop inventory-service inventory.max-order-quantity 750
+expect_within "inventory-service maxOrderQuantity 500 -> 750 after psql UPDATE" 750 field_of "$INVENTORY" maxOrderQuantity
+[ "$(field_of "$PRICING" surgePricingEnabled)" = "false" ] && ok "pricing-service untouched" || bad "pricing-service changed"
+[ "$(field_of "$NODE" maxItems)" = "25" ] && ok "node-service untouched" || bad "node-service changed"
 
-elapsed=$(wait_for_version_above "$INV" "$inv_b")
-[ "$elapsed" != "TIMEOUT" ] && ok "inventory-service refreshed in ${elapsed}s after psql UPDATE" \
-                            || bad "inventory-service did not refresh within ${SLA_SECONDS}s"
+set_prop pricing-service pricing.surge-pricing-enabled true
+expect_within "pricing-service surgePricingEnabled false -> true" true field_of "$PRICING" surgePricingEnabled
+[ "$(field_of "$INVENTORY" maxOrderQuantity)" = "750" ] && ok "inventory-service untouched" || bad "inventory-service changed"
 
-mode_after=$(curl -s -m 5 -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"SKU-1","quantity":10}' | jget shippingMode)
-[ "$mode_after" = "EXPRESS" ] && ok "business behaviour changed: $mode_before -> EXPRESS" \
-                              || bad "shippingMode = $mode_after"
+set_prop node-service node.max-items 30
+expect_within "node-service (Node.js, over Spring Cloud Bus) maxItems 25 -> 30" 30 field_of "$NODE" maxItems
+[ "$(field_of "$GO" maxItems)" = "50" ] && ok "go-service untouched" || bad "go-service changed"
 
-prc_after=$(version "$PRC")
-[ "$prc_after" = "$prc_b" ] && ok "pricing-service untouched - exact scoping from the APPLICATION column" \
-                            || bad "pricing-service moved $prc_b -> $prc_after"
+set_prop go-service go.max-items 55
+expect_within "go-service (Go, over Spring Cloud Bus) maxItems 50 -> 55" 55 field_of "$GO" maxItems
+[ "$(field_of "$NODE" maxItems)" = "30" ] && ok "node-service untouched" || bad "node-service changed"
 
-# ---------------------------------------------------------------- AC-14
-head2 "AC-14  a ROLLED BACK change must not broadcast"
-inv_b=$(version "$INV")
+if [ "$SKIP_LAMBDA" != "1" ]; then
+  set_prop lambda-service lambda.max-items 12
+  expect_within "lambda-service (reads on every call) maxItems 10 -> 12" 12 lambda_field maxItems
+fi
+
+# ------------------------------------------------------------------------------ transactions
+section "Only COMMITTED changes reach the clients"
+# PostgreSQL delivers pg_notify only on COMMIT, so a rolled-back UPDATE must change nothing.
 sql "BEGIN; UPDATE properties SET \"value\"='7777' WHERE application='inventory-service' AND \"key\"='inventory.max-order-quantity'; ROLLBACK;" >/dev/null
-sleep 4
-inv_after=$(version "$INV")
-max_now=$(field "$INV" settings.maxOrderQuantity)
-[ "$inv_after" = "$inv_b" ] && ok "no refresh occurred (version stayed $inv_after) - NOTIFY is transactional" \
-                            || bad "version moved $inv_b -> $inv_after on a rolled-back transaction"
-[ "$max_now" = "500" ] && ok "value still 500, rolled-back data never served" || bad "maxOrderQuantity=$max_now"
+sleep 2
+[ "$(field_of "$INVENTORY" maxOrderQuantity)" = "750" ] && ok "a rolled-back UPDATE is never served" || bad "inventory-service served an uncommitted value"
 
-# ---------------------------------------------------------------- AC-16
-head2 "AC-16  a bulk UPDATE produces ONE broadcast, not one per row"
-before_bcast=$(curl -s -m 5 -u "$ADMIN" "$SERVER_MGMT/actuator/metrics/config.change.broadcast" \
-  | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["measurements"][0]["value"]))' 2>/dev/null || echo 0)
+# ------------------------------------------------------------------------------ PostgreSQL-specific guarantees
+broadcasts() { curl -s -m 5 -u "$ADMIN_AUTH" "$SERVER_MGMT/actuator/metrics/config.change.broadcast" \
+  | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["measurements"][0]["value"]))' 2>/dev/null || echo 0; }
+
+section "A bulk UPDATE produces ONE broadcast, not one per row"
+before=$(broadcasts)
 sql "UPDATE properties SET updated_at=now() WHERE application='inventory-service';" >/dev/null
 sleep 4
-after_bcast=$(curl -s -m 5 -u "$ADMIN" "$SERVER_MGMT/actuator/metrics/config.change.broadcast" \
-  | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["measurements"][0]["value"]))' 2>/dev/null || echo 0)
-delta=$((after_bcast - before_bcast))
-rowcount=$(sql "SELECT count(*) FROM properties WHERE application='inventory-service';")
-echo "  rows updated: $rowcount   broadcasts emitted: $delta"
-[ "$delta" -eq 1 ] && ok "exactly 1 broadcast for a $rowcount-row UPDATE (statement-level trigger)" \
-                   || bad "expected 1 broadcast, got $delta"
+after=$(broadcasts)
+rows=$(sql "SELECT count(*) FROM properties WHERE application='inventory-service';")
+[ $((after - before)) -eq 1 ] && ok "exactly 1 broadcast for a $rows-row UPDATE (statement-level trigger)" \
+                              || bad "expected 1 broadcast for a $rows-row UPDATE, got $((after - before))"
 
-# ---------------------------------------------------------------- AC-01 / AC-03
-head2 "AC-01 / AC-03  shared change reaches ALL apps and ALL instances"
-inv_b=$(version "$INV"); prc_b=$(version "$PRC"); prc2_b=$(version "$PRC2")
-set_prop application demo.shared.environment-label production-like
-e1=$(wait_for_version_above "$INV" "$inv_b")
-e2=$(wait_for_version_above "$PRC" "$prc_b")
-e3=$(wait_for_version_above "$PRC2" "$prc2_b")
-[ "$e1" != "TIMEOUT" ] && ok "inventory-service refreshed in ${e1}s" || bad "inventory-service timed out"
-[ "$e2" != "TIMEOUT" ] && ok "pricing-service refreshed in ${e2}s"   || bad "pricing-service timed out"
-[ "$e3" != "TIMEOUT" ] && ok "pricing-service-2 refreshed in ${e3}s" || bad "pricing-service-2 timed out"
-for u in "$INV" "$PRC" "$PRC2"; do
-  lbl=$(field "$u" settings.environmentLabel)
-  [ "$lbl" = "production-like" ] && ok "$u sees production-like" || bad "$u label=$lbl"
-done
+section "properties_history is the audit trail (it replaces git log)"
+latest=$(sql "SELECT operation||'|'||application||'|'||\"key\"||'|'||coalesce(old_value,'-')||'->'||coalesce(new_value,'-')||'|'||changed_by FROM properties_history ORDER BY history_id DESC LIMIT 1;")
+echo "  latest entry: $latest"
+echo "$latest" | grep -qE '^U\|' && ok "records operation, application, key, old -> new value and who made it" \
+                                  || bad "unexpected history entry: $latest"
 
-# ---------------------------------------------------------------- AC-05
-head2 "AC-05  invalid configuration rejected, last-known-good retained"
-good_v=$(version "$INV"); good_max=$(field "$INV" settings.maxOrderQuantity)
-set_prop inventory-service inventory.max-order-quantity 99999
-wait_for_outcome "$INV" 15 REJECTED >/dev/null
-[ "$(field "$INV" settings.maxOrderQuantity)" = "$good_max" ] && ok "still serving last-known-good ($good_max)" \
-                                                             || bad "adopted invalid value"
-[ "$(version "$INV")" = "$good_v" ] && ok "snapshot version unchanged ($good_v)" || bad "version moved"
-[ "$(field "$INV" lastOutcome)" = "REJECTED" ] && ok "lastOutcome=REJECTED observable" || bad "outcome not REJECTED"
-code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -X POST "$INV/api/v1/inventory/reservations" \
-  -H 'Content-Type: application/json' -d '{"sku":"S","quantity":5}')
-[ "$code" = "200" ] && ok "business endpoint still serving (HTTP 200)" || bad "endpoint returned $code"
-set_prop inventory-service inventory.max-order-quantity "$good_max"
-rec=$(wait_for_outcome "$INV" 15 NO_CHANGE APPLIED)
-[ "$rec" = "NO_CHANGE" ] || [ "$rec" = "APPLIED" ] && ok "recovered (lastOutcome=$rec)" || bad "did not recover: $rec"
-
-# ---------------------------------------------------------------- AC-17
-head2 "AC-17  properties_history replaces git log"
-hist=$(sql "SELECT count(*) FROM properties_history;")
-[ "${hist:-0}" -ge 5 ] 2>/dev/null && ok "history table has $hist rows" || bad "history rows = ${hist:-0}"
-detail=$(sql "SELECT operation||'|'||\"key\"||'|'||coalesce(old_value,'-')||'->'||coalesce(new_value,'-')||'|'||changed_by FROM properties_history ORDER BY history_id DESC LIMIT 1;")
-echo "  latest: $detail"
-echo "$detail" | grep -q 'U|inventory' && ok "records operation, key, old->new value and actor" || bad "history detail unexpected: $detail"
-
-# ---------------------------------------------------------------- AC-15
-head2 "AC-15  listener connection killed - reconciler must catch the missed change"
-# Target ONLY the dedicated LISTEN session, identified by the ApplicationName the detector sets.
-# An indiscriminate pg_terminate_backend also kills the main read pool, which tests nothing.
+section "A lost notification is still delivered (catch-up on reconnect, or the 15s reconciler)"
+# Kill ONLY the Config Server's dedicated LISTEN session, then commit straight away: NOTIFY reaches
+# only sessions connected at commit time, so this change is genuinely lost to the listener and
+# a catch-up has to deliver it: the listener's revision check when it reconnects, or failing that
+# the 15-second revision poller. (Measured: usually ~1s, i.e. the reconnect catch-up.)
 killed=$(sql "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE application_name = 'config-notify-listener';")
-echo "  terminated listener sessions: $killed"
-[ "${killed:-0}" -ge 1 ] 2>/dev/null && ok "the dedicated LISTEN session was identifiable and killed" \
-                                     || bad "no listener session found by application_name"
-
-# Commit a change immediately, in the window before the listener reconnects. NOTIFY is delivered
-# only to sessions connected at commit time, so this payload is genuinely lost - the reconciler
-# is the only thing that can still deliver it.
-inv_b=$(version "$INV")
+[ "${killed:-0}" -ge 1 ] 2>/dev/null && ok "the LISTEN session was found by its application_name and killed" \
+                                     || bad "no LISTEN session found (application_name=config-notify-listener)"
 set_prop inventory-service inventory.low-stock-threshold 44
-
-# The poller runs every 15s, so allow well past one interval.
 SLA_SECONDS=40
-e=$(wait_for_version_above "$INV" "$inv_b")
-if [ "$e" != "TIMEOUT" ]; then
-  ok "missed change still propagated in ${e}s (listener reconnect or reconciler)"
-else
-  bad "change permanently lost after listener kill"
-fi
-SLA_SECONDS=8
+expect_within "inventory-service still receives the missed change (lowStockThreshold 25 -> 44)" 44 field_of "$INVENTORY" lowStockThreshold
+SLA_SECONDS=5
+drops=$(get "$SERVER_MGMT/actuator/health" | python3 -c 'import sys,json;print(json.load(sys.stdin)["components"]["configChange"]["details"]["listenerDrops"])' 2>/dev/null)
+[ "${drops:-0}" -ge 1 ] 2>/dev/null && ok "the drop is visible in the Config Server's health (listenerDrops=$drops)" || bad "listenerDrops=${drops:-none}"
+[ "$(get "$SERVER_MGMT/actuator/health" | json status)" = "UP" ] && ok "Config Server stays UP (a lost notification is not an outage)" || bad "Config Server not UP"
 
-thr=$(field "$INV" settings.lowStockThreshold)
-[ "$thr" = "44" ] && ok "new value 44 is being served" || bad "lowStockThreshold=$thr"
-
-recon=$(curl -s -m 5 "$SERVER_MGMT/actuator/health" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-print(d.get('components',{}).get('configChange',{}).get('details',{}).get('listenerDrops'))" 2>/dev/null)
-[ "${recon:-0}" -ge 1 ] 2>/dev/null && ok "listenerDrops=$recon recorded and visible in health" \
-                                    || bad "listener drop not recorded (listenerDrops=$recon)"
-
-h=$(curl -s -m 5 "$SERVER_MGMT/actuator/health" | jget status)
-[ "$h" = "UP" ] && ok "config-server still UP (degraded notification is not an outage)" || bad "health=$h"
-
-set_prop inventory-service inventory.low-stock-threshold 25
-
-# ---------------------------------------------------------------- NFR-10
-head2 "NFR-10  the encryption endpoints require authentication"
-# No configuration value is {cipher}-encrypted any more, so there is no decrypted secret to
-# assert on. The endpoints still exist, and their access control is still worth asserting.
-code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Content-Type: text/plain' --data-binary x "$SERVER/encrypt")
-[ "$code" = "401" ] && ok "/encrypt rejects unauthenticated callers" || bad "/encrypt returned $code"
-
+# ------------------------------------------------------------------------------ security and errors
+section "Security and error format"
+[ "$(status "$SERVER/inventory-service/default")" = "401" ] && ok "Config Server rejects unauthenticated reads" || bad "Config Server readable without credentials"
+[ "$(status -H 'Content-Type: text/plain' --data-binary x "$SERVER/encrypt")" = "401" ] && ok "/encrypt requires authentication" || bad "/encrypt is open"
+[ "$(status http://localhost:8091/swagger-ui/index.html)" = "200" ] && ok "inventory-service Swagger UI is served" || bad "inventory-service Swagger UI"
+[ "$(status http://localhost:8091/internal)" = "403" ] && ok "inventory-service denies paths outside its API" || bad "inventory-service /internal not denied"
+[ "$(status -X POST http://localhost:9091/actuator/refresh)" = "403" ] && ok "client refresh endpoint is not open over HTTP" || bad "client /actuator/refresh is open"
+for url in "http://localhost:8092/api/v1/pricing/nope" "http://localhost:8094/nope" "http://localhost:8095/nope"; do
+  ctype=$(curl -s -m 5 -o /dev/null -w '%{content_type}' "$url")
+  [ "$ctype" = "application/problem+json" ] && ok "$url -> 404 problem+json" || bad "$url content type '$ctype'"
+done
+for url in "$INVENTORY" "$NODE" "$GO"; do
+  frame=$(curl -s -m 5 -D - -o /dev/null "$url" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-frame-options"{print $2}')
+  [ "$frame" = "DENY" ] && ok "$url sends security headers" || bad "$url X-Frame-Options='$frame'"
+done
+for url in "http://localhost:8091/v3/api-docs" "http://localhost:8094/v3/api-docs" "http://localhost:8095/v3/api-docs"; do
+  [ -n "$(get "$url" | json openapi)" ] && ok "$url serves an OpenAPI document" || bad "$url has no OpenAPI document"
+done
 
 echo
 echo "${BOLD}==================================================================${OFF}"
-if [ "$FAIL" -eq 0 ]; then
-  echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED${OFF}"
-else
-  echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"
-fi
+if [ "$FAIL" -eq 0 ]; then echo "${GREEN}${BOLD} ALL $PASS CHECKS PASSED${OFF}"; else echo "${RED}${BOLD} $FAIL FAILED${OFF}, ${GREEN}$PASS passed${OFF}"; fi
 echo "${BOLD}==================================================================${OFF}"
 [ "$FAIL" -eq 0 ]

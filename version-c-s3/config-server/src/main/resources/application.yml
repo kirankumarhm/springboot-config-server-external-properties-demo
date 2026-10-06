@@ -53,7 +53,7 @@ spring:
 app:
   # Used by S3ObjectKeyApplicationMapper to resolve a profile suffix exactly, instead of the
   # dash-guessing the Git backend is forced into.
-  known-applications: inventory-service,pricing-service
+  known-applications: inventory-service,pricing-service,node-service,go-service,lambda-service
   security:
     admin-username: ${CONFIG_ADMIN_USERNAME:config-admin}
     admin-password: ${CONFIG_ADMIN_PASSWORD:{noop}admin-secret}

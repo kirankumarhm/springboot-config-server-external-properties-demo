@@ -3,20 +3,36 @@
 > **Storage Backend:** Git repository (Local `file://` or Remote GitHub / GitLab)  
 > **Change Detection:** Git Webhook / Post-Commit Hook &rarr; `/monitor` endpoint &rarr; Spring Cloud Bus (RabbitMQ)  
 > **Encryption:** Asymmetric RSA 4096-bit Keystore (PKCS12)  
-> **Default Ports (host):** Config Server `8888` (Actuator `9898` &rarr; container `9888`), Inventory Service `8081` (Actuator `9081`), Pricing Service `8082` (Actuator `9082`), Pricing Service 2 `8083` (Actuator `9083`), RabbitMQ `5672` / UI `15672`
+> **Default Ports (host):** Config Server `8888` (Actuator `9898` &rarr; container `9888`), inventory-service `8081` (Actuator `9081`), pricing-service `8082` (Actuator `9082`), node-service `8084`, go-service `8085`, RabbitMQ `5672` / UI `15672`, Floci (Lambda) `4566`
 
 > **Further reading:** [How Spring Boot reloads configuration without restart](https://medium.com/@AlexanderObregon/how-spring-boot-reloads-configuration-without-restart-4d9dc9e8b926)
 
 ---
 
+## The services in this version
+
+One Config Server, five clients in three languages. Every client has **one API** that returns
+its own configuration, and every client picks up a change **without a restart**.
+
+| Service | Language | Its API | How it hears about a change | README |
+|---|---|---|---|---|
+| inventory-service | Spring Boot | `GET :8081/api/v1/inventory/config` | Spring Cloud Bus (RabbitMQ) | [inventory-service/](inventory-service/README.md) |
+| pricing-service | Spring Boot | `GET :8082/api/v1/pricing/config` | Spring Cloud Bus (RabbitMQ) | [pricing-service/](pricing-service/README.md) |
+| node-service | Node.js 22 | `GET :8084/api/v1/node/config` | Spring Cloud Bus, via its own small RabbitMQ listener | [node-service/](node-service/README.md) |
+| go-service | Go 1.23 | `GET :8085/api/v1/go/config` | Spring Cloud Bus, via its own small RabbitMQ listener | [go-service/](go-service/README.md) |
+| lambda-service | AWS Lambda (Node.js 22) in Floci | `GET /api/v1/lambda/config` through API Gateway | none needed - it reads the Config Server on every call | [lambda-service/](lambda-service/README.md) |
+
+Each lives in its own directory, builds on its own and shares no code with the others.
+
 ## 1. Architectural Overview
 
-Version A uses a **Git repository** as the single source of truth for externalized configurations. Changes pushed to Git trigger dynamic, zero-downtime property refreshes across all active microservices via **Spring Cloud Bus** backed by **RabbitMQ**.
+Version A uses a **Git repository** as the single source of truth for configuration. A commit
+triggers a live refresh of every affected client via **Spring Cloud Bus**, backed by **RabbitMQ**.
 
 ```mermaid
 graph TD
     subgraph Storage["Configuration Source"]
-        GitRepo["Git Repository<br/>(Remote GitHub / GitLab / Local)"]
+        GitRepo["Git Repository<br/>(Remote GitHub / Local file://)"]
     end
 
     subgraph ConfigLayer["Config Management"]
@@ -29,21 +45,23 @@ graph TD
         RabbitMQ["RabbitMQ Broker<br/>(:5672)"]
     end
 
-    subgraph Microservices["Client Applications"]
-        Inv["Inventory Service<br/>(:8081)"]
-        Prc1["Pricing Service (Inst 1)<br/>(:8082)"]
-        Prc2["Pricing Service (Inst 2)<br/>(:8083)"]
+    subgraph Clients["Client services"]
+        Inv["inventory-service<br/>Spring Boot (:8081)"]
+        Prc["pricing-service<br/>Spring Boot (:8082)"]
+        Node["node-service<br/>Node.js (:8084)"]
+        Go["go-service<br/>Go (:8085)"]
     end
 
-    GitRepo -- "1. Push / Webhook" --> CS
-    GitRepo -- "2. Pulls YAML config" --> CS
-    CS -- "3. Broadcasts Refresh Event" --> RabbitMQ
-    RabbitMQ -- "4. Delivers event" --> Inv
-    RabbitMQ -- "4. Delivers event" --> Prc1
-    RabbitMQ -- "4. Delivers event" --> Prc2
-    Inv -- "5. Fetches new config" --> CS
-    Prc1 -- "5. Fetches new config" --> CS
-    Prc2 -- "5. Fetches new config" --> CS
+    subgraph Floci["Floci (local AWS)"]
+        Lambda["lambda-service<br/>Lambda + API Gateway"]
+    end
+
+    GitRepo -- "1. Commit -> /monitor" --> CS
+    CS -- "2. Reads YAML" --> GitRepo
+    CS -- "3. Broadcasts refresh" --> RabbitMQ
+    RabbitMQ -- "4. Delivers" --> Inv & Prc & Node & Go
+    Inv & Prc & Node & Go -- "5. Re-fetch config" --> CS
+    Lambda -- "Fetches on every call" --> CS
 ```
 
 ---
@@ -59,19 +77,24 @@ graph LR
         BusPublisher["Bus Event Publisher"]
     end
 
-    subgraph Clients["Client Microservices"]
-        ConfigDataLoader["ConfigDataLoader (Startup)"]
+    subgraph Spring["Spring Boot clients"]
+        ConfigDataLoader["ConfigDataLoader (startup)"]
+        SpringBus["Spring Cloud Bus listener"]
         Rebinder["ConfigurationPropertiesRebinder"]
-        Provider["SettingsProvider (Validation & Atomic Swap)"]
-        BusListener["Spring Cloud Bus Listener"]
+        Validator["PropertiesValidator"]
+    end
+
+    subgraph Polyglot["Node.js / Go clients"]
+        Lib["cloud-config-client / cloudconfigclient"]
+        OwnBus["Bus listener (amqplib / amqp091-go)"]
     end
 
     MonEndpoint --> JGit
     JGit --> BusPublisher
-    BusPublisher --> BusListener
-    BusListener --> Rebinder
-    Rebinder --> Provider
+    BusPublisher --> SpringBus --> Rebinder --> Validator
+    BusPublisher --> OwnBus --> Lib
     ConfigDataLoader --> JGit
+    Lib --> JGit
 ```
 
 ---
@@ -82,28 +105,28 @@ graph LR
 sequenceDiagram
     autonumber
     actor Dev as Developer / Operator
-    participant Git as GitHub / Git Repository
+    participant Git as Git repository
     participant CS as Config Server (:8888)
     participant RMQ as RabbitMQ (Spring Cloud Bus)
-    participant Client as Pricing Service (:8082 & :8083)
+    participant Client as pricing-service (:8082)
 
-    Dev->>Git: git commit & git push (pricing-service.yml)
-    Git->>CS: POST /monitor (Webhook payload: path=pricing-service.yml)
-    CS->>Git: git fetch / pull latest commit
-    CS->>CS: Identify impacted application: "pricing-service"
+    Dev->>Git: git commit (pricing-service.yml)
+    Git->>CS: POST /monitor (path=pricing-service.yml)
+    CS->>CS: Work out the affected application: "pricing-service"
     CS->>RMQ: Publish RefreshRemoteApplicationEvent (destination: pricing-service:**)
-    RMQ->>Client: Deliver Refresh event
+    RMQ->>Client: Deliver the event (every instance of pricing-service)
     Client->>CS: GET /pricing-service/default/main
-    CS-->>Client: Return updated properties & version
-    Client->>Client: Validate new values (@NotNull, @DecimalMin, etc.)
-    alt Validation Succeeded
-        Client->>Client: Atomically swap configuration snapshot (v1 -> v2)
-        Client->>Client: Log audit event (Outcome: APPLIED)
-    else Validation Failed
-        Client->>Client: Retain last-known-good snapshot (v1)
-        Client->>Client: Log audit failure (Outcome: REJECTED)
+    CS-->>Client: The updated properties
+    Client->>Client: Re-bind PricingProperties in place
+    alt Values valid
+        Client->>Client: GET /api/v1/pricing/config now returns the new values
+    else A value breaks a rule (@DecimalMax, ...)
+        Client->>Client: Log ERROR "Refreshed pricing configuration is invalid" - fix it in Git
     end
 ```
+
+node-service and go-service follow the same steps with their own listener; lambda-service skips
+steps 3-5 because it reads the Config Server on every call.
 
 ---
 
@@ -119,18 +142,20 @@ graph TD
     CS["Config Server (:8888)<br/>(Receives Git commit /monitor webhook)"]
     Ex["RabbitMQ Exchange: springCloudBus<br/>(Topic Exchange :5672)"]
     Q1["Queue: inventory-service"]
-    Q2["Queue: pricing-service-1"]
-    Q3["Queue: pricing-service-2"]
-    Inv["Inventory Service (:8081)<br/>(Ignores, not for me)"]
-    Prc1["Pricing Service 1 (:8082)<br/>(Matches! Pulls new config)"]
-    Prc2["Pricing Service 2 (:8083)<br/>(Matches! Pulls new config)"]
+    Q2["Queue: pricing-service"]
+    Q3["Queue: node-service"]
+    Q4["Queue: go-service"]
+    Inv["inventory-service (:8081)<br/>(Ignores, not for me)"]
+    Prc["pricing-service (:8082)<br/>(Matches! Pulls new config)"]
+    Node["node-service (:8084)<br/>(Ignores, not for me)"]
+    Go["go-service (:8085)<br/>(Ignores, not for me)"]
 
     CS -- "1. Publishes 1 message:<br/>'pricing-service:**'" --> Ex
     Ex --> Q1 --> Inv
-    Ex --> Q2 --> Prc1
-    Ex --> Q3 --> Prc2
-    Prc1 -- "2. Pulls updated config" --> CS
-    Prc2 -- "2. Pulls updated config" --> CS
+    Ex --> Q2 --> Prc
+    Ex --> Q3 --> Node
+    Ex --> Q4 --> Go
+    Prc -- "2. Pulls updated config" --> CS
 ```
 
 ### Accessing the RabbitMQ Web Management Dashboard
@@ -143,8 +168,8 @@ RabbitMQ comes with an interactive web dashboard running out of the box:
 
 #### What to observe in the RabbitMQ UI:
 1. **Connections Tab ("The Phone Lines")**:
-   - You will see 4 active AMQP connections.
-   - **Service Name Identification**: Thanks to the `ConnectionNameStrategy` bean (`RabbitConfig.java`), connections display human-readable names (`config-server:8888`, `inventory-service:8081`, `pricing-service:8082`, `pricing-service:8083`).
+   - You will see 5 active AMQP connections: the Config Server and the four clients.
+   - **Service Name Identification**: each connection carries a readable name - the Spring services set it with `spring.cloud.stream.rabbit.binder.connection-name-prefix` (e.g. `inventory-service:8081#0`), and node-service / go-service use their bus id (e.g. `node-service:8084:3f2a...`).
    - *Tip*: Click the `+/-` icon on the top-right of the table to enable the **Client-provided name** column, or click any connection to inspect its details.
 2. **Exchanges Tab ("The Router")**:
    - Click on **`springCloudBus`** (`topic` type) to see the broadcast bindings to each microservice's queue (`#`).
@@ -209,7 +234,9 @@ spring:
     bootstrap-servers: localhost:9092
 ```
 
-All your Java code, `@RefreshScope`, snapshot providers, and zero-downtime refresh mechanics remain **100% identical**.
+The Spring Boot code needs no change. **node-service and go-service do**: they talk to RabbitMQ
+directly (`amqplib` / `amqp091-go`), so with Kafka their bus listener would have to be rewritten
+on a Kafka client. lambda-service is unaffected - it never uses the bus.
 
 ---
 
@@ -225,7 +252,8 @@ relative to wherever you cloned this project.
 springboot-external-properties-demo-II/     <- repository root ("the project repo")
 ├── version-a-git/                          <- run nearly everything from HERE
 │   ├── config-repo/                        <- the configuration files being served
-│   ├── config-server/  inventory-service/  pricing-service/
+│   ├── config-server/  inventory-service/  pricing-service/   <- Spring Boot
+│   ├── node-service/   go-service/   lambda-service/        <- Node.js, Go, AWS Lambda
 │   ├── docker/compose.yaml                 <- referenced as docker/compose.yaml, so cwd matters
 │   ├── k8s/                                <- deploy / verify / teardown scripts
 │   ├── scripts/                            <- keystore, git hook, e2e test, docker teardown
@@ -249,7 +277,7 @@ Two exceptions to "run it from `version-a-git/`", both about Git rather than the
 | Editing config for the **remote** backend (the default) | the **repository root** | The Config Server clones *this project's* GitHub repo and reads `version-a-git/config-repo/` inside it. The commit has to go to that repo, so it must be pushed from the root. |
 | Editing config for the **local `file://`** backend | **`version-a-git/config-repo/`** | That directory is *its own* separate Git repository with no remote. The `file://` backend serves **its** commits, and the post-commit hook lives in *its* `.git/hooks`. |
 
-> **This catches people out, so it is worth stating plainly: the same three YAML files belong to
+> **This catches people out, so it is worth stating plainly: the same YAML files belong to
 > two different Git repositories.** `version-a-git/config-repo/*.yml` are tracked by the project
 > repo *and* by the standalone repo at `version-a-git/config-repo/.git`. Committing in the root
 > does nothing for a `file://` server; committing inside `config-repo/` never reaches GitHub. Check
@@ -260,6 +288,9 @@ Two exceptions to "run it from `version-a-git/`", both about Git rather than the
 - **Docker & Docker Compose** with Docker Desktop running (`docker ps`)
 - **`keytool`** - ships with the JDK, so Java 21 covers it
 - **`jq`** and **`python3`** - used by the curl examples and by `scripts/e2e-test.sh`
+- **Node.js 22** and **npm** - only to test node-service / lambda-service, or run them without Docker
+- **Go 1.23** - only to test go-service or run it without Docker (Docker builds it for you otherwise)
+- **Floci** (`floci start`) and the **AWS CLI** - only for lambda-service
 
 Check all of them in one go:
 
@@ -373,28 +404,68 @@ mvn compile jib:buildTar
 *(`-Pfast` skips the quality gates - Spotless, Checkstyle, SpotBugs, JaCoCo - which are not needed to produce a runnable jar. Add `-o` if Maven stalls checking the network for dependencies it already has.)*
 
 ### Step 3: Run with Docker Compose
+
+Choose where the Config Server reads its configuration from:
+
 ```bash
 # from: version-a-git/
-docker compose -f docker/compose.yaml build --no-cache
-docker compose -f docker/compose.yaml up -d
+
+# (a) LOCAL mode - reads version-a-git/config-repo/ on your disk. A local commit is enough to
+#     change a value, and the end-to-end test needs this mode.
+CONFIG_REPO_URI=file:///config-repo CONFIG_REPO_SEARCH_PATHS= CONFIG_REPO_FORCE_PULL=false \
+  docker compose -f docker/compose.yaml up -d --build
+
+# (b) GITHUB mode (the default) - reads this project's GitHub repository. A change must be
+#     committed AND pushed from the repository root.
+docker compose -f docker/compose.yaml up -d --build
+```
+
+Why `CONFIG_REPO_FORCE_PULL=false` in local mode: with `true` (right for GitHub), the Config
+Server "resets the dirty repository to origin" while you commit, rewriting the files it serves
+back to the previous values - a change appears for a moment and then silently reverts.
+
+Compose builds node-service and go-service itself (they download their dependencies while
+building). **Behind a TLS-inspecting corporate proxy** such as Zscaler that fails with
+`x509: certificate signed by unknown authority`; export the proxy's root certificate first:
+`export EXTRA_CA_CERT="$(cat proxy-root.pem)"` (on macOS:
+`security find-certificate -a -c Zscaler -p /Library/Keychains/System.keychain`).
+
+Then deploy lambda-service to Floci (it is not a container in this file):
+
+```bash
+# from: version-a-git/
+floci start                                  # if it is not running yet
+./lambda-service/scripts/deploy-floci.sh     # role, function and API Gateway route
+./lambda-service/scripts/invoke-floci.sh     # -> {"greeting":"Hello from AWS Lambda",...}
 ```
 
 ### Step 4: Verify Container Status
 ```bash
 # from: version-a-git/
-docker ps
+docker compose -f docker/compose.yaml ps
 ```
-All 5 containers will report `(healthy)`:
+All 6 containers will report `(healthy)`:
 
 | Container | Role | Host ports | Image tag built by Compose |
 |---|---|---|---|
 | `cfg-git-server` | Config Server | `8888`, `9898` | `config-git-demo-config-server:latest` |
-| `cfg-git-inventory` | Inventory Service | `8081`, `9081` | `config-git-demo-inventory-service:latest` |
-| `cfg-git-pricing` | Pricing Service 1 | `8082`, `9082` | `config-git-demo-pricing-service:latest` |
-| `cfg-git-pricing-2` | Pricing Service 2 | `8083`, `9083` | `config-git-demo-pricing-service:latest` |
+| `cfg-git-inventory` | inventory-service | `8081`, `9081` | `config-git-demo-inventory-service:latest` |
+| `cfg-git-pricing` | pricing-service | `8082`, `9082` | `config-git-demo-pricing-service:latest` |
+| `cfg-git-node` | node-service | `8084` | `config-git-demo-node-service:latest` |
+| `cfg-git-go` | go-service | `8085` | `config-git-demo-go-service:latest` |
 | `cfg-git-rabbitmq` | RabbitMQ broker | `5672`, `15672` | `rabbitmq:4-management` (pulled) |
 
 The tags come from `name: config-git-demo` on line 1 of `docker/compose.yaml` (`<project>-<service>:latest`). The Kubernetes manifests in `k8s/` reference these exact strings - see section 13.6.
+
+Ask each client for its configuration:
+
+```bash
+# from: anywhere (these are just HTTP calls)
+curl -s http://localhost:8081/api/v1/inventory/config
+curl -s http://localhost:8082/api/v1/pricing/config
+curl -s http://localhost:8084/api/v1/node/config
+curl -s http://localhost:8085/api/v1/go/config
+```
 
 ### Step 5: Shut Down
 
@@ -405,7 +476,7 @@ The tags come from `name: config-git-demo` on line 1 of `docker/compose.yaml` (`
 ./scripts/teardown-docker.sh                # remove the containers and network; next `up` is instant
 ./scripts/teardown-docker.sh --stop         # only stop them; resume with `docker compose start`
 ./scripts/teardown-docker.sh --volumes      # also remove anonymous volumes (RabbitMQ leaves one per `up`)
-./scripts/teardown-docker.sh --images       # also remove the 3 images built here (next `up` must rebuild)
+./scripts/teardown-docker.sh --images       # also remove the images built here (next `up` must rebuild)
 ./scripts/teardown-docker.sh --base-images  # also remove rabbitmq:4-management (see the warning below)
 ./scripts/teardown-docker.sh --hook         # also uninstall config-repo/.git/hooks/post-commit
 ./scripts/teardown-docker.sh --jars         # also run `mvn clean`
@@ -452,33 +523,35 @@ sets for the local stack.
 ## 7. Testing Guide
 
 ### A. Automated End-to-End Test Suite
-Run the full automated acceptance suite that validates zero-downtime live refresh, the 5-second
-SLA, multi-instance broadcasting, endpoint access control and validation-error rollback. Each
-check maps to an acceptance criterion in [REQUIREMENTS.md](../REQUIREMENTS.md) - AC-01, AC-02,
-AC-03, AC-04, AC-05 and FR-31/AC-09:
+
+One script checks the whole stack: that every client returns only its own properties, that a
+commit reaches **only** the service that owns the changed value - live, within the 5-second SLA -
+and the security and error-format rules.
 
 ```bash
 # from: version-a-git/
-./scripts/e2e-test.sh
+./scripts/e2e-test.sh                 # 36 checks
+SKIP_LAMBDA=1 ./scripts/e2e-test.sh   # without Floci: skips the lambda-service checks
 ```
 
-It needs the Compose stack up (section 5), `python3` on the PATH, and it **commits to
-`config-repo/`** to trigger a refresh, reverting the value when it finishes.
+It needs the Compose stack in **local mode** (section 5, Step 3a) - it checks this first and
+says so if the server is reading GitHub instead - plus lambda-service deployed to Floci and
+`python3`. It **commits to `config-repo/`**, sets a known baseline first and restores it at the
+end, so you can run it again and again.
 
 ---
 
 ### B. Manual Testing & Verification
 
-#### 1. Verify Config Server Environment & Decryption API
-Fetch resolved properties for `pricing-service` and `inventory-service`:
+#### 1. Ask the Config Server directly
+This is the HTTP call every client makes (`/{application}/{profile}/{label}`):
 ```bash
 # from: anywhere (these are just HTTP calls)
-# Pricing service configuration (from GitHub / Git)
 curl -s -u config-client:client-secret http://localhost:8888/pricing-service/default/main | jq .
-
-# Inventory service configuration (decrypted server-side)
-curl -s -u config-client:client-secret http://localhost:8888/inventory-service/default/main | jq .
+curl -s -u config-client:client-secret http://localhost:8888/node-service/default/main | jq .
 ```
+The answer lists **property sources**, most specific first (`node-service.yml`, then the shared
+`application.yml`); a client merges them so that the first one wins.
 
 #### 2. Test Encrypting and Decrypting Secrets
 Encrypt a secret with Config Server's active RSA key:
@@ -494,56 +567,34 @@ curl -s -u config-admin:admin-secret -X POST http://localhost:8888/decrypt \
   -H "Content-Type: text/plain" --data-binary "$CIPHER"
 ```
 
-#### 3. Inspect Microservice Configuration Snapshots
-Check the active configuration loaded into memory by each service:
+#### 3. Ask each client what it is using
 ```bash
 # from: anywhere (these are just HTTP calls)
-# Inventory Service Snapshot
-curl -s http://localhost:8081/api/v1/config/snapshot | jq .
-
-# Pricing Service 1 Snapshot
-curl -s http://localhost:8082/api/v1/config/snapshot | jq .
-
-# Pricing Service 2 Snapshot
-curl -s http://localhost:8083/api/v1/config/snapshot | jq .
+curl -s http://localhost:8081/api/v1/inventory/config | jq .
+curl -s http://localhost:8082/api/v1/pricing/config | jq .
+curl -s http://localhost:8084/api/v1/node/config | jq .
+curl -s http://localhost:8085/api/v1/go/config | jq .
+./lambda-service/scripts/invoke-floci.sh        # from: version-a-git/
 ```
-
-Each service also exposes its refresh audit trail - one entry per refresh, with the changed keys
-but never their values:
-```bash
-# from: anywhere (these are just HTTP calls)
-curl -s http://localhost:8081/api/v1/config/history | jq .
-```
-The first entry of every service has `trigger: "startup"`; a bus-delivered refresh appears as a
-separate entry.
-
-#### 4. Test Business Endpoints
-```bash
-# from: anywhere (these are just HTTP calls)
-# Test Inventory reservation
-curl -s -X POST http://localhost:8081/api/v1/inventory/reservations \
-  -H 'Content-Type: application/json' \
-  -d '{"sku":"SKU-1","quantity":10}' | jq .
-
-# Test Price Quote calculation
-curl -s "http://localhost:8082/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
-```
+Each returns only its own properties, for example
+`{"currency":"INR","discountPercentage":10.0,"surgePricingEnabled":false,"surgeMultiplier":4}`.
 
 ---
 
 ### C. Testing Live Refresh (Zero-Downtime Propagation)
 
 #### Step 1: Change a Configuration Property
-Edit `version-a-git/config-repo/pricing-service.yml` in your Git repo:
+Edit `version-a-git/config-repo/pricing-service.yml`:
 ```yaml
 pricing:
   currency: "INR"
   discount-percentage: 25.0   # Changed from 10.0 to 25.0
   surge-pricing-enabled: false
-  surge-multiplier: 1.5
+  surge-multiplier: 4
 ```
-Commit it. With a **local `file://`** repo a commit is enough (nothing to push); against a
-**remote** repo you must `git push`, because the Config Server reads the remote, not your disk.
+Commit it. In **local mode** a commit inside `config-repo/` is enough (nothing to push), and the
+post-commit hook (section 8) already performs Step 2a for you. In **GitHub mode** you must commit
+and `git push` from the repository root, because the Config Server reads the remote, not your disk.
 
 #### Step 2: Notify Config Server
 Two supported triggers. Use the one that matches your backend:
@@ -578,28 +629,30 @@ Expect `HTTP/1.1 204`. The `Content-Type` header is **mandatory** - without it t
 refresh that had no effect. Append `/pricing-service:**` to scope it to one application.
 
 #### Step 3: Verify Updated Live State
-Without restarting containers, query the quote endpoints:
+Without restarting anything:
 ```bash
 # from: anywhere (these are just HTTP calls)
-curl -s "http://localhost:8082/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
-curl -s "http://localhost:8083/api/v1/pricing/quotes/SKU-100?basePrice=1000.00" | jq .
+curl -s http://localhost:8082/api/v1/pricing/config | jq .discountPercentage   # -> 25.0
+curl -s http://localhost:8081/api/v1/inventory/config | jq .                   # unchanged
 ```
-Both instances will immediately reflect:
-- `discountPercentage: 25.0`
-- `finalPrice: 750.00`
-- `configVersion: 2`
+Only pricing-service changed. The same works for node-service and go-service (edit
+`node-service.yml` / `go-service.yml`), and lambda-service shows a change on its very next call.
 
 ---
 
-### D. Testing Validation Failure & Last-Known-Good Safety
+### D. What happens with an invalid value
 
-If an operator commits an invalid value (e.g. `discount-percentage: 95.0`, violating `@DecimalMax("90.0")`):
-1. Push the invalid change and notify `/monitor`.
-2. Inspect `curl -s http://localhost:8082/api/v1/config/snapshot | jq .`:
-   - `lastOutcome`: `"REJECTED"`
-   - `lastFailureReason`: `"discountPercentage must be less than or equal to 90.0"`
-   - `settings`: **Retains previous valid snapshot (last-known-good)**.
-   - Traffic continues serving without disruption or errors.
+The Spring services check their values against rules in their `config/*Properties.java`
+(`@Min`, `@Max`, `@DecimalMax`, ...); node-service, go-service and lambda-service check theirs in
+`node-config.js` / `goconfig.go` / `lambda-config.js`.
+
+| When the bad value arrives | Spring Boot services | node-service / go-service | lambda-service |
+|---|---|---|---|
+| At startup | refuse to start: `Invalid pricing configuration: pricing.discountPercentage must be less than or equal to 90.0` | refuse to start, same kind of message | n/a |
+| In a refresh | keep running, log `ERROR Refreshed pricing configuration is invalid: ...` | **keep the values they already had** and log the error | answer `503` problem details until it is fixed |
+
+Try it: set `discount-percentage: 95.0`, commit, and watch `docker logs -f cfg-git-pricing`.
+Then set it back.
 
 ---
 
@@ -631,23 +684,32 @@ notify prints a warning and never blocks the commit, and manual recovery is
 
 Every microservice exposes full OpenAPI 3.1 definitions and an interactive Swagger UI with live schema validation:
 
-| Service | Swagger UI URL | OpenAPI 3 JSON Schema |
+| Service | Swagger UI | OpenAPI 3 document |
 |---|---|---|
-| **Inventory Service** | [http://localhost:8081/swagger-ui.html](http://localhost:8081/swagger-ui.html) | [http://localhost:8081/v3/api-docs](http://localhost:8081/v3/api-docs) |
-| **Pricing Service (Inst 1)** | [http://localhost:8082/swagger-ui.html](http://localhost:8082/swagger-ui.html) | [http://localhost:8082/v3/api-docs](http://localhost:8082/v3/api-docs) |
-| **Pricing Service (Inst 2)** | [http://localhost:8083/swagger-ui.html](http://localhost:8083/swagger-ui.html) | [http://localhost:8083/v3/api-docs](http://localhost:8083/v3/api-docs) |
+| **inventory-service** | [http://localhost:8081/swagger-ui.html](http://localhost:8081/swagger-ui.html) | [http://localhost:8081/v3/api-docs](http://localhost:8081/v3/api-docs) |
+| **pricing-service** | [http://localhost:8082/swagger-ui.html](http://localhost:8082/swagger-ui.html) | [http://localhost:8082/v3/api-docs](http://localhost:8082/v3/api-docs) |
+| **node-service** | - (paste the document into [editor.swagger.io](https://editor.swagger.io)) | [http://localhost:8084/v3/api-docs](http://localhost:8084/v3/api-docs) |
+| **go-service** | - (paste the document into [editor.swagger.io](https://editor.swagger.io)) | [http://localhost:8085/v3/api-docs](http://localhost:8085/v3/api-docs) |
+| **lambda-service** | - | [lambda-service/openapi.json](lambda-service/openapi.json) (the API Gateway route) |
 
 ### Features Included:
-- **Rich DTO Schemas**: `@Schema` metadata including descriptions, example values, min/max constraints, and required fields.
-- **Response Code Mapping**: Explicit `@ApiResponse` annotations documenting `200 OK`, `400 Bad Request` (RFC 9457), `404 Not Found`, and `500 Internal Server Error`.
-- **Try-It-Out**: Directly execute quote calculations, stock reservations, and configuration snapshot inspections from your browser.
+- **Schemas with examples**: every field of every response is described, with an example value.
+- **Documented responses**: `200` with the body, and errors as RFC 9457 problem details.
+- **Try-It-Out** (Spring services): call the API from the browser.
 
 ---
 
 ## 10. Production-Grade Security Hardening
 
 ### Security Filter Chain (`SecurityConfig.java`)
-All microservices implement enterprise-grade HTTP security controls:
+The Spring services implement these HTTP security controls (node-service, go-service and
+lambda-service send the same response headers; see their READMEs):
+- **Deny by default**: only the API, the OpenAPI/Swagger docs and the health checks are reachable;
+  every other path answers `403`. Note that in Spring Boot 4 this chain also guards the separate
+  management port, which is why `/actuator/health/**` is listed explicitly - without it Docker and
+  Kubernetes health probes get `403`.
+- **No open refresh endpoint**: the clients expose only `health` on Actuator. Refreshes arrive over
+  RabbitMQ, so an HTTP `/actuator/refresh` would only let anyone trigger reloads.
 - **Stateless Session Management**: `SessionCreationPolicy.STATELESS` eliminates server-side session fixation vulnerabilities.
 - **REST-Safe CSRF**: CSRF protection is safely disabled on stateless JSON endpoints in accordance with OWASP API Security guidelines.
 - **Strict HTTP Security Response Headers**:
@@ -656,39 +718,36 @@ All microservices implement enterprise-grade HTTP security controls:
   - `X-Frame-Options`: `DENY` (Clickjacking prevention)
   - `X-Content-Type-Options`: `nosniff` (MIME-sniffing prevention)
   - `Referrer-Policy`: `strict-origin-when-cross-origin`
-  - `Permissions-Policy`: `"camera=(), microphone=(), geolocation=()"`
 
 ---
 
 ## 11. RFC 9457 Standardized Exception Handling
 
-All uncaught exceptions and validation errors are intercepted by `@RestControllerAdvice` (`GlobalExceptionHandler`) and formatted as RFC 9457 `application/problem+json`:
+Every error is formatted as RFC 9457 `application/problem+json` - by `GlobalExceptionHandler`
+(`@RestControllerAdvice`) in the Spring services, and by each Node.js / Go service's own handler.
+For example, an unknown path:
 
+```bash
+# from: anywhere (these are just HTTP calls)
+curl -s http://localhost:8081/api/v1/inventory/nope
+```
 ```json
 {
-  "type": "https://api.acme.com/errors/validation-error",
-  "title": "Validation Failed",
-  "status": 400,
-  "detail": "Request payload validation failed for 1 field(s)",
-  "instance": "/api/v1/inventory/reservations",
-  "errorId": "7b0d2d3e-953e-4b71-9c8d-2947113197f2",
-  "timestamp": "2026-09-19T17:30:00Z",
-  "fieldErrors": [
-    {
-      "field": "quantity",
-      "rejectedValue": -5,
-      "message": "Quantity must be greater than zero"
-    }
-  ]
+  "type": "urn:problem:resource-not-found",
+  "title": "Resource not found",
+  "status": 404,
+  "detail": "No endpoint api/v1/inventory/nope",
+  "instance": "/api/v1/inventory/nope",
+  "timestamp": "2026-10-06T14:30:00Z"
 }
 ```
 
 ### Handled Error Scenarios:
-- **`MethodArgumentNotValidException` / `ConstraintViolationException`**: HTTP 400 with detailed `fieldErrors`.
-- **`ConfigurationValidationException` / `IllegalStateException`**: HTTP 400 when business rules reject invalid configuration or payload state.
-- **`NoResourceFoundException`**: HTTP 404 for nonexistent endpoints.
-- **`HttpRequestMethodNotSupportedException`**: HTTP 405 for unsupported HTTP verbs.
-- **`Exception` (Uncaught Fallback)**: HTTP 500 with unique `errorId` for log correlation without leaking internal stack traces.
+- **`NoResourceFoundException`**: HTTP 404 for an endpoint that does not exist.
+- **`HttpRequestMethodNotSupportedException`**: HTTP 405 for anything but `GET` / `HEAD`.
+- **`HttpMediaTypeNotAcceptableException`**: HTTP 406 when the caller does not accept JSON.
+- **`Exception` (fallback)**: HTTP 500 with a unique `errorId` that matches the log line; the
+  cause and stack trace are logged, never returned.
 
 ---
 
@@ -720,12 +779,12 @@ mvn compile jib:build -Dimage=<registry>/<image>:<tag>   # Push directly to cont
 |---|---|---|
 | **SAST (Bytecode Analysis)** | SpotBugs 4.10.4 + `findsecbugs-plugin:1.13.0` | SQL injection, CSRF misconfiguration, insecure cryptography, path traversal, command injection |
 | **SCA (Dependency Vulnerability)** | OWASP `dependency-check-maven:13.0.0` | Known CVEs in third-party libraries against the National Vulnerability Database (NVD) |
-| **Architecture Enforcement** | ArchUnit 1.5.0 | Layer isolation, immutable snapshot boundaries, ban direct properties injection |
+| **Architecture Enforcement** | ArchUnit 1.5.0 | Refresh safety (`@ConfigurationProperties` with setters, not records; no `@Value`), package layering, no field injection |
 | **Code Formatting** | Spotless + google-java-format 1.36.1 | Deterministic code style formatting |
 | **Static Code Analysis** | Checkstyle 14.1.0 | Coding conventions, naming standards, Javadoc hygiene |
 | **Code Coverage** | JaCoCo 0.8.15 | Enforced line (>70%) and branch (>60%) thresholds. **`config-server` lowers these to 45% / 35%** on purpose: its two largest classes (`SecurityConfig`, the application class) need a full context to instantiate, and their behaviour is asserted by `GitBackendIT` and `scripts/e2e-test.sh` instead of by unit coverage - the override and its rationale are in `config-server/pom.xml` |
 
-Each of the three services is a **standalone Maven project** parented directly to
+Each of the three Java services is a **standalone Maven project** parented directly to
 `spring-boot-starter-parent` 4.0.8, with its own dependency management, quality gates and
 `config/` directory. The `pom.xml` at `version-a-git/` is an **aggregator only** - nothing is
 inherited from it - so a single service builds on its own:
@@ -733,6 +792,15 @@ inherited from it - so a single service builds on its own:
 ```bash
 # from: version-a-git/
 cd inventory-service && mvn verify
+```
+
+The other three services have their own checks:
+
+```bash
+# from: version-a-git/
+(cd node-service && npm ci && npm test)
+(cd lambda-service && npm ci && npm test)
+(cd go-service && gofmt -l . && go vet ./... && go test -race ./...)
 ```
 
 
@@ -750,8 +818,8 @@ understand what that script does, or when a step fails and you need to run just 
 
 Think of it as five jobs:
 
-1. **Compile** the Java code into three `.jar` files.
-2. **Wrap** each jar into a Docker image (a sealed box containing the app + a Java runtime).
+1. **Compile** the Java code into three `.jar` files (node-service and go-service need no compile step on your machine - their images build themselves).
+2. **Wrap** each service into a Docker image (a sealed box containing the app and its runtime).
 3. **Hand** those boxes to the Kubernetes cluster.
 4. **Tell** Kubernetes to run them, using the instruction files in `k8s/`.
 5. **Prove** that changing a setting in GitHub reaches the running apps without restarting them.
@@ -831,7 +899,7 @@ only want the jars. Wait for `BUILD SUCCESS`.
 
 ```bash
 # from: version-a-git/
-docker compose -f docker/compose.yaml build config-server inventory-service pricing-service
+docker compose -f docker/compose.yaml build config-server inventory-service pricing-service node-service go-service
 ```
 
 **Where the image names come from.** You never type the tags yourself. Docker Compose builds them
@@ -843,6 +911,8 @@ as `<project-name>-<service-name>:latest`. The project name is set on line 1 of
 | `config-server` | `config-git-demo-config-server:latest` |
 | `inventory-service` | `config-git-demo-inventory-service:latest` |
 | `pricing-service` | `config-git-demo-pricing-service:latest` |
+| `node-service` | `config-git-demo-node-service:latest` |
+| `go-service` | `config-git-demo-go-service:latest` |
 
 These exact strings are what `k8s/02-config-server.yaml` and `k8s/03-clients.yaml` ask for in
 their `image:` fields. **If they do not match, the pods will never start** — so confirm the tags
@@ -853,7 +923,7 @@ actually exist before continuing:
 docker images | grep config-git-demo
 ```
 
-You should see three lines. If a name differs, either rename the image:
+You should see five lines. If a name differs, either rename the image:
 
 ```bash
 # from: anywhere (these are just HTTP calls)
@@ -871,13 +941,15 @@ The cluster is a separate machine and cannot see your laptop's images yet.
 for img in config-git-demo-config-server:latest \
            config-git-demo-inventory-service:latest \
            config-git-demo-pricing-service:latest \
+           config-git-demo-node-service:latest \
+           config-git-demo-go-service:latest \
            rabbitmq:4-management; do
   echo "loading $img"
   minikube image load "$img"
 done
 ```
 
-This is slow and silent — each image is a few hundred MB. Verify all four arrived:
+This is slow and silent — the Java images are a few hundred MB each. Verify all six arrived:
 
 ```bash
 # from: anywhere (these are just HTTP calls)
@@ -999,13 +1071,15 @@ kubectl apply -f k8s/02-config-server.yaml
 kubectl -n config-demo rollout status deployment/config-server --timeout=300s
 ```
 
-**Then the two client apps:**
+**Then the four client apps** (inventory and pricing in Spring Boot, node-service, go-service):
 
 ```bash
 # from: version-a-git/   # paths below are relative to it
 kubectl apply -f k8s/03-clients.yaml
 kubectl -n config-demo rollout status deployment/inventory-service --timeout=300s
 kubectl -n config-demo rollout status deployment/pricing-service  --timeout=300s
+kubectl -n config-demo rollout status deployment/node-service     --timeout=300s
+kubectl -n config-demo rollout status deployment/go-service       --timeout=300s
 ```
 
 **Apply Zero-Trust Network Policies and Autoscaling (HPA):**
@@ -1023,15 +1097,16 @@ Now look at everything:
 kubectl -n config-demo get pods
 ```
 
-Expect six pods, all `Running`, all `1/1`:
+Expect seven pods, all `Running`, all `1/1`:
 
 ```
 config-server-xxxxxxxxxx-aaaaa      1/1  Running
 config-server-xxxxxxxxxx-bbbbb      1/1  Running
-inventory-service-xxxxxxxxx-ccccc   1/1  Running
-pricing-service-xxxxxxxxxx-ddddd    1/1  Running
-pricing-service-xxxxxxxxxx-eeeee    1/1  Running
-rabbitmq-xxxxxxxxxx-fffff           1/1  Running
+go-service-xxxxxxxxxx-ccccc         1/1  Running
+inventory-service-xxxxxxxxx-ddddd   1/1  Running
+node-service-xxxxxxxxxx-eeeee       1/1  Running
+pricing-service-xxxxxxxxxx-fffff    1/1  Running
+rabbitmq-xxxxxxxxxx-ggggg           1/1  Running
 ```
 
 `1/1` means "1 of 1 containers passed its health check". A pod stuck at `0/1` is still starting;
@@ -1058,13 +1133,11 @@ kubectl -n config-demo port-forward svc/config-server 9888:9888
 
 ```bash
 # from: anywhere (these are just HTTP calls)
-curl -s -u config-client:client-secret \
-  http://localhost:8081/api/v1/config/snapshot | python3 -m json.tool
+curl -s http://localhost:8081/api/v1/inventory/config | python3 -m json.tool
 ```
 
-Look at `settings.environmentLabel`. It reads back whatever `demo.shared.environment-label`
-currently holds in `config-repo/application.yml` **on GitHub** (`production-config` at the time of
-writing) — so check the file rather than expecting a fixed string.
+The values are whatever `config-repo/inventory-service.yml` currently holds **on GitHub** - so
+compare with the file on GitHub rather than expecting fixed numbers.
 
 To see the proof that it came from Git rather than from inside the jar, ask the Config Server
 directly. Open a third terminal:
@@ -1073,50 +1146,60 @@ directly. Open a third terminal:
 # from: anywhere (these are just HTTP calls)
 kubectl -n config-demo port-forward svc/config-server 8888:8888
 curl -s -u config-client:client-secret \
-  http://localhost:8888/application/default | python3 -m json.tool
+  http://localhost:8888/inventory-service/default | python3 -m json.tool
 ```
 
 The reply contains a real commit SHA and the GitHub URL it was read from:
 
 ```json
 "version": "04b14a940777d4909d3defd467291937d77a0f3f",
-"propertySources": [{ "name": "https://github.com/.../version-a-git/config-repo/application.yml" }]
+"propertySources": [{ "name": "https://github.com/.../version-a-git/config-repo/inventory-service.yml" }]
 ```
 
 > **The very first request can take 10–20 seconds and may time out.** That request is what
 > triggers the initial `git clone`. Just run it again — the second one is fast.
 
+> **node-service and go-service need their YAML files on GitHub.** `node-service.yml` and
+> `go-service.yml` must be committed and pushed before these pods can start - they refuse to run
+> without configuration. Until then they crash-loop with `Could not load configuration ... 404`.
+
 ### 13.13 Step 11 — The main event: change a setting with no restart
 
-This is the whole point of the project. Four moves: **edit → commit → push → broadcast.**
+This is the whole point of the project. Four moves: **edit → commit → push → broadcast.** This
+example changes node-service, to show that a non-Spring service gets the same broadcast.
 
-**First, note what you are starting from** (remember the `version` number):
+Open a door to node-service (its own terminal):
 
 ```bash
 # from: anywhere (these are just HTTP calls)
-curl -s http://localhost:8081/api/v1/config/snapshot \
-  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("version",d["version"],"->",d["settings"]["environmentLabel"])'
+kubectl -n config-demo port-forward svc/node-service 8084:8084
 ```
 
-**1. Edit** `version-a-git/config-repo/application.yml` and change the label:
+**First, note what you are starting from:**
+
+```bash
+# from: anywhere (these are just HTTP calls)
+curl -s http://localhost:8084/api/v1/node/config      # e.g. "maxItems":25
+```
+
+**1. Edit** `version-a-git/config-repo/node-service.yml`:
 
 ```yaml
-demo:
-  shared:
-    environment-label: "hello-from-kubernetes"
+node:
+  max-items: 30
 ```
 
 **2 and 3. Commit and push.** Pushing is not optional — the cluster reads GitHub, not your disk:
 
 ```bash
 # from: the repository root
-git add version-a-git/config-repo/application.yml
-git commit -m "test: change environment label"
+git add version-a-git/config-repo/node-service.yml
+git commit -m "test: change node-service max-items"
 git push
 ```
 
-**4. Broadcast.** Tell the Config Server to announce the change. Every app hears it over RabbitMQ
-and re-fetches:
+**4. Broadcast.** Tell the Config Server to announce the change. Every app hears it over RabbitMQ;
+node-service sees that the message is addressed to it and re-fetches:
 
 ```bash
 # from: anywhere (these are just HTTP calls)
@@ -1135,11 +1218,9 @@ You want **`HTTP/1.1 204`**. 204 means "done, nothing to say back" — that is s
 
 ```bash
 # from: anywhere (these are just HTTP calls)
-curl -s http://localhost:8081/api/v1/config/snapshot \
-  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("version",d["version"],"->",d["settings"]["environmentLabel"])'
+curl -s http://localhost:8084/api/v1/node/config      # "maxItems":30
+kubectl -n config-demo logs deploy/node-service --tail=3   # "Configuration changed"
 ```
-
-The `version` has gone up by one and the label is your new text.
 
 **The important part:** confirm nothing restarted. `RESTARTS` must still be `0` and `AGE` must
 still be the original age:
@@ -1151,43 +1232,44 @@ kubectl -n config-demo get pods
 
 The apps never stopped. No redeploy, no downtime, no dropped requests.
 
-**Put the label back when you are done** — edit, commit, push, and broadcast again. Pushing the
+**Put the value back when you are done** — edit, commit, push, and broadcast again. Pushing the
 revert alone is *not* enough: the running pods keep serving the old value until you broadcast.
 
-### 13.14 Step 12 — Prove every copy got the message
+### 13.14 Step 12 — Prove every pod got the message
 
-One broadcast must reach **both** `pricing-service` pods. If it only reached one, half your traffic
-would silently get stale settings — the exact bug this design exists to prevent.
-
-Ask each pod by its own IP, bypassing load balancing:
+A broadcast must reach **every** pod of a service. If it reached only some, part of your traffic
+would silently get stale settings — the exact bug this design exists to prevent. When a service
+is scaled to several pods (for example by its autoscaler), ask each pod by its own IP, bypassing
+load balancing:
 
 ```bash
 # from: anywhere (these are just HTTP calls)
-for ip in $(kubectl -n config-demo get pods -l app=pricing-service \
+for ip in $(kubectl -n config-demo get pods -l app=node-service \
               -o jsonpath='{range .items[*]}{.status.podIP}{"\n"}{end}'); do
   echo -n "pod $ip -> "
   kubectl -n config-demo exec deploy/config-server -c config-server -- \
-    wget -qO- --timeout=10 "http://$ip:8082/api/v1/config/snapshot" \
-    | python3 -c 'import sys,json;print(json.load(sys.stdin)["settings"]["environmentLabel"])'
+    wget -qO- --timeout=10 "http://$ip:8084/api/v1/node/config"
+  echo
 done
 ```
 
-Both lines must show the same new value.
+Every line must show the same new value.
 
 *(The command borrows the Config Server pod as a web browser because it already sits inside the
 cluster network. Starting a fresh helper pod would need an image download this VM cannot do.)*
 
-To run all of this automatically:
+To run all of this automatically, for all four in-cluster services:
 
 ```bash
 # from: version-a-git/
 ./k8s/verify-in-cluster.sh
 ```
 
-It finishes with `ALL <n> CHECKS PASSED (in-cluster)`. The count is not fixed - it grows with the
-number of replicas, because every config-server and pricing-service pod is asserted individually.
-The script pushes a real commit to the remote and pushes the revert back in a trap, so it needs
-push access and leaves the repository as it found it even if interrupted.
+It finishes with `ALL <n> CHECKS PASSED (in-cluster)` - every pod is asserted individually, so
+the count grows with the number of pods. **It pushes two commits to the remote** (the change and
+its revert, the revert in a trap so it happens even if the script is interrupted), so it needs
+push access. It stages only the four config-repo files it edits; nothing else in your working tree
+is committed.
 
 ### 13.15 Step 13 — Shut down
 
@@ -1247,4 +1329,3 @@ kubectl -n config-demo logs <pod-name> --previous   # if it already crashed and 
 | Pushed a change, nothing happened | You committed but did not `git push`, or did not broadcast | Push, then `busrefresh` |
 | Values arrive as `invalid.<key>: <n/a>` | A `{cipher}` value cannot be decrypted by the current keystore | The keystore does not match what encrypted the value; re-encrypt it or remove it |
 | `Pending` pods, `Insufficient cpu/memory` | The cluster is too small | Restart bigger: `minikube delete && minikube start --cpus=4 --memory=6g` |
-

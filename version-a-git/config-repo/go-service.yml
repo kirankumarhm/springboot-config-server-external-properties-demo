@@ -1,0 +1,6 @@
+# Read by go-service (Go), which has no Spring library: it calls the Config Server's
+# HTTP API directly and re-reads it every 5 seconds.
+go:
+  greeting: "Hello from Go"
+  feature-enabled: false
+  max-items: 50

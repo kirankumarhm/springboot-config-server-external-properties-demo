@@ -53,8 +53,9 @@ Options:
                     certain the database holds nothing you want.
   --volumes         Also remove anonymous volumes (`down -v`). The postgres and RabbitMQ base
                     images declare VOLUMEs, so each `up` leaves some behind.
-  --images          Also remove the 3 images built from this project
-                    (config-jdbc-demo-config-server / -inventory-service / -pricing-service).
+  --images          Also remove the 5 images built from this project
+                    (config-jdbc-demo-config-server / -inventory-service / -pricing-service /
+                    -node-service / -go-service).
                     The next `up` must rebuild them - run `mvn -Pfast package` first.
   --base-images     Also remove the pulled base images (postgres:17.6, rabbitmq:4-management).
                     CAUTION: k8s/deploy-minikube.sh loads both from the HOST daemon into
@@ -111,7 +112,7 @@ if [ "$NO_DUMP" -eq 0 ] && pg_running; then
   echo "  - first pg_dump the configuration database to scripts/backups/"
 fi
 [ "$DO_VOLUMES"     -eq 1 ] && echo "  - remove anonymous volumes belonging to this project"
-[ "$DO_IMAGES"      -eq 1 ] && echo "  - remove the 3 images built from this project (next up must rebuild)"
+[ "$DO_IMAGES"      -eq 1 ] && echo "  - remove the 5 images built from this project (next up must rebuild)"
 [ "$DO_BASE_IMAGES" -eq 1 ] && echo "  - ${YEL}remove postgres:17.6 and rabbitmq:4-management - this breaks k8s/deploy-minikube.sh until you pull them again${OFF}"
 [ "$DO_JARS"        -eq 1 ] && echo "  - run 'mvn clean' (deletes target/ in all three modules)"
 echo
@@ -168,7 +169,9 @@ if [ "$DO_IMAGES" -eq 1 ]; then
   echo "==> Removing images built from this project"
   for img in ${PROJECT}-config-server:latest \
              ${PROJECT}-inventory-service:latest \
-             ${PROJECT}-pricing-service:latest; do
+             ${PROJECT}-pricing-service:latest \
+             ${PROJECT}-node-service:latest \
+             ${PROJECT}-go-service:latest; do
     printf '    %-45s' "$img"
     docker rmi "$img" >/dev/null 2>&1 && echo "removed" || echo "not present"
   done
@@ -193,7 +196,7 @@ echo
 echo "${BOLD}==> Remaining state${OFF}"
 echo "  containers: $(dc ps -a -q 2>/dev/null | grep -c . || echo 0)"
 echo "  database:   $(docker inspect "$PG" >/dev/null 2>&1 && echo 'container present - data intact' || echo 'gone (restored only from a dump)')"
-echo "  images:     $(docker images --format '{{.Repository}}' | grep -c "^${PROJECT}-" || true) of 3 built images present"
+echo "  images:     $(docker images --format '{{.Repository}}' | grep -c "^${PROJECT}-" || true) of 5 built images present"
 if [ -d "$BACKUP_DIR" ]; then
   echo "  backups:    $(ls -1 "$BACKUP_DIR"/configdb-*.sql 2>/dev/null | wc -l | tr -d ' ') dump(s) in scripts/backups/"
 fi

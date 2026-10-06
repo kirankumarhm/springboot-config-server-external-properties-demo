@@ -94,7 +94,7 @@ This idea is old and well-established — it is principle III of the
 
 ## 3. The vocabulary
 
-These eight terms are all you need to read the rest of this guide. Everything else in the other
+These terms are all you need to read the rest of this guide. Everything else in the other
 documents is built on top of them.
 
 **Property** — one named value. `inventory.max-order-quantity = 500`. That's a property. Its name
@@ -105,9 +105,10 @@ hold properties and hand them out. Your services ask it "what are my settings?" 
 In this project it runs on port `8888`. It is a real, standard piece of Spring software
 (*Spring Cloud Config Server*) — not something invented here.
 
-**Client** — any application that *asks* the Config Server for its settings. This project has two
-clients: `inventory-service` and `pricing-service`. Calling them "clients" just means they are on
-the asking end.
+**Client** — any application that *asks* the Config Server for its settings. This project has
+five clients, in three languages: `inventory-service` and `pricing-service` (Java, Spring Boot),
+`node-service` (Node.js), `go-service` (Go), and `lambda-service` (an AWS Lambda function).
+Calling them "clients" just means they are on the asking end.
 
 **Backend** — where the Config Server actually stores the properties. Could be a Git repository, a
 database, a cloud file store. The clients neither know nor care which one it is; they only ever
@@ -123,22 +124,20 @@ clients at once. Without it, you'd have to poke each running copy individually. 
 RabbitMQ, a widely-used message broker, as the channel. The Spring piece that rides on it is
 called *Spring Cloud Bus*.
 
-**Snapshot** — a complete, frozen, read-only set of configuration values, taken at one moment.
-This is a design idea specific to this project, and it is the heart of it: instead of letting
-business code read settings that might be changing underneath it, the code reads a *snapshot*
-that can never change. When new configuration arrives, a whole new snapshot is built and swapped
-in, in one step.
+**Validation** — checking that a setting makes sense before relying on it. Each client has rules
+such as "the maximum order quantity is between 1 and 10,000". Section 8 shows what each client does
+when a setting breaks a rule.
 
-**Last-known-good** — the snapshot the service is currently using successfully. If someone pushes
-a broken configuration change, the service *keeps* its last-known-good snapshot and carries on
-serving traffic, rather than adopting the broken values or falling over. Section 8 shows this
-happening.
+**Lambda** — a function that AWS runs on demand and freezes between calls. Because it is frozen, it
+cannot listen to the Bus; instead it asks the Config Server on *every* call. Here it runs in
+**Floci**, a program that imitates AWS on your laptop.
 
 ---
 
 ## 4. The cast: what actually runs
 
-When you start version A, five containers come up. Here is what each one is for.
+When you start version A, six containers come up, and one Lambda function runs in Floci. Here is
+what each one is for.
 
 ```text
         ┌──────────────────────────┐
@@ -152,34 +151,29 @@ When you start version A, five containers come up. Here is what each one is for.
                      │ "everybody refresh!"
         ┌────────────▼─────────────┐
         │     RabbitMQ (the Bus)   │   port 5672
-        └──┬──────────┬─────────┬──┘
-           │          │         │
-    ┌──────▼───┐ ┌────▼─────┐ ┌─▼─────────┐
-    │inventory │ │ pricing  │ │ pricing   │   the clients — real little web apps
-    │  :8081   │ │  :8082   │ │  #2 :8083 │   with actual business endpoints
-    └──────────┘ └──────────┘ └───────────┘
+        └──┬────────┬────────┬──┬──┘
+           │        │        │  │
+    ┌──────▼──┐ ┌───▼────┐ ┌─▼──────┐ ┌▼──────┐      ┌─────────────────────┐
+    │inventory│ │pricing │ │ node   │ │  go   │      │ lambda-service      │
+    │ :8081   │ │ :8082  │ │ :8084  │ │ :8085 │      │ (in Floci) - asks   │
+    │ Java    │ │ Java   │ │Node.js │ │  Go   │      │ the server on every │
+    └─────────┘ └────────┘ └────────┘ └───────┘      │ call, no Bus needed │
+                                                     └─────────────────────┘
 ```
 
-Why two copies of `pricing-service`? To prove that a refresh reaches **every** running copy, not
-just whichever one you happen to poke. That is the whole reason the Bus exists. In real life you
-run several copies of a service for capacity and redundancy, and a configuration change that only
-reached one of them would be worse than useless — you'd have copies disagreeing with each other.
+Every client does the same deliberately simple thing: it has **one** web address that tells you
+which settings it is using right now. For example, `inventory-service` answers
+`GET /api/v1/inventory/config` with its four settings, and nothing else.
 
-The two client services do deliberately boring, easy-to-check things:
-
-- **`inventory-service`** — accepts stock reservations, and refuses ones bigger than the
-  configured limit. Also decides express vs standard shipping based on a configured on/off flag.
-- **`pricing-service`** — quotes a price for an item, applying a configured discount percentage
-  and an optional surge multiplier.
-
-They are intentionally trivial. The point is not the business logic; the point is that you can
-*see* their behaviour change the instant you change configuration.
+Why so simple? Because the point is not the business logic - the point is that you can *see* a
+service's settings change the instant you change the configuration, without restarting it. And
+because there are clients in three languages, you can see that the idea is not tied to Java.
 
 ---
 
 ## 5. How a change travels
 
-You edit a file. About half a second later, three running services behave differently. Here is
+You edit a file. About a second later, the service that owns that setting is using the new value. Here is
 every step in between.
 
 ```text
@@ -193,10 +187,11 @@ every step in between.
     and publishes a refresh message onto the Bus, addressed to just that application
                          │
  5. Every running copy of inventory-service receives the message
+    (node-service and go-service hear it too, see it is not for them, and ignore it)
                          │
  6. Each one re-fetches its settings from the Config Server
                          │
- 7. Each one validates the new values, builds a fresh snapshot, and swaps it in
+ 7. Each one checks the new values against its rules and starts using them
                          │
  8. The very next request is served using the new values.  No restart happened.
 ```
@@ -210,9 +205,13 @@ not free, and you do not want every configuration change in your company to ripp
 service you own. There is also a shared file, `application.yml`, whose changes deliberately *do*
 reach everyone.
 
-**Step 7 — "validates the new values."** Configuration comes from outside your code, which means
+**Step 7 — "checks the new values."** Configuration comes from outside your code, which means
 it can be wrong. Someone can type `99999` where the maximum sensible value is `10000`. Section 8
 is entirely about what happens then.
+
+**The Node.js and Go services are not Spring applications**, yet they follow the same steps. Spring
+Cloud Bus is just small JSON messages on RabbitMQ, so they listen to it with a few lines of their
+own code. Their READMEs (`node-service/README.md`, `go-service/README.md`) show exactly how.
 
 ---
 
@@ -226,6 +225,7 @@ is entirely about what happens then.
 | Java 21 | The services are Java 21 | `java -version` |
 | Maven 3.9+ | Builds the code | `mvn -version` |
 | `curl` and `jq` | Calling the services and reading the JSON they return | `curl --version`, `jq --version` |
+| Floci and the AWS CLI | Only for lambda-service (the local AWS imitation) | `floci status`, `aws --version` |
 
 `jq` is only there to pretty-print JSON. If you don't have it, drop the `| jq .` from the commands
 below and you will get the same data, just harder to read.
@@ -293,8 +293,13 @@ you would just have to trigger refreshes by hand.
 **Step 5 — start everything.**
 
 ```bash
-docker compose -f docker/compose.yaml up -d --build
+CONFIG_REPO_URI=file:///config-repo CONFIG_REPO_SEARCH_PATHS= CONFIG_REPO_FORCE_PULL=false \
+  docker compose -f docker/compose.yaml up -d --build
 ```
+
+The three settings at the front tell the Config Server to read **your local `config-repo/`
+folder**, so that a commit on your laptop is enough to change a value. (Without them it reads this
+project's repository on GitHub, and you would have to `git push` every change.)
 
 `-d` means "in the background". The first run has to build container images, so give it a few
 minutes. Watch them come up with:
@@ -303,97 +308,75 @@ minutes. Watch them come up with:
 docker compose -f docker/compose.yaml ps
 ```
 
-Wait until the client services report healthy. You can also just watch the logs:
+Wait until all six report `healthy`. You can also just watch the logs:
 
 ```bash
 docker compose -f docker/compose.yaml logs -f inventory-service
 ```
 
-**Step 6 — prove it all works.**
+> **At work, behind a corporate proxy such as Zscaler?** Building node-service and go-service may
+> fail with `x509: certificate signed by unknown authority`, because the proxy re-signs internet
+> traffic with its own certificate. Hand Docker that certificate and build again:
+> `export EXTRA_CA_CERT="$(cat proxy-root.pem)"` (on a Mac:
+> `export EXTRA_CA_CERT="$(security find-certificate -a -c Zscaler -p /Library/Keychains/System.keychain)"`).
+
+**Step 6 — put lambda-service into Floci** (skip this if you do not have Floci; everything else
+works without it):
 
 ```bash
-./scripts/e2e-test.sh
+floci start
+./lambda-service/scripts/deploy-floci.sh
+./lambda-service/scripts/invoke-floci.sh
 ```
 
-This runs the full acceptance suite against the live stack — every claim in the README, checked
-end to end. It is the fastest way to know your setup is sound. It is safe to run repeatedly.
+The last command prints `{"greeting":"Hello from AWS Lambda","featureEnabled":true,"maxItems":10}`.
+
+**Step 7 — prove it all works.**
+
+```bash
+./scripts/e2e-test.sh                 # or: SKIP_LAMBDA=1 ./scripts/e2e-test.sh  without Floci
+```
+
+This runs the full acceptance suite against the live stack — 36 checks, end to end. It is the
+fastest way to know your setup is sound. It is safe to run repeatedly.
 
 ### Look around
 
-Ask the inventory service what settings it is currently using:
+Ask the inventory service which settings it is using right now:
 
 ```bash
-curl -s localhost:8081/api/v1/config/snapshot | jq .
+curl -s localhost:8081/api/v1/inventory/config | jq .
 ```
 
 ```json
 {
-  "application": "inventory-service",
-  "version": 1,
-  "appliedAt": "2026-08-30T15:00:13.154Z",
-  "lastOutcome": "APPLIED",
-  "refreshAttempts": 0,
-  "rejectedCount": 0,
-  "lastChangedKeys": [],
-  "settings": {
-    "warehouseCode": "WH-BLR-01",
-    "maxOrderQuantity": 400,
-    "expressShippingEnabled": true,
-    "lowStockThreshold": 25,
-    "bannerMessage": "Configured centrally via Spring Cloud Config - Git backend",
-    "environmentLabel": "production-config"
-  }
-}
-```
-
-Read that response field by field, because you will be using it for the rest of the guide:
-
-- **`settings`** — the values the service is using right now. Compare them against
-  `config-repo/inventory-service.yml`; they should match.
-- **`version`** — a counter that starts at 1 and goes up **only when a value actually changed**.
-  This is your single most useful tool. To prove a change landed, compare the version before and
-  after.
-- **`lastOutcome`** — what happened on the most recent refresh attempt. `APPLIED` (new values
-  adopted), `NO_CHANGE` (asked, but nothing was different), or `REJECTED` (new values were
-  invalid and were refused — section 8).
-- **`rejectedCount`** — how many times bad configuration has been refused.
-
-Now call an actual business endpoint and watch configuration drive behaviour:
-
-```bash
-curl -s -X POST localhost:8081/api/v1/inventory/reservations \
-  -H 'Content-Type: application/json' \
-  -d '{"sku":"SKU-1","quantity":10}' | jq .
-```
-
-```json
-{
-  "reservationId": "...",
-  "sku": "SKU-1",
-  "quantity": 10,
   "warehouseCode": "WH-BLR-01",
-  "expressEligible": true,
-  "shippingMode": "EXPRESS",
-  "lowStockWarning": false,
-  "appliedMaxOrderQuantity": 500,
-  "configVersion": 1
+  "maxOrderQuantity": 100,
+  "expressShippingEnabled": true,
+  "lowStockThreshold": 115
 }
 ```
 
-Every one of those fields traces back to a configured value. And `configVersion` tells you *which
-generation of configuration* served this particular request — useful when you are trying to work
-out whether a request happened before or after a change.
+Open `config-repo/inventory-service.yml` and compare - the same four values, under `inventory:`.
+That is the whole answer: only this service's own settings.
 
-Now ask for more than the limit allows:
+Now ask the other clients the same question:
 
 ```bash
-curl -s -X POST localhost:8081/api/v1/inventory/reservations \
-  -H 'Content-Type: application/json' \
-  -d '{"sku":"SKU-1","quantity":501}' | jq .
+curl -s localhost:8082/api/v1/pricing/config | jq .
+curl -s localhost:8084/api/v1/node/config | jq .
+curl -s localhost:8085/api/v1/go/config | jq .
 ```
 
-You get a clean, structured error saying 501 was requested and 500 is allowed. Remember that
-`500` — we are about to change it while the service keeps running.
+Each comes from its own file in `config-repo/` (`pricing-service.yml`, `node-service.yml`,
+`go-service.yml`). Two of those services are written in Node.js and Go - and they got their
+settings from the same Config Server, the same way.
+
+If you want to see what the Config Server itself sends, ask it directly (it wants a password):
+
+```bash
+curl -s -u config-client:client-secret localhost:8888/node-service/default/main | jq .
+```
 
 ---
 
@@ -402,20 +385,20 @@ You get a clean, structured error saying 501 was requested and 500 is allowed. R
 **First, note where you are:**
 
 ```bash
-curl -s localhost:8081/api/v1/config/snapshot | jq '.version, .settings.maxOrderQuantity'
+curl -s localhost:8081/api/v1/inventory/config | jq .maxOrderQuantity
 ```
 
-Say that gives you `1` and `500`.
+That gives you `100`.
 
 **Now change the limit.** Open `config-repo/inventory-service.yml` in any editor and change
-`max-order-quantity` from `500` to `750`:
+`max-order-quantity` from `100` to `750`:
 
 ```yaml
 inventory:
   warehouse-code: "WH-BLR-01"
-  max-order-quantity: 750      # was 500
+  max-order-quantity: 750      # was 100
   express-shipping-enabled: true
-  low-stock-threshold: 25
+  low-stock-threshold: 115
 ```
 
 **Commit it.** This is the part that triggers everything:
@@ -427,46 +410,39 @@ git -C config-repo commit -am "Raise the order limit to 750"
 **Look again** — give it a second or so:
 
 ```bash
-curl -s localhost:8081/api/v1/config/snapshot | jq '.version, .settings.maxOrderQuantity, .lastOutcome'
+curl -s localhost:8081/api/v1/inventory/config | jq .maxOrderQuantity
 ```
 
-You should now see `2`, `750`, and `"APPLIED"`.
+You should now see `750`.
 
-**Nothing restarted.** Confirm that for yourself — the uptime and restart count are untouched:
+**Nothing restarted.** Confirm that for yourself — the uptime is untouched:
 
 ```bash
 docker compose -f docker/compose.yaml ps inventory-service
-```
-
-**And the business behaviour has changed.** The request that was rejected a minute ago now
-succeeds:
-
-```bash
-curl -s -X POST localhost:8081/api/v1/inventory/reservations \
-  -H 'Content-Type: application/json' \
-  -d '{"sku":"SKU-1","quantity":501}' | jq .
 ```
 
 That is the whole point of the project, and you just watched it happen.
 
 ### Two things to try while you're here
 
-**Check that the change was scoped.** The pricing service should be entirely unaffected — its
-version should not have moved:
+**Check that the change was scoped.** The pricing service should be entirely unaffected:
 
 ```bash
-curl -s localhost:8082/api/v1/config/snapshot | jq '.application, .version'
+curl -s localhost:8082/api/v1/pricing/config | jq .
 ```
 
-**Check that it reached every copy.** Both pricing instances should agree. Change something in
-`config-repo/pricing-service.yml`, commit, then ask both:
+**Watch a Node.js service do the same.** Change `max-items` in `config-repo/node-service.yml` from
+`25` to `30`, commit, and ask it:
 
 ```bash
-curl -s localhost:8082/api/v1/config/snapshot | jq '.version, .settings.discountPercentage'
-curl -s localhost:8083/api/v1/config/snapshot | jq '.version, .settings.discountPercentage'
+git -C config-repo commit -am "Change node-service max-items"
+curl -s localhost:8084/api/v1/node/config | jq .maxItems           # 30
+docker compose -f docker/compose.yaml logs --tail=2 node-service   # "Configuration changed"
 ```
 
-Same numbers from both. That is the Bus doing its job.
+The same broadcast that refreshes the Java services refreshed a Node.js service. Try `go-service.yml`
+next - or `lambda-service.yml` and `./lambda-service/scripts/invoke-floci.sh`, which shows the new
+value on its very next call.
 
 ### Why commit, and not just save?
 
@@ -483,86 +459,70 @@ and now you know why.
 
 ## 8. The interesting part: what happens when the change is wrong
 
-Everything so far was the happy path. This section is the one worth actually understanding,
-because it is where most real-world configuration systems quietly fail.
+Everything so far was the happy path. Configuration comes from outside your code, which means it
+can be **wrong**. Someone fat-fingers an extra digit at 11pm. What should happen?
 
-Configuration comes from outside your code. Which means it can be **wrong**. Someone fat-fingers
-an extra digit at 11pm. What should happen?
+The maximum sensible order quantity in this service is 10,000. Let's commit 99,999 - and, at the
+same time, an impossible `max-items: 0` for node-service.
 
-The maximum sensible order quantity in this service is 10,000. Let's push 99,999.
-
-```bash
-# note the version and value you're starting from
-curl -s localhost:8081/api/v1/config/snapshot | jq '.version, .settings.maxOrderQuantity'
-```
-
-Edit `config-repo/inventory-service.yml` to set `max-order-quantity: 99999`, then commit:
+Edit `config-repo/inventory-service.yml` to `max-order-quantity: 99999` and
+`config-repo/node-service.yml` to `max-items: 0`, then commit:
 
 ```bash
-git -C config-repo commit -am "Oops, typo"
+git -C config-repo commit -am "Oops, typos"
 ```
 
-Now look:
+Now look at both:
 
 ```bash
-curl -s localhost:8081/api/v1/config/snapshot | jq '.version, .settings.maxOrderQuantity, .lastOutcome, .lastFailureReason'
+curl -s localhost:8081/api/v1/inventory/config | jq .maxOrderQuantity    # 99999
+curl -s localhost:8084/api/v1/node/config | jq .maxItems                 # still 25
 ```
 
-You will see something like:
-
-```text
-2                                                      ← version did NOT go up
-750                                                    ← still the OLD, good value
-"REJECTED"
-"maxOrderQuantity must be less than or equal to 10000"
-```
-
-Read what just happened carefully, because four separate good things occurred:
-
-1. **The bad value was refused.** The service did not adopt 99,999.
-2. **The service kept working.** It is still serving traffic, using the last configuration that
-   was valid — its *last-known-good* snapshot. It did not crash, and it did not fall back to
-   defaults or empty values.
-3. **The version did not move.** So your "did it change?" check stays honest.
-4. **It told you exactly what was wrong**, in `lastFailureReason`, naming the offending property.
-
-And one more, which is easy to miss and genuinely a judgement call:
+The two services made **different, deliberate choices**, and both tell you about it in their logs:
 
 ```bash
-curl -s localhost:9081/actuator/health | jq '.status, .components.configuration'
+docker compose -f docker/compose.yaml logs inventory-service | grep invalid
+#  ERROR ... Refreshed inventory configuration is invalid:
+#            inventory.maxOrderQuantity must be less than or equal to 10000
+docker compose -f docker/compose.yaml logs node-service | grep "refresh failed"
+#  {"level":"error","message":"Configuration refresh failed; keeping the values in use",
+#   "error":"Invalid node-service configuration: node.max-items must be an integer between 1 and 1000"}
 ```
 
-The service reports **UP**, not DOWN — while clearly flagging `lastOutcome: REJECTED` and the
-reason in its health details.
+| | inventory-service (Spring Boot) | node-service / go-service |
+|---|---|---|
+| What it serves | the new, invalid value | **the previous, valid value** |
+| What it tells you | an `ERROR` log line naming the broken rule | an `error` log line naming the broken rule |
+| Does it restart or go down? | no | no |
 
-That is deliberate. Health status is what load balancers and Kubernetes use to decide whether to
-send you traffic or kill your container. This service is *perfectly healthy* — it is serving
-correct, valid, slightly-older configuration. The broken thing is a file in a Git repository. If
-it reported DOWN, a bad commit would take your entire fleet out of service, which is a far worse
-outcome than running on configuration that is five minutes stale. So it stays UP and shouts
-loudly in its details instead.
+Why the difference? The Spring services are kept deliberately simple: Spring Cloud updates their
+settings in place, and they check *afterwards*. The Node.js and Go services check *before* they
+swap the new values in, so a bad set never replaces a good one. Both are reasonable; what matters
+is that neither crashes and both say exactly what is wrong. (README §4.3 explains the trade-off.)
 
-**Now fix it.** Set the value back to something valid and commit:
+**Now the safety net that always holds: a service never *starts* on bad settings.** Restart
+inventory-service while 99,999 is still in the file:
 
 ```bash
-git -C config-repo commit -am "Fix the typo"
-curl -s localhost:8081/api/v1/config/snapshot | jq '.version, .settings.maxOrderQuantity, .lastOutcome'
+docker restart cfg-git-inventory
+docker logs cfg-git-inventory 2>&1 | grep "Invalid inventory configuration"
+#  InvalidConfigurationException: Invalid inventory configuration:
+#    inventory.maxOrderQuantity must be less than or equal to 10000
+docker compose -f docker/compose.yaml ps -a inventory-service   # "exited", not running
 ```
 
-Version moves, value updates, `lastOutcome` returns to `APPLIED`. It recovers on its own; no
-intervention, no restart.
+It refuses to start, and says why. That is the right behaviour: better no service than one that
+silently runs on settings it cannot honour.
 
-### The audit trail
-
-Every refresh attempt — applied, unchanged, or rejected — is recorded:
+**Now fix it.** Put the values back (`100` and `25`), commit, and start inventory-service again:
 
 ```bash
-curl -s localhost:8081/api/v1/config/history | jq '.[0:3]'
+git -C config-repo commit -am "Fix the typos"
+docker start cfg-git-inventory
+curl -s localhost:8081/api/v1/inventory/config | jq .maxOrderQuantity   # 100 (once it is up)
+curl -s localhost:8084/api/v1/node/config | jq .maxItems               # 25
 ```
-
-You will see the rejection you just caused, with a timestamp, the reason, and which property keys
-changed. Note that it records property **names** only, never **values** — because one of those
-values is a decrypted password, and an audit log is not a safe place to put it.
 
 ---
 
@@ -579,16 +539,16 @@ the settings are stored and how a change is detected:
 
 Here is the part that matters, and it is the real lesson of the project:
 
-**The two client services are byte-for-byte identical across all three versions.** Not "similar" —
-identical files. They have no idea whether their configuration came from Git, Postgres, or S3. They
-ask the Config Server, and the Config Server deals with it.
+**The five client services are the same code in all three versions** - the only differences are
+default port numbers. They have no idea whether their configuration came from Git, Postgres, or
+S3. They ask the Config Server, and the Config Server deals with it.
 
 That is what a good abstraction looks like. You can swap out the entire storage layer of your
 configuration system and not touch, retest, or redeploy a single line of application code. If you
 take one idea away from this repository, take that one.
 
 Each version runs on its own ports, so you can run all three side by side if you have the disk
-space: A on 8888/8081-8083, B on 8898/8091-8093, C on 8908/8101-8103.
+space: A on 8888 / 8081-8085, B on 8898 / 8091-8095, C on 8908 / 8101-8105.
 
 ### Cleaning up
 
@@ -603,20 +563,18 @@ docker compose -f docker/compose.yaml down -v
 Now that the vocabulary means something to you, the other documents will read much more easily.
 In rough order of how approachable they are:
 
-1. **[README.md](README.md) §4, "The core design"** — start here. It explains the three
-   engineering decisions that make refresh *safe* rather than just possible: why the settings
-   class must use setters instead of being a `record`, why validation deliberately does *not* go
-   on that class, and why every read goes through a single atomic reference. Each one exists
-   because of a specific, non-obvious way Spring Cloud behaves. This is the most valuable reading
-   in the repository.
+1. **[README.md](README.md) §4, "The core design"** — start here. It explains why the settings
+   class must use setters instead of being a `record`, why the validation rules deliberately do
+   *not* switch on Spring's `@Validated`, the trade-off that was accepted to keep the clients
+   simple, and how the Node.js and Go clients join Spring Cloud Bus without a Spring library.
 
-2. **The code itself** — one file: `inventory-service/.../provider/InventorySettingsProvider.java`.
-   It is the whole refresh algorithm in one class: validate, compare, swap, audit. The comments
-   explain *why* at each step, not just what.
+2. **The code itself** — each client is small. Start with `inventory-service/src/main/java/.../config/InventoryProperties.java`
+   and `InventoryPropertiesValidator.java`, then `node-service/src/bus/bus-listener.js` to see the
+   Bus from the other side.
 
-3. **The tests** — `InventorySettingsProviderTest`. Read the test names alone and you have a
-   specification of the safety guarantees. One of them spins up eight concurrent reader threads to
-   prove no request can ever see a half-applied set of values.
+3. **Each service's README** — for example [node-service/README.md](version-a-git/node-service/README.md):
+   its folder layout, settings, the four ways to run it (Docker Compose, Kubernetes, or straight
+   on your machine), and the real error messages you might meet.
 
 4. **[README.md](README.md) §8, the operator runbook** — how to change configuration, roll back,
    and recover by hand, in each of the three versions.
@@ -640,36 +598,33 @@ curl -s localhost:8888/actuator/health | jq .
 docker compose -f docker/compose.yaml logs config-server | tail -30
 ```
 
-**I committed, but the version didn't change.**
+**I committed, but the value didn't change.**
 Work through it in this order:
 
-1. Did the value *actually* change? An identical value is correctly reported as `NO_CHANGE` —
-   nothing is broken.
-2. Was it `REJECTED`? Check `lastOutcome` and `lastFailureReason` (section 8).
+1. Did you start the stack in **local mode** (section 6, Step 5)? Without the three settings the
+   Config Server reads GitHub, and a local commit does nothing.
+2. Did the value break a rule? Look for `invalid` / `refresh failed` in the service's log
+   (section 8).
 3. Is the Git hook installed? `ls -l config-repo/.git/hooks/post-commit`. If it's missing, re-run
    `./scripts/install-git-hook.sh`.
 4. Is RabbitMQ up? `docker compose -f docker/compose.yaml ps rabbitmq`.
-5. Force it by hand and see whether that works — if it does, the problem is in the trigger
-   chain, not in the refresh itself:
+5. Broadcast by hand and see whether that works — if it does, the problem is in the trigger chain,
+   not in the refresh itself:
 
    ```bash
-   curl -X POST localhost:9081/actuator/refresh
+   curl -i -X POST -u config-admin:admin-secret -H "Content-Type: application/json" \
+        localhost:9898/actuator/busrefresh
    ```
+   Expect `HTTP/1.1 204`. (Leave out the `Content-Type` header and you get `415` and nothing
+   happens.)
 
-**Only one of the two pricing copies updated.**
-That points at the Bus rather than the services. Check RabbitMQ is healthy and look at its
-management console at <http://localhost:15672> (guest/guest).
+**A Node.js or Go service never updates, but the Java ones do.**
+Check its log for `Listening on Spring Cloud Bus`. If you see `Could not connect to RabbitMQ; will
+retry` (Node.js) or `Spring Cloud Bus connection lost; will retry` (Go), it cannot reach the broker.
 
-**I need to refresh everything by hand.**
-
-```bash
-# one specific instance
-curl -X POST localhost:9081/actuator/refresh
-
-# every copy of one application, via the Bus
-curl -X POST -u config-admin:admin-secret \
-     localhost:8888/actuator/busrefresh/inventory-service
-```
+**lambda-service answers `503`.**
+It could not reach the Config Server. The function runs inside Floci and reaches it through your
+machine at `host.docker.internal:8888`, so the stack must be up.
 
 **Something is deeply wrong and I want a clean slate.**
 
@@ -679,7 +634,8 @@ docker compose -f docker/compose.yaml up -d --build
 ```
 
 **Port already in use.** All three versions can run at once, but if you have something else on
-8888 or 8081-8083, stop it — or run version B or C instead, which use different ports.
+8888 or 8081-8085, stop it — or run version B or C instead, which use different ports. (Version B's
+database uses host port 5433, because a PostgreSQL installed on your machine usually holds 5432.)
 
 ---
 

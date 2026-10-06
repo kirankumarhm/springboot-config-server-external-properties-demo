@@ -1,0 +1,17 @@
+{
+  "name": "lambda-service",
+  "version": "1.0.0",
+  "description": "AWS Lambda (Node.js 22) client of Spring Cloud Config Server, behind API Gateway: serves its lambda.* configuration",
+  "private": true,
+  "type": "module",
+  "main": "src/handler.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "cloud-config-client": "1.6.2"
+  }
+}

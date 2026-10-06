@@ -5,44 +5,17 @@
 <FindBugsFilter>
 
   <!--
-    EI_EXPOSE_REP / EI_EXPOSE_REP2: SpotBugs flags storing or returning a reference to a mutable
-    object. Here that is the entire point: a @ConfigurationProperties bean must be shared by
-    reference so that Spring's rebinder mutating it in place is visible to the provider that
-    reads it. Defensive copying would break live refresh outright.
+    EI_EXPOSE_REP2: SpotBugs flags storing a reference to a mutable object. Here that is the
+    entire point: the controller must hold the SAME @ConfigurationProperties object that a
+    refresh updates in place. A defensive copy would freeze the startup values.
   -->
   <Match>
     <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
   </Match>
 
   <!--
-    Instant and java.time types are immutable, but SpotBugs treats them conservatively in some
-    versions. Same reasoning as above for the Instant fields held in AtomicReference.
-  -->
-  <Match>
-    <Bug pattern="EI_EXPOSE_STATIC_REP2"/>
-  </Match>
-
-  <!--
-    CT_CONSTRUCTOR_THROW: the snapshot provider validates in @PostConstruct and throws to fail
-    the application start. That is intentional fail-fast behaviour (NFR-14) - a service must not
-    start and serve traffic on invalid configuration.
-  -->
-  <Match>
-    <Bug pattern="CT_CONSTRUCTOR_THROW"/>
-  </Match>
-
-  <!--
-    Generated Spring configuration/DTO members and records are not hand-written code worth
-    analysing for these patterns.
-  -->
-  <Match>
-    <Source name="~.*[\\/]api[\\/].*"/>
-  </Match>
-
-  <!--
-    SPRING_CSRF_PROTECTION_DISABLED: FindSecBugs flags disabling CSRF. The microservices and
-    Config Server are stateless REST APIs utilizing HTTP Basic/token authentication without cookie-based
-    sessions, making CSRF protection unnecessary and disabling it safe and standard.
+    SPRING_CSRF_PROTECTION_DISABLED: FindSecBugs flags disabling CSRF. This service is a stateless,
+    read-only REST API with no cookies and no sessions, so there is no CSRF attack surface.
   -->
   <Match>
     <Bug pattern="SPRING_CSRF_PROTECTION_DISABLED"/>

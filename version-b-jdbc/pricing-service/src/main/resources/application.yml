@@ -2,7 +2,7 @@ server:
   # Graceful shutdown: without this a rolling update severs in-flight requests. Pair with
   # terminationGracePeriodSeconds and a preStop hook so endpoints deregister before SIGTERM.
   shutdown: graceful
-  port: ${SERVER_PORT:8082}
+  port: ${SERVER_PORT:8092}
 
 spring:
   lifecycle:
@@ -10,13 +10,13 @@ spring:
   application:
     name: pricing-service
   config:
-    import: "configserver:${CONFIG_SERVER_URI:http://localhost:8888}?fail-fast=true&max-attempts=6&initial-interval=1000&multiplier=1.5&max-interval=8000"
+    import: "configserver:${CONFIG_SERVER_URI:http://localhost:8898}?fail-fast=true&max-attempts=6&initial-interval=1000&multiplier=1.5&max-interval=8000"
   cloud:
     bus:
       # Makes the Spring Cloud Bus service id (app:index:id) unique per instance. Without this,
       # two instances of the same app can collide and duplicate-event suppression silently drops
       # a refresh on one of them.
-      id: ${spring.application.name}:${APP_INDEX:${SERVER_PORT:8082}}:${random.uuid}
+      id: ${spring.application.name}:${APP_INDEX:${SERVER_PORT:8092}}:${random.uuid}
     config:
       username: ${CONFIG_CLIENT_USERNAME:config-client}
       password: ${CONFIG_CLIENT_PASSWORD:client-secret}
@@ -29,26 +29,25 @@ spring:
           connection-name-prefix: ${spring.application.name}:${APP_INDEX:${SERVER_PORT:8092}}
   rabbitmq:
     host: ${RABBITMQ_HOST:localhost}
-    port: ${RABBITMQ_PORT:5672}
+    port: ${RABBITMQ_PORT:5673}
     username: ${RABBITMQ_USERNAME:guest}
     password: ${RABBITMQ_PASSWORD:guest}
 
 management:
   server:
-    port: ${MANAGEMENT_PORT:9082}
+    port: ${MANAGEMENT_PORT:9092}
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,refresh,busrefresh,configprops,env
+        # Health only. Refreshes arrive over RabbitMQ (Spring Cloud Bus), so the clients do not
+        # need an HTTP refresh endpoint - and an open one would let anyone trigger reloads.
+        include: health
   endpoint:
     health:
       show-details: always
       probes:
         enabled: true
-    env:
-      show-values: never
-    configprops:
-      show-values: never
+
 
 logging:
   level:

@@ -50,6 +50,11 @@ services:
       CONFIG_REPO_URI: ${CONFIG_REPO_URI:-https://github.com/kirankumarhm/springboot-config-server-external-properties-demo.git}
       CONFIG_REPO_SEARCH_PATHS: ${CONFIG_REPO_SEARCH_PATHS:-version-a-git/config-repo}
       CONFIG_REPO_LABEL: ${CONFIG_REPO_LABEL:-main}
+      # true suits the GitHub remote: the server re-pulls and discards local drift in its clone.
+      # The LOCAL file:// repo must set this to false. With true, the server "resets the dirty
+      # repository to origin" while you commit, rewriting the working tree it serves back to the
+      # previous values - the change appears for a moment, then silently reverts.
+      CONFIG_REPO_FORCE_PULL: ${CONFIG_REPO_FORCE_PULL:-true}
       # REQUIRED for the file:// backend. The monitor validation filter verifies a provider's
       # webhook signature; a local repo has no provider and no secret, so with the filter on
       # every POST /monitor is rejected 401 and the post-commit hook cannot notify anything.
@@ -120,31 +125,55 @@ services:
       retries: 30
       start_period: 20s
 
-  # Second pricing instance, to prove ONE broadcast reaches EVERY instance (AC-03).
-  # Distinct APP_INDEX keeps the bus service id unique.
-  pricing-service-2:
+  # Node.js: reads the Config Server with the cloud-config-client library and joins Spring Cloud
+  # Bus through RabbitMQ, so the same broadcast that refreshes the Spring services refreshes it.
+  node-service:
     build:
-      # Each service owns its Dockerfile and is built from its own directory - no shared
-      # build context, and no MODULE argument selecting between siblings.
-      context: ../pricing-service
-      dockerfile: Dockerfile
-    container_name: cfg-git-pricing-2
+      context: ../node-service
+      args:
+        # Empty unless you are behind a TLS-inspecting proxy; see ../node-service/Dockerfile.
+        EXTRA_CA_CERT: ${EXTRA_CA_CERT:-}
+    container_name: cfg-git-node
     depends_on:
       config-server:
         condition: service_healthy
     ports:
-      - "8083:8083"
-      - "9083:9083"
+      - "8084:8084"
     environment:
-      SERVER_PORT: 8083
-      MANAGEMENT_PORT: 9083
-      APP_INDEX: 8083
-      CONFIG_SERVER_URI: http://config-server:8888
+      PORT: 8084
+      CONFIG_SERVER_URL: http://config-server:8888
       CONFIG_CLIENT_PASSWORD: client-secret
       RABBITMQ_HOST: rabbitmq
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9083/actuator/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8084/health"]
       interval: 5s
       timeout: 5s
       retries: 30
-      start_period: 20s
+
+  # Go: reads the Config Server with the cloudconfigclient library and joins Spring Cloud Bus
+  # through RabbitMQ, exactly like node-service.
+  go-service:
+    build:
+      context: ../go-service
+      args:
+        # Empty unless you are behind a TLS-inspecting proxy; see ../go-service/Dockerfile.
+        EXTRA_CA_CERT: ${EXTRA_CA_CERT:-}
+    container_name: cfg-git-go
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8085:8085"
+    environment:
+      PORT: 8085
+      CONFIG_SERVER_URL: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8085/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # lambda-service is NOT in this file: it runs in Floci's Lambda emulator.
+  # See ../lambda-service/deploy-floci.sh.

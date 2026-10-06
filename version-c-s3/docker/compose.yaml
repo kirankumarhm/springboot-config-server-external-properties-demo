@@ -81,14 +81,17 @@ services:
       config-server:
         condition: service_healthy
     ports:
-      - "8101:8081"
-      - "9101:9081"
+      - "8101:8101"
+      - "9101:9101"
     environment:
+      SERVER_PORT: 8101
+      MANAGEMENT_PORT: 9101
       CONFIG_SERVER_URI: http://config-server:8888
       CONFIG_CLIENT_PASSWORD: client-secret
       RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9081/actuator/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9101/actuator/health"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -105,42 +108,73 @@ services:
       config-server:
         condition: service_healthy
     ports:
-      - "8102:8082"
-      - "9102:9082"
+      - "8102:8102"
+      - "9102:9102"
     environment:
+      SERVER_PORT: 8102
+      MANAGEMENT_PORT: 9102
       CONFIG_SERVER_URI: http://config-server:8888
       CONFIG_CLIENT_PASSWORD: client-secret
       RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9082/actuator/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:9102/actuator/health"]
       interval: 5s
       timeout: 5s
       retries: 30
       start_period: 20s
 
-  pricing-service-2:
+  # Node.js: reads the Config Server with the cloud-config-client library and joins Spring Cloud
+  # Bus through RabbitMQ, so the same broadcast that refreshes the Spring services refreshes it.
+  node-service:
     build:
-      # Each service owns its Dockerfile and is built from its own directory - no shared
-      # build context, and no MODULE argument selecting between siblings.
-      context: ../pricing-service
-      dockerfile: Dockerfile
-    container_name: cfg-s3-pricing-2
+      context: ../node-service
+      args:
+        # Empty unless you are behind a TLS-inspecting proxy; see ../node-service/Dockerfile.
+        EXTRA_CA_CERT: ${EXTRA_CA_CERT:-}
+    container_name: cfg-s3-node
     depends_on:
       config-server:
         condition: service_healthy
     ports:
-      - "8103:8083"
-      - "9103:9083"
+      - "8104:8104"
     environment:
-      SERVER_PORT: 8083
-      MANAGEMENT_PORT: 9083
-      APP_INDEX: 8083
-      CONFIG_SERVER_URI: http://config-server:8888
+      PORT: 8104
+      CONFIG_SERVER_URL: http://config-server:8888
       CONFIG_CLIENT_PASSWORD: client-secret
       RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9083/actuator/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8104/health"]
       interval: 5s
       timeout: 5s
       retries: 30
-      start_period: 20s
+
+  # Go: reads the Config Server with the cloudconfigclient library and joins Spring Cloud Bus
+  # through RabbitMQ, exactly like node-service.
+  go-service:
+    build:
+      context: ../go-service
+      args:
+        # Empty unless you are behind a TLS-inspecting proxy; see ../go-service/Dockerfile.
+        EXTRA_CA_CERT: ${EXTRA_CA_CERT:-}
+    container_name: cfg-s3-go
+    depends_on:
+      config-server:
+        condition: service_healthy
+    ports:
+      - "8105:8105"
+    environment:
+      PORT: 8105
+      CONFIG_SERVER_URL: http://config-server:8888
+      CONFIG_CLIENT_PASSWORD: client-secret
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8105/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # lambda-service is NOT in this file: it runs in Floci's Lambda emulator.
+  # See ../lambda-service/scripts/deploy-floci.sh.

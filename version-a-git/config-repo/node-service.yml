@@ -1,0 +1,6 @@
+# Read by node-service (Node.js), which has no Spring library: it calls the Config Server's
+# HTTP API directly and re-reads it every 5 seconds.
+node:
+  greeting: "Hello from Node.js"
+  feature-enabled: true
+  max-items: 25

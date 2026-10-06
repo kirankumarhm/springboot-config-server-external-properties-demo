@@ -42,8 +42,9 @@ Options:
                     (`docker compose start`).
   --volumes         Also remove anonymous volumes (`down -v`). RabbitMQ's base image declares a
                     VOLUME, so each `up` leaves one behind.
-  --images          Also remove the 3 images built from this project
-                    (config-s3-demo-config-server / -inventory-service / -pricing-service).
+  --images          Also remove the 5 images built from this project
+                    (config-s3-demo-config-server / -inventory-service / -pricing-service /
+                    -node-service / -go-service).
                     Includes any per-deploy 1.0.0-<timestamp> tags left by deploy-floci-eks.sh.
                     The next `up` must rebuild - run `mvn -Pfast package` first.
   --base-images     Also remove the pulled base image (rabbitmq:4-management).
@@ -144,7 +145,9 @@ if [ "$DO_IMAGES" -eq 1 ]; then
   echo "==> Removing images built from this project"
   for img in ${PROJECT}-config-server:latest \
              ${PROJECT}-inventory-service:latest \
-             ${PROJECT}-pricing-service:latest; do
+             ${PROJECT}-pricing-service:latest \
+             ${PROJECT}-node-service:latest \
+             ${PROJECT}-go-service:latest; do
     printf '    %-45s' "$img"
     docker rmi "$img" >/dev/null 2>&1 && echo "removed" || echo "not present"
   done

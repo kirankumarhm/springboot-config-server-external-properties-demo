@@ -49,7 +49,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: pricing-service
-  minReplicas: 2
+  # One instance by default, like every other service; the autoscaler adds more under load.
+  minReplicas: 1
   maxReplicas: 10
   metrics:
     - type: Resource
@@ -77,3 +78,43 @@ spec:
         - type: Percent
           value: 100
           periodSeconds: 30
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: node-service-hpa
+  namespace: config-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: node-service
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: go-service-hpa
+  namespace: config-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: go-service
+  minReplicas: 1
+  maxReplicas: 3
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75

@@ -1,0 +1,19 @@
+{
+  "name": "node-service",
+  "version": "1.0.0",
+  "description": "Node.js client of Spring Cloud Config Server: serves its node.* configuration and refreshes it live over Spring Cloud Bus",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "amqplib": "2.2.0",
+    "cloud-config-client": "1.6.2"
+  }
+}

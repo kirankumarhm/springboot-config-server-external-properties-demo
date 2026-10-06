@@ -39,8 +39,9 @@ Options:
                     (`docker compose start`). Use this when you are coming back to it.
   --volumes         Also remove anonymous volumes (`down -v`). RabbitMQ's base image declares a
                     VOLUME, so each `up` leaves one behind; this is what reclaims them.
-  --images          Also remove the 3 images built from this project
-                    (config-git-demo-config-server / -inventory-service / -pricing-service).
+  --images          Also remove the 5 images built from this project
+                    (config-git-demo-config-server / -inventory-service / -pricing-service /
+                    -node-service / -go-service).
                     The next `up` must rebuild them - run `mvn -Pfast package` first.
   --base-images     Also remove the pulled base image (rabbitmq:4-management).
                     CAUTION: k8s/deploy-minikube.sh loads that image from the HOST daemon into
@@ -91,7 +92,7 @@ else
   echo "  - remove the containers and the '$PROJECT' network ($running running)"
 fi
 [ "$DO_VOLUMES"     -eq 1 ] && echo "  - remove anonymous volumes belonging to this project"
-[ "$DO_IMAGES"      -eq 1 ] && echo "  - remove the 3 images built from this project (next up must rebuild)"
+[ "$DO_IMAGES"      -eq 1 ] && echo "  - remove the 5 images built from this project (next up must rebuild)"
 [ "$DO_BASE_IMAGES" -eq 1 ] && echo "  - ${YEL}remove rabbitmq:4-management - this breaks k8s/deploy-minikube.sh until you pull it again${OFF}"
 [ "$DO_HOOK"        -eq 1 ] && echo "  - uninstall config-repo/.git/hooks/post-commit"
 [ "$DO_JARS"        -eq 1 ] && echo "  - run 'mvn clean' (deletes target/ in all three modules)"
@@ -123,7 +124,9 @@ if [ "$DO_IMAGES" -eq 1 ]; then
   echo "==> Removing images built from this project"
   for img in ${PROJECT}-config-server:latest \
              ${PROJECT}-inventory-service:latest \
-             ${PROJECT}-pricing-service:latest; do
+             ${PROJECT}-pricing-service:latest \
+             ${PROJECT}-node-service:latest \
+             ${PROJECT}-go-service:latest; do
     printf '    %-45s' "$img"
     docker rmi "$img" >/dev/null 2>&1 && echo "removed" || echo "not present"
   done
@@ -155,7 +158,7 @@ fi
 echo
 echo "${BOLD}==> Remaining state${OFF}"
 echo "  containers: $(dc ps -a -q 2>/dev/null | grep -c . || echo 0)"
-echo "  images:     $(docker images --format '{{.Repository}}' | grep -c "^${PROJECT}-" || true) of 3 built images present"
+echo "  images:     $(docker images --format '{{.Repository}}' | grep -c "^${PROJECT}-" || true) of 5 built images present"
 echo "  hook:       $([ -f "$ROOT/config-repo/.git/hooks/post-commit" ] && echo installed || echo 'not installed')"
 
 # A leftover test value in config-repo is invisible once the stack is down, and the next `up`

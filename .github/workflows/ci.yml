@@ -17,6 +17,37 @@ permissions:
   contents: read
 
 jobs:
+  # The Node.js, Go and Lambda services of every version. Each is self-contained (its own
+  # package.json / go.mod), so each is tested from its own directory, exactly as a developer would.
+  polyglot-clients:
+    name: node / go / lambda ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [version-a-git, version-b-jdbc, version-c-s3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ matrix.version }}/go-service/go.mod
+          cache-dependency-path: ${{ matrix.version }}/go-service/go.sum
+      - name: node-service - install exactly the locked dependencies, then test
+        working-directory: ${{ matrix.version }}/node-service
+        run: npm ci && npm test
+      - name: lambda-service - install exactly the locked dependencies, then test
+        working-directory: ${{ matrix.version }}/lambda-service
+        run: npm ci && npm test
+      - name: go-service - format, vet, and test with the race detector
+        working-directory: ${{ matrix.version }}/go-service
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test -race ./...
+
   build:
     name: build ${{ matrix.version }}
     runs-on: ubuntu-latest
@@ -112,9 +143,15 @@ jobs:
           git -C config-repo commit -q -m "seed" 2>/dev/null || true
           ./scripts/install-git-hook.sh
 
+      # Version A's suite commits to the LOCAL config repository, so the Config Server must read
+      # that repository (file://) rather than the GitHub remote that compose defaults to.
       - name: Start the stack
         working-directory: ${{ matrix.version }}
-        run: docker compose -f docker/compose.yaml up -d --build
+        run: |
+          if [ "${{ matrix.version }}" = "version-a-git" ]; then
+            export CONFIG_REPO_URI=file:///config-repo CONFIG_REPO_SEARCH_PATHS= CONFIG_REPO_FORCE_PULL=false
+          fi
+          docker compose -f docker/compose.yaml up -d --build
 
       - name: Wait for every service to report healthy
         working-directory: ${{ matrix.version }}
@@ -129,8 +166,12 @@ jobs:
           done
           echo "services did not become healthy"; exit 1
 
+      # Floci is not available on the CI runner, so the Lambda checks are skipped here; they run
+      # locally against Floci (see lambda-service/README.md).
       - name: Run the acceptance suite
         working-directory: ${{ matrix.version }}
+        env:
+          SKIP_LAMBDA: '1'
         run: ./scripts/e2e-test.sh
 
       - name: Dump logs on failure
@@ -194,4 +235,3 @@ jobs:
             exit 1
           fi
           echo "Secret audit passed: no private keystores or kubeconfigs in repository index."
-

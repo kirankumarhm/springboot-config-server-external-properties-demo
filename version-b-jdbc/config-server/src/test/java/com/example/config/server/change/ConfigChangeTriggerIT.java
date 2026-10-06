@@ -49,7 +49,11 @@ class ConfigChangeTriggerIT {
     jdbcUrl = POSTGRES.getJdbcUrl();
     try (Connection connection = connect(null);
         Statement statement = connection.createStatement()) {
-      for (String migration : List.of("V1__config_schema.sql", "V2__config_change_notify.sql")) {
+      for (String migration :
+          List.of(
+              "V1__config_schema.sql",
+              "V2__config_change_notify.sql",
+              "V3__seed_polyglot_clients.sql")) {
         String sql =
             new String(
                 new ClassPathResource("db/migration/" + migration).getInputStream().readAllBytes(),
@@ -98,6 +102,14 @@ class ConfigChangeTriggerIT {
           s.executeQuery(
               "SELECT count(*) FROM information_schema.triggers "
                   + "WHERE trigger_name LIKE 'trg_notify_config%'")) {
+        rs.next();
+        assertThat(rs.getInt(1)).isEqualTo(3);
+      }
+      // V3 seeds the Node.js, Go and Lambda clients, and the V2 trigger gives each a revision.
+      try (ResultSet rs =
+          s.executeQuery(
+              "SELECT count(*) FROM config_revision WHERE application IN "
+                  + "('node-service','go-service','lambda-service')")) {
         rs.next();
         assertThat(rs.getInt(1)).isEqualTo(3);
       }

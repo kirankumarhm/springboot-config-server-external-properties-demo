@@ -39,16 +39,14 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,refresh,busrefresh,configprops,env
+        # Health only. Refreshes arrive over RabbitMQ (Spring Cloud Bus), so the clients do not
+        # need an HTTP refresh endpoint - and an open one would let anyone trigger reloads.
+        include: health
   endpoint:
     health:
       show-details: always
       probes:
         enabled: true
-    env:
-      show-values: never
-    configprops:
-      show-values: never
 
 
 logging:

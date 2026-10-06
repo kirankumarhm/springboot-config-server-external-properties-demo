@@ -20,7 +20,7 @@
   <artifactId>inventory-service</artifactId>
   <version>1.0.0</version>
   <name>inventory-service</name>
-  <description>Config client 1 - proves scoped refresh and feature-flag driven behaviour</description>
+  <description>Spring Boot client of Spring Cloud Config Server: serves its inventory configuration and refreshes it live over Spring Cloud Bus</description>
 
   <properties>
     <java.version>21</java.version>
@@ -36,15 +36,12 @@
     <jacoco.version>0.8.15</jacoco.version>
     <enforcer.version>3.6.3</enforcer.version>
     <archunit.version>1.5.0</archunit.version>
-    <dependency-check.version>13.0.0</dependency-check.version>
-    <!-- OpenAPI 3 / Swagger Documentation -->
+    <!-- OpenAPI 3 / Swagger UI -->
     <springdoc.version>3.1.1</springdoc.version>
+    <dependency-check.version>13.0.0</dependency-check.version>
     <findsecbugs.version>1.13.0</findsecbugs.version>
     <jib.version>3.5.2</jib.version>
     <image.name>config-s3-demo-inventory-service</image.name>
-
-    <!-- Keystore-based {cipher} support. Not managed by the Spring Cloud BOM. -->
-    <spring-security-rsa.version>1.1.5</spring-security-rsa.version>
 
     <!-- Coverage gate. Overridden per module where a module is legitimately thin. -->
     <coverage.line.min>0.70</coverage.line.min>
@@ -59,11 +56,6 @@
         <version>${spring-cloud.version}</version>
         <type>pom</type>
         <scope>import</scope>
-      </dependency>
-      <dependency>
-        <groupId>org.springframework.security</groupId>
-        <artifactId>spring-security-rsa</artifactId>
-        <version>${spring-security-rsa.version}</version>
       </dependency>
       <dependency>
         <groupId>com.tngtech.archunit</groupId>
@@ -83,20 +75,6 @@
       <groupId>org.springframework.cloud</groupId>
       <artifactId>spring-cloud-starter-config</artifactId>
     </dependency>
-    <!--
-      This service owns its refresh plumbing rather than inheriting it from a shared library, so
-      the two APIs that plumbing is written against are declared directly here instead of being
-      relied on transitively: spring-cloud-context supplies RefreshScopeRefreshedEvent and
-      EnvironmentChangeEvent, and jackson-databind serialises the structured audit records.
-    -->
-    <dependency>
-      <groupId>org.springframework.cloud</groupId>
-      <artifactId>spring-cloud-context</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-databind</artifactId>
-    </dependency>
     <dependency>
       <groupId>org.springframework.cloud</groupId>
       <artifactId>spring-cloud-starter-bus-amqp</artifactId>
@@ -105,6 +83,13 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
+    <!--
+      Startup retry against the Config Server (NFR-14) needs NO extra dependency: the retry
+      parameters ride on the spring.config.import URI and are handled by the config-data
+      implementation. spring-retry + spring-boot-starter-aop are required only by the LEGACY
+      bootstrap path, which this project does not use (CON-06) - and spring-boot-starter-aop
+      was removed in Spring Boot 4 anyway (last GA release is 3.5.16).
+    -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>
@@ -118,13 +103,6 @@
       <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
       <version>${springdoc.version}</version>
     </dependency>
-    <!--
-      Startup retry against the Config Server (NFR-14) needs NO extra dependency: the retry
-      parameters ride on the spring.config.import URI and are handled by the config-data
-      implementation. spring-retry + spring-boot-starter-aop are required only by the LEGACY
-      bootstrap path, which this project does not use (CON-06) - and spring-boot-starter-aop
-      was removed in Spring Boot 4 anyway (last GA release is 3.5.16).
-    -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-configuration-processor</artifactId>
@@ -135,15 +113,15 @@
       <artifactId>archunit-junit5</artifactId>
       <scope>test</scope>
     </dependency>
+    <!--
+      Spring Boot 4 split the test slices into per-technology modules, so @WebMvcTest no longer
+      arrives with spring-boot-starter-test as it did in Boot 3.
+    -->
     <dependency>
       <groupId>org.springframework.security</groupId>
       <artifactId>spring-security-test</artifactId>
       <scope>test</scope>
     </dependency>
-    <!--
-      Spring Boot 4 split the test slices into per-technology modules, so @WebMvcTest no longer
-      arrives with spring-boot-starter-test as it did in Boot 3.
-    -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-webmvc-test</artifactId>
@@ -341,10 +319,6 @@
         <configuration>
           <excludes>
             <exclude>**/*Application.class</exclude>
-            <exclude>**/domain/**</exclude>
-            <exclude>**/dto/**</exclude>
-            <exclude>**/ConfigSnapshotStatus.class</exclude>
-            <exclude>**/ConfigChangeNotification.class</exclude>
           </excludes>
         </configuration>
         <executions>
