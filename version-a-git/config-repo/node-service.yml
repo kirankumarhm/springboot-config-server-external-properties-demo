@@ -3,4 +3,4 @@
 node:
   greeting: "Hello from Node.js"
   feature-enabled: true
-  max-items: 30
+  max-items: 25

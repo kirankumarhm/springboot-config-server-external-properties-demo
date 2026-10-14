@@ -3,4 +3,4 @@
 go:
   greeting: "Hello from Go"
   feature-enabled: false
-  max-items: 55
+  max-items: 50
