@@ -1,5 +1,5 @@
 inventory:
   warehouse-code: "WH-BLR-01"
-  max-order-quantity: 100
+  max-order-quantity: 750
   express-shipping-enabled: true
   low-stock-threshold: 115
